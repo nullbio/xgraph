@@ -25,6 +25,7 @@ const REF_EXPORT_CJS: &str = "export_cjs";
 const REF_CALL: &str = "call";
 const REF_MEMBER_ACCESS: &str = "member_access";
 const REF_JSX_COMPONENT: &str = "jsx_component";
+const REF_JSX_ELEMENT: &str = "jsx_element";
 const REF_TYPE_REFERENCE: &str = "type_reference";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -557,23 +558,26 @@ fn collect_calls_and_jsx(
                 && let Some(name_node) = node.child_by_field_name("name")
             {
                 let text = slice_text(source, name_node);
-                if is_component_name(&text) {
-                    let id = *next_id;
-                    *next_id += 1;
-                    out.push(Ref {
-                        id,
-                        kind: REF_JSX_COMPONENT.to_owned(),
-                        qname: None,
-                        alias: None,
-                        name: text,
-                        span: span_from_node(node),
-                        container: enclosing_def(
-                            container_ranges,
-                            node.start_byte(),
-                            node.end_byte(),
-                        ),
-                    });
-                }
+                let kind = if is_component_name(&text) {
+                    REF_JSX_COMPONENT
+                } else {
+                    REF_JSX_ELEMENT
+                };
+                let id = *next_id;
+                *next_id += 1;
+                out.push(Ref {
+                    id,
+                    kind: kind.to_owned(),
+                    qname: None,
+                    alias: None,
+                    name: text,
+                    span: span_from_node(node),
+                    container: enclosing_def(
+                        container_ranges,
+                        node.start_byte(),
+                        node.end_byte(),
+                    ),
+                });
             }
         }
         _ => {}

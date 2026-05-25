@@ -104,7 +104,9 @@ pub enum Confidence {
     High,
 }
 
-/// Kinds of edge the Laravel resolver may emit.
+/// Kinds of edge the Laravel resolver may emit. (Also used by the React
+/// resolver — see [`crate::react`] — since both flow through the same
+/// `lh:`-prefixed framework-edge synthesis path in the owner.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameworkEdgeKind {
     RouteToController,
@@ -120,6 +122,14 @@ pub enum FrameworkEdgeKind {
     BladeIncludesView,
     /// `@component('alert')` or `<x-alert />` in a Blade template.
     BladeUsesComponent,
+    /// Function or class is a React component (function returns JSX, or
+    /// class extends `Component`/`PureComponent`, or wrapped via
+    /// `memo`/`forwardRef`).
+    ReactComponent,
+    /// Function whose name matches `use[A-Z]...` — a custom React hook.
+    ReactHook,
+    /// A component or hook calls another React hook (builtin or custom).
+    ReactUsesHook,
 }
 
 /// A framework edge with mandatory provenance and confidence.

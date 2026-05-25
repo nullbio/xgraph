@@ -44,6 +44,58 @@ pub enum Command {
     Sync,
     /// Rebuild the graph from scratch.
     Reindex,
+    /// Find a symbol by exact name.
+    FindSymbol {
+        name: String,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Symbol search with optional `--prefix` / `--contains` mode and filters.
+    Search {
+        name: String,
+        #[arg(long, value_enum, default_value_t = SearchMode::Exact)]
+        mode: SearchMode,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        path_prefix: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        limit: usize,
+    },
+    /// List callers of a node id.
+    Callers { node_id: String },
+    /// List callees of a node id.
+    Callees { node_id: String },
+    /// Transitive backward closure (calls / inherits / implements / references).
+    Impact {
+        node_id: String,
+        #[arg(long, default_value_t = 0)]
+        max_depth: u32,
+    },
+    /// Task context: symbol + source + callers + callees in one call.
+    Context {
+        name: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        related_limit: usize,
+    },
+    /// Shortest call path between two node ids.
+    Trace {
+        from: String,
+        to: String,
+        #[arg(long, default_value_t = 12)]
+        max_depth: usize,
+    },
+    /// List all indexed files.
+    Files,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SearchMode {
+    Exact,
+    Prefix,
+    Contains,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -132,6 +184,71 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Status => cmd_status(),
         Command::Sync => cmd_sync(),
         Command::Reindex => cmd_reindex(),
+        Command::FindSymbol { name, kind } => cmd_send_query(
+            "find_symbol",
+            serde_json::json!({
+                "name": name,
+                "kind": kind,
+            }),
+        ),
+        Command::Search {
+            name,
+            mode,
+            kind,
+            path_prefix,
+            limit,
+        } => cmd_send_query(
+            "search",
+            serde_json::json!({
+                "name": name,
+                "mode": match mode {
+                    SearchMode::Exact => "exact",
+                    SearchMode::Prefix => "prefix",
+                    SearchMode::Contains => "contains",
+                },
+                "kind": kind,
+                "path_prefix": path_prefix,
+                "limit": limit,
+            }),
+        ),
+        Command::Callers { node_id } => {
+            cmd_send_query("callers_of", serde_json::json!({ "node_id": node_id }))
+        }
+        Command::Callees { node_id } => {
+            cmd_send_query("callees_of", serde_json::json!({ "node_id": node_id }))
+        }
+        Command::Impact { node_id, max_depth } => cmd_send_query(
+            "impact",
+            serde_json::json!({
+                "node_id": node_id,
+                "max_depth": max_depth,
+            }),
+        ),
+        Command::Context {
+            name,
+            kind,
+            related_limit,
+        } => cmd_send_query(
+            "context",
+            serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "related_limit": related_limit,
+            }),
+        ),
+        Command::Trace {
+            from,
+            to,
+            max_depth,
+        } => cmd_send_query(
+            "trace",
+            serde_json::json!({
+                "from": from,
+                "to": to,
+                "max_depth": max_depth,
+            }),
+        ),
+        Command::Files => cmd_send_query("files", serde_json::json!({})),
     }
 }
 
@@ -160,7 +277,7 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
     )?;
 
     let progress = crate::progress::Progress::start();
-    let indexed = owner.index_all_with_progress(&progress)?;
+    let summary = owner.index_all_with_progress(&progress)?;
     progress.stop();
     let errors = owner.shutdown();
     if let Some(first) = errors.into_iter().next() {
@@ -168,8 +285,11 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
     }
 
     println!(
-        "indexed {indexed} files into {}",
-        persistent.root_dir().display()
+        "indexed {files} files: {nodes} nodes, {edges} edges into {dir}",
+        files = summary.files_indexed,
+        nodes = summary.nodes_created,
+        edges = summary.edges_created,
+        dir = persistent.root_dir().display(),
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -249,10 +369,13 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         Arc::clone(&status),
     )?;
 
-    let indexed = owner.index_all()?;
+    let summary = owner.index_all()?;
     println!(
-        "indexed {indexed} files; opening daemon socket at {}",
-        runtime.socket_path().display()
+        "indexed {files} files ({nodes} nodes, {edges} edges); opening daemon socket at {sock}",
+        files = summary.files_indexed,
+        nodes = summary.nodes_created,
+        edges = summary.edges_created,
+        sock = runtime.socket_path().display(),
     );
 
     // Start the watcher and hand its batches to an OS thread that owns the
@@ -442,6 +565,91 @@ fn cmd_reindex() -> Result<ExitCode, CliError> {
     init_at(&cwd)
 }
 
+/// Send a JSON-RPC request to the worktree's daemon socket and pretty-
+/// print the response payload. Used by `search` / `context` / `callers`
+/// / `callees` / `impact` / `trace` / `files` / `find-symbol` CLI
+/// subcommands.
+///
+/// The daemon is the source of truth — running a query via CLI is just a
+/// thin client over the same socket the MCP transport uses. No language
+/// extractors are loaded in this process; all the work happens daemon-side.
+fn cmd_send_query(method: &str, params: serde_json::Value) -> Result<ExitCode, CliError> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    let runtime = runtime_dir(worktree.as_path())?;
+    let socket_path = runtime.socket_path();
+    if !socket_path.exists() {
+        eprintln!(
+            "xgraph: daemon socket not found at {}. Start the daemon with `xgraph daemon start`.",
+            socket_path.display()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let mut stream = UnixStream::connect(&socket_path).map_err(|source| CliError::Io {
+        path: socket_path.clone(),
+        source,
+    })?;
+    // Short read/write timeout so a hung daemon doesn't block the CLI.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let mut request_bytes = serde_json::to_vec(&request).expect("json serialize");
+    request_bytes.push(b'\n');
+    stream
+        .write_all(&request_bytes)
+        .map_err(|source| CliError::Io {
+            path: socket_path.clone(),
+            source,
+        })?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|source| CliError::Io {
+            path: socket_path.clone(),
+            source,
+        })?;
+    let parsed: serde_json::Value = match serde_json::from_str(response.trim()) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("xgraph: malformed daemon response: {err}");
+            eprintln!("raw: {response}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    if let Some(err) = parsed.get("error") {
+        eprintln!(
+            "xgraph: {}",
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    let pretty = serde_json::to_string_pretty(&parsed.get("result").unwrap_or(&parsed))
+        .unwrap_or_else(|_| parsed.to_string());
+    println!("{pretty}");
+    if let Some(meta) = parsed.get("meta")
+        && let Some(catching_up) = meta.get("catching_up").and_then(|v| v.as_bool())
+        && catching_up
+    {
+        eprintln!("note: daemon is catching up — result may be stale");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +719,88 @@ mod tests {
     fn parses_reindex_command() {
         let cli = parse(["xgraph", "reindex"]).expect("reindex should parse");
         assert_eq!(cli.command, Command::Reindex);
+    }
+
+    #[test]
+    fn parses_find_symbol_command() {
+        let cli =
+            parse(["xgraph", "find-symbol", "User", "--kind", "class"]).expect("parses");
+        assert_eq!(
+            cli.command,
+            Command::FindSymbol {
+                name: "User".to_string(),
+                kind: Some("class".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_search_command_with_prefix_mode() {
+        let cli = parse(["xgraph", "search", "User", "--mode", "prefix"]).expect("parses");
+        match cli.command {
+            Command::Search {
+                name, mode, limit, ..
+            } => {
+                assert_eq!(name, "User");
+                assert!(matches!(mode, SearchMode::Prefix));
+                assert_eq!(limit, 64);
+            }
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_callers_command() {
+        let cli = parse(["xgraph", "callers", "h:42"]).expect("parses");
+        assert_eq!(
+            cli.command,
+            Command::Callers {
+                node_id: "h:42".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_impact_command_with_max_depth() {
+        let cli = parse(["xgraph", "impact", "h:42", "--max-depth", "5"]).expect("parses");
+        assert_eq!(
+            cli.command,
+            Command::Impact {
+                node_id: "h:42".to_string(),
+                max_depth: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_trace_command() {
+        let cli = parse(["xgraph", "trace", "h:1", "h:2"]).expect("parses");
+        assert_eq!(
+            cli.command,
+            Command::Trace {
+                from: "h:1".to_string(),
+                to: "h:2".to_string(),
+                max_depth: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_context_command() {
+        let cli = parse(["xgraph", "context", "User"]).expect("parses");
+        match cli.command {
+            Command::Context { name, related_limit, .. } => {
+                assert_eq!(name, "User");
+                assert_eq!(related_limit, 20);
+            }
+            other => panic!("expected Context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_files_command() {
+        let cli = parse(["xgraph", "files"]).expect("parses");
+        assert_eq!(cli.command, Command::Files);
     }
 
     #[test]

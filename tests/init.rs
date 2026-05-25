@@ -641,6 +641,56 @@ fn python_cross_file_call_emits_edge() {
     );
 }
 
+/// React resolver runs as a post-pass on every JS/TS/TSX file. A function
+/// returning JSX must be tagged as a `react_component`; a custom hook
+/// (`use*` name) as a `react_hook`; builtin-hook call sites must produce
+/// `react_uses_hook` edges to `lh:react.hook.<name>`.
+#[test]
+fn react_resolver_classifies_component_and_hook_use() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    fs::write(
+        tmp.path().join("Counter.tsx"),
+        "export function Counter(): JSX.Element {\n  \
+            const [n, setN] = useState(0);\n  \
+            return <button>{n}</button>;\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("useCounter.ts"),
+        "export function useCounter() {\n  \
+            const [n, setN] = useState(0);\n  \
+            return [n, setN];\n\
+         }\n",
+    )
+    .unwrap();
+
+    init_at(tmp.path()).expect("init");
+
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    let edges = read_laravel_edges(&cozo_path);
+
+    assert!(
+        edges
+            .iter()
+            .any(|(_, k, t)| k == "react_component" && t.ends_with("react.component")),
+        "expected react_component edge tagging Counter, got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(_, k, t)| k == "react_hook" && t.ends_with("react.hook")),
+        "expected react_hook edge tagging useCounter, got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(_, k, t)| k == "react_uses_hook" && t.ends_with("react.hook.useState")),
+        "expected react_uses_hook edge to useState, got {edges:?}"
+    );
+}
+
 /// `impact` MCP query runs a reverse transitive closure over Calls /
 /// Inherits / Implements / References edges. Exercises the inline Datalog
 /// in `handlers.rs::run_impact_query` against real Cozo data.

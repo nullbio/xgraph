@@ -61,6 +61,27 @@ pub struct SymbolKey {
     pub kind: String,
 }
 
+/// Match modes for [`HotIndexes::search`].
+#[derive(Clone, Copy, Debug)]
+pub enum SearchMode {
+    Exact,
+    Prefix,
+    Contains,
+}
+
+/// Composite search criteria used by the `search` MCP tool.
+///
+/// `limit` is enforced by the searcher itself so a `contains:""` request
+/// against a 100k-symbol graph won't allocate a 100k-entry vector.
+#[derive(Clone, Debug)]
+pub struct SearchQuery {
+    pub name: String,
+    pub mode: SearchMode,
+    pub kind: Option<String>,
+    pub path_prefix: Option<String>,
+    pub limit: usize,
+}
+
 /// In-memory indexes owned by the daemon.
 pub struct HotIndexes {
     nodes: DashMap<NodeId, NodeRecord>,
@@ -311,6 +332,87 @@ impl HotIndexes {
             .values()
             .map(|targets| targets.len())
             .sum()
+    }
+
+    /// Symbol search with optional `kind` and `path_prefix` filters, three
+    /// match modes (exact / prefix / contains), and a hard result cap. All
+    /// data is served out of the in-memory hot index — no Cozo round-trip.
+    ///
+    /// Cost: O(N_unique_names) for prefix/contains modes (DashMap shard
+    /// iteration); O(1) for exact. Per-result filtering is constant-time
+    /// against the pre-loaded `NodeRecord`. The `limit` short-circuits
+    /// iteration so even pathological queries stay bounded.
+    pub fn search(&self, query: &SearchQuery) -> Vec<NodeId> {
+        let mut results: Vec<NodeId> = Vec::with_capacity(query.limit.min(64));
+
+        // Fast path: exact match goes directly through the primary index.
+        if matches!(query.mode, SearchMode::Exact) {
+            let ids = match &query.kind {
+                Some(k) => self.lookup_symbol(&SymbolKey {
+                    name: query.name.clone(),
+                    kind: k.clone(),
+                }),
+                None => self.lookup_symbol_by_name(&query.name),
+            };
+            for id in ids {
+                if results.len() >= query.limit {
+                    break;
+                }
+                if !self.path_filter_passes(&id, query.path_prefix.as_deref()) {
+                    continue;
+                }
+                results.push(id);
+            }
+            return results;
+        }
+
+        // Prefix / contains: scan the names secondary index. For each
+        // matching name, fan out across its SymbolKey set, then nodes.
+        let needle = query.name.as_str();
+        for entry in self.symbols_by_name.iter() {
+            if results.len() >= query.limit {
+                break;
+            }
+            let name = entry.key();
+            let name_matches = match query.mode {
+                SearchMode::Exact => name == needle, // unreachable (fast-pathed)
+                SearchMode::Prefix => name.starts_with(needle),
+                SearchMode::Contains => name.contains(needle),
+            };
+            if !name_matches {
+                continue;
+            }
+            for key in entry.value() {
+                if let Some(filter_kind) = &query.kind
+                    && &key.kind != filter_kind
+                {
+                    continue;
+                }
+                let Some(ids_ref) = self.symbols.get(key) else {
+                    continue;
+                };
+                for id in ids_ref.value().iter() {
+                    if results.len() >= query.limit {
+                        break;
+                    }
+                    if !self.path_filter_passes(id, query.path_prefix.as_deref()) {
+                        continue;
+                    }
+                    results.push(id.clone());
+                }
+            }
+        }
+        results
+    }
+
+    fn path_filter_passes(&self, id: &NodeId, path_prefix: Option<&str>) -> bool {
+        let Some(prefix) = path_prefix else {
+            return true;
+        };
+        match self.nodes.get(id) {
+            Some(record) => record.path.to_string_lossy().starts_with(prefix),
+            None => false,
+        }
     }
 
     pub fn remove_file(&self, path: &Path) -> Vec<NodeId> {

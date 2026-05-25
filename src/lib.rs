@@ -23,6 +23,7 @@ pub mod owner;
 pub mod parser;
 pub mod progress;
 pub mod query;
+pub mod react;
 pub mod resolve;
 pub mod runtime;
 pub mod scanner;

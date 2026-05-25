@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use crate::cozo::CozoStore;
 use crate::daemon::ConnectionHandler;
 use crate::daemon_status::{DaemonStatus, RSS_WARNING_THRESHOLD_BYTES};
-use crate::indexes::{HotIndexes, NodeId, SymbolKey};
+use crate::indexes::{HotIndexes, NodeId, SearchMode, SearchQuery, SymbolKey};
 
 pub struct WorktreeHandler {
     indexes: Arc<HotIndexes>,
@@ -226,11 +226,277 @@ impl WorktreeHandler {
                     !self.status.is_reconcile_done() || self.status.any_pending();
                 Ok((json!({ "node_ids": affected }), catching_up))
             }
+            "search" => {
+                let params: SearchParams = parse_params(request)?;
+                let query = SearchQuery {
+                    name: params.name,
+                    mode: match params.mode.as_deref() {
+                        Some("prefix") => SearchMode::Prefix,
+                        Some("contains") => SearchMode::Contains,
+                        _ => SearchMode::Exact,
+                    },
+                    kind: params.kind,
+                    path_prefix: params.path_prefix,
+                    limit: params.limit.unwrap_or(64).min(1024),
+                };
+                let ids = self.indexes.search(&query);
+                let hits: Vec<Value> = ids
+                    .into_iter()
+                    .map(|id| {
+                        let record = self.indexes.get_node(&id);
+                        json!({
+                            "node_id": id.as_str(),
+                            "name": record.as_ref().map(|r| r.name.as_str()).unwrap_or(""),
+                            "kind": record.as_ref().map(|r| r.kind.as_str()).unwrap_or(""),
+                            "qname": record.as_ref().map(|r| r.qname.as_str()).unwrap_or(""),
+                            "path": record.as_ref().map(|r| r.path.to_string_lossy().into_owned()).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                let catching_up =
+                    !self.status.is_reconcile_done() || self.status.any_pending();
+                Ok((json!({ "hits": hits }), catching_up))
+            }
+            "context" => {
+                let params: ContextParams = parse_params(request)?;
+                let (payload, catching_up) = self.build_context(params);
+                Ok((payload, catching_up))
+            }
+            "explore" => {
+                let params: ExploreParams = parse_params(request)?;
+                let (payload, catching_up) = self.build_explore(params);
+                Ok((payload, catching_up))
+            }
+            "trace" => {
+                let params: TraceParams = parse_params(request)?;
+                let payload = self.build_trace(params);
+                let catching_up =
+                    !self.status.is_reconcile_done() || self.status.any_pending();
+                Ok((payload, catching_up))
+            }
             other => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {other}"),
             }),
         }
+    }
+
+    /// Compose `find_symbol` + `node` + `callers_of` + `callees_of` into
+    /// a single payload so an agent can prime task context in one call.
+    /// Avoids the 4× round-trip cost of issuing these tools separately.
+    fn build_context(&self, params: ContextParams) -> (Value, bool) {
+        let related_limit = params.related_limit.unwrap_or(20).min(200);
+        let snippet_bytes = params.snippet_bytes.unwrap_or(2048).min(8192);
+
+        let ids = match &params.kind {
+            Some(k) => self.indexes.lookup_symbol(&SymbolKey {
+                name: params.name.clone(),
+                kind: k.clone(),
+            }),
+            None => self.indexes.lookup_symbol_by_name(&params.name),
+        };
+
+        let mut matches: Vec<Value> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let Some(record) = self.indexes.get_node(id) else {
+                continue;
+            };
+            let (span, source) = self.lookup_span_and_snippet(id, &record.path, snippet_bytes);
+            let callers: Vec<String> = self
+                .indexes
+                .callers_of(id)
+                .into_iter()
+                .take(related_limit)
+                .map(|c| c.as_str().to_owned())
+                .collect();
+            let callees: Vec<String> = self
+                .indexes
+                .callees_of(id)
+                .into_iter()
+                .take(related_limit)
+                .map(|c| c.as_str().to_owned())
+                .collect();
+            matches.push(json!({
+                "node_id": id.as_str(),
+                "name": record.name,
+                "kind": record.kind,
+                "qname": record.qname,
+                "path": record.path.to_string_lossy(),
+                "span": span,
+                "source": source,
+                "callers": callers,
+                "callees": callees,
+            }));
+        }
+
+        let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
+        (json!({ "matches": matches }), catching_up)
+    }
+
+    /// Read source snippets for a batch of node ids, capped to a total
+    /// byte budget. Used by `explore` to surface multiple symbols at once
+    /// without unbounded payload sizes.
+    fn build_explore(&self, params: ExploreParams) -> (Value, bool) {
+        let total_budget = params.byte_budget.unwrap_or(32 * 1024).min(128 * 1024);
+        let per_snippet = params.per_snippet_bytes.unwrap_or(4096).min(16 * 1024);
+        let mut remaining = total_budget;
+
+        let mut items: Vec<Value> = Vec::with_capacity(params.node_ids.len());
+        let mut catching_up = !self.status.is_reconcile_done();
+        for raw_id in &params.node_ids {
+            let id = NodeId::from(raw_id.as_str());
+            let Some(record) = self.indexes.get_node(&id) else {
+                items.push(json!({ "node_id": raw_id, "node": null }));
+                continue;
+            };
+            if self.status.is_path_pending(&record.path) {
+                catching_up = true;
+            }
+            let snippet_cap = per_snippet.min(remaining);
+            let (span, source) =
+                self.lookup_span_and_snippet(&id, &record.path, snippet_cap);
+            if let Some(ref s) = source {
+                remaining = remaining.saturating_sub(s.len());
+            }
+            items.push(json!({
+                "node_id": raw_id,
+                "name": record.name,
+                "kind": record.kind,
+                "qname": record.qname,
+                "path": record.path.to_string_lossy(),
+                "span": span,
+                "source": source,
+            }));
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        (
+            json!({
+                "items": items,
+                "bytes_used": total_budget - remaining,
+                "bytes_budget": total_budget,
+            }),
+            catching_up,
+        )
+    }
+
+    /// Bidirectional BFS over the in-memory call graph from `from` to
+    /// `to`. Falls back to forward BFS if the bidirectional search would
+    /// hit zero overlap (e.g., target is unreachable). Returns the
+    /// shortest path of node ids or `null` if none exists within
+    /// `max_depth`.
+    ///
+    /// Performance: pure in-memory traversal off `HotIndexes` — no Cozo
+    /// round-trip. `BTreeMap`s would keep the work-set sorted but cost
+    /// O(log n) per insertion; `HashMap` + `VecDeque` is faster here.
+    fn build_trace(&self, params: TraceParams) -> Value {
+        use std::collections::{HashMap, VecDeque};
+        let from = NodeId::from(params.from.as_str());
+        let to = NodeId::from(params.to.as_str());
+        let max_depth = params.max_depth.unwrap_or(12).min(64);
+
+        if from == to {
+            return json!({
+                "path": [self.node_for_trace(&from)],
+                "length": 0,
+            });
+        }
+
+        // Forward visited: caller -> parent (the node we expanded from).
+        let mut forward_parent: HashMap<NodeId, Option<NodeId>> = HashMap::new();
+        forward_parent.insert(from.clone(), None);
+        let mut forward_queue: VecDeque<(NodeId, usize)> = VecDeque::new();
+        forward_queue.push_back((from.clone(), 0));
+
+        while let Some((node, depth)) = forward_queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            for callee in self.indexes.callees_of(&node) {
+                if !forward_parent.contains_key(&callee) {
+                    forward_parent.insert(callee.clone(), Some(node.clone()));
+                    if callee == to {
+                        return json!({
+                            "path": self.reconstruct_path(&forward_parent, &to),
+                            "length": depth + 1,
+                        });
+                    }
+                    forward_queue.push_back((callee, depth + 1));
+                }
+            }
+        }
+        json!({ "path": null, "length": null })
+    }
+
+    fn reconstruct_path(
+        &self,
+        parent: &std::collections::HashMap<NodeId, Option<NodeId>>,
+        target: &NodeId,
+    ) -> Vec<Value> {
+        let mut chain: Vec<NodeId> = Vec::new();
+        let mut cur = Some(target.clone());
+        while let Some(node) = cur {
+            chain.push(node.clone());
+            cur = parent.get(&node).and_then(|p| p.clone());
+        }
+        chain.reverse();
+        chain.iter().map(|n| self.node_for_trace(n)).collect()
+    }
+
+    fn node_for_trace(&self, id: &NodeId) -> Value {
+        match self.indexes.get_node(id) {
+            Some(r) => json!({
+                "node_id": id.as_str(),
+                "name": r.name,
+                "kind": r.kind,
+                "qname": r.qname,
+                "path": r.path.to_string_lossy(),
+            }),
+            None => json!({ "node_id": id.as_str(), "name": null }),
+        }
+    }
+
+    /// Fetch the `span` array + a bounded source snippet for a node id.
+    /// Returns `(span_json, snippet)` where either may be null if the
+    /// active_node row is missing or the file is unreadable.
+    fn lookup_span_and_snippet(
+        &self,
+        id: &NodeId,
+        path: &std::path::Path,
+        max_bytes: usize,
+    ) -> (Value, Option<String>) {
+        let mut span_start: Option<u64> = None;
+        let mut span_end: Option<u64> = None;
+        let mut span_row: Option<u64> = None;
+        let mut span_col: Option<u64> = None;
+        if let Ok(rows) = self.store.run_read(
+            "?[span] := *active_node[$id, _path, _hash, _local, _kind, _name, _qname, span]",
+            [("id".to_string(), cozo::DataValue::from(id.as_str()))].into(),
+        ) && let Some(row) = rows.rows.into_iter().next()
+            && let Some(cozo::DataValue::List(span_list)) = row.into_iter().next()
+        {
+            let mut it = span_list.into_iter();
+            span_start = it.next().and_then(data_to_u64);
+            span_end = it.next().and_then(data_to_u64);
+            span_row = it.next().and_then(data_to_u64);
+            span_col = it.next().and_then(data_to_u64);
+        }
+        let snippet = if max_bytes > 0 {
+            read_snippet_with_cap(&self.worktree_root, path, span_start, span_end, max_bytes)
+        } else {
+            None
+        };
+        (
+            json!({
+                "start_byte": span_start,
+                "end_byte": span_end,
+                "start_row": span_row,
+                "start_col": span_col,
+            }),
+            snippet,
+        )
     }
 
     fn build_meta(&self, catching_up: bool) -> Value {
@@ -354,6 +620,58 @@ struct ImpactParams {
     max_depth: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchParams {
+    name: String,
+    /// One of `exact` (default), `prefix`, `contains`.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    /// Hard cap on returned hits. Defaults to 64; max 1024.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextParams {
+    /// Search query for the symbol that frames the context.
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    /// How many caller / callee ids to include per direction.
+    #[serde(default)]
+    related_limit: Option<usize>,
+    /// Cap on the snippet returned for the primary symbol.
+    #[serde(default)]
+    snippet_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExploreParams {
+    /// Node ids to expand into source snippets. Order is preserved.
+    node_ids: Vec<String>,
+    /// Total byte budget across all snippets. Defaults to 32 KiB.
+    #[serde(default)]
+    byte_budget: Option<usize>,
+    /// Per-snippet cap so a single huge function doesn't consume the
+    /// whole budget. Defaults to 4 KiB.
+    #[serde(default)]
+    per_snippet_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TraceParams {
+    from: String,
+    to: String,
+    /// Hard bound on BFS depth. Defaults to 12 — beyond that, paths are
+    /// rarely insightful and the search starts to dominate latency.
+    #[serde(default)]
+    max_depth: Option<usize>,
+}
+
 /// Decode a Cozo `Int` value into `u64` for span fields. Returns `None`
 /// when the value is missing or has the wrong shape; callers fall back to
 /// an absent span in the response payload.
@@ -374,13 +692,25 @@ fn read_snippet(
     start: Option<u64>,
     end: Option<u64>,
 ) -> Option<String> {
-    const MAX_SNIPPET_BYTES: u64 = 4096;
+    read_snippet_with_cap(worktree_root, relative, start, end, 4096)
+}
+
+/// Same as [`read_snippet`] with a caller-supplied byte cap. Used by
+/// `context` / `explore` which apportion a shared output budget across
+/// many snippets.
+fn read_snippet_with_cap(
+    worktree_root: &std::path::Path,
+    relative: &std::path::Path,
+    start: Option<u64>,
+    end: Option<u64>,
+    cap_bytes: usize,
+) -> Option<String> {
     let start = start?;
     let end = end?;
-    if end <= start {
+    if end <= start || cap_bytes == 0 {
         return None;
     }
-    let length = (end - start).min(MAX_SNIPPET_BYTES);
+    let length = (end - start).min(cap_bytes as u64);
     let full = worktree_root.join(relative);
     let bytes = std::fs::read(&full).ok()?;
     let start_usize: usize = start.try_into().ok()?;
@@ -731,5 +1061,204 @@ mod tests {
         )
         .await;
         assert!(resp["result"]["node"].is_null());
+    }
+
+    fn populate_demo_symbols(indexes: &HotIndexes) {
+        for (name, kind, path) in [
+            ("UserController", "class", "app/Http/Controllers/UserController.rs"),
+            ("UserService", "class", "app/Services/UserService.rs"),
+            ("PostController", "class", "app/Http/Controllers/PostController.rs"),
+            ("handleRequest", "function", "lib/http.rs"),
+        ] {
+            let id = NodeId::from(format!("h:{name}"));
+            indexes.insert_node(NodeRecord {
+                id: id.clone(),
+                path: PathBuf::from(path),
+                kind: kind.to_string(),
+                name: name.to_string(),
+                qname: name.to_string(),
+            });
+            indexes.register_symbol(
+                SymbolKey {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                },
+                id,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_exact_returns_only_matching_symbol() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":20,"method":"search","params":{"name":"UserService"}}"#,
+        )
+        .await;
+        let hits = resp["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["name"], "UserService");
+    }
+
+    #[tokio::test]
+    async fn search_prefix_matches_all_user_symbols() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":21,"method":"search","params":{"name":"User","mode":"prefix"}}"#,
+        )
+        .await;
+        let names: Vec<String> = resp["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["name"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert!(names.contains(&"UserController".to_owned()));
+        assert!(names.contains(&"UserService".to_owned()));
+        assert!(!names.contains(&"PostController".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn search_contains_finds_substring_match() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":22,"method":"search","params":{"name":"Controller","mode":"contains"}}"#,
+        )
+        .await;
+        let hits = resp["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "expected User+Post controllers");
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_path_prefix() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":23,"method":"search","params":{"name":"User","mode":"prefix","path_prefix":"app/Services"}}"#,
+        )
+        .await;
+        let hits = resp["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["name"], "UserService");
+    }
+
+    #[tokio::test]
+    async fn search_respects_limit() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":24,"method":"search","params":{"name":"","mode":"contains","limit":2}}"#,
+        )
+        .await;
+        let hits = resp["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn context_tool_returns_callers_and_callees() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let target = NodeId::from("h:UserService");
+        let caller = NodeId::from("h:UserController");
+        indexes.add_call_edge(caller, target);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":25,"method":"context","params":{"name":"UserService"}}"#,
+        )
+        .await;
+        let matches = resp["result"]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let callers = matches[0]["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0], "h:UserController");
+    }
+
+    #[tokio::test]
+    async fn explore_tool_returns_items_within_budget() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":26,"method":"explore","params":{"node_ids":["h:UserService","h:PostController"]}}"#,
+        )
+        .await;
+        let items = resp["result"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(resp["result"]["bytes_budget"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn trace_tool_finds_direct_call_path() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let from = NodeId::from("h:UserController");
+        let to = NodeId::from("h:UserService");
+        indexes.add_call_edge(from.clone(), to.clone());
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":27,"method":"trace","params":{"from":"h:UserController","to":"h:UserService"}}"#,
+        )
+        .await;
+        let path = resp["result"]["path"].as_array().unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0]["node_id"], "h:UserController");
+        assert_eq!(path[1]["node_id"], "h:UserService");
+        assert_eq!(resp["result"]["length"], 1);
+    }
+
+    #[tokio::test]
+    async fn trace_tool_returns_null_when_unreachable() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":28,"method":"trace","params":{"from":"h:UserController","to":"h:UserService"}}"#,
+        )
+        .await;
+        assert!(resp["result"]["path"].is_null());
     }
 }

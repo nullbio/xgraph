@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use xgraph::cli::init_at;
 use xgraph::cozo::CozoStore;
-use xgraph::indexes::{HotIndexes, NodeId, NodeRecord, SymbolKey};
+use xgraph::indexes::{HotIndexes, NodeId, NodeRecord, SearchMode, SearchQuery, SymbolKey};
 
 fn init_git_repo(root: &Path) {
     let status = Command::new("git")
@@ -171,12 +171,73 @@ fn bench_hot_query_find_symbol(c: &mut Criterion) {
     });
 }
 
+/// Search benchmarks at 10k and 50k symbols across exact / prefix /
+/// contains modes. The exact path goes through the primary hash map and
+/// should be sub-microsecond; prefix and contains scan the
+/// `symbols_by_name` DashMap and depend on N_unique_names.
+fn bench_hot_search(c: &mut Criterion) {
+    for &n in &[10_000usize, 50_000] {
+        let indexes = Arc::new(HotIndexes::new());
+        for i in 0..n {
+            let id = NodeId::from(format!("h:{i}"));
+            indexes.insert_node(NodeRecord {
+                id: id.clone(),
+                path: std::path::PathBuf::from(format!("mod_{}.rs", i / 100)),
+                kind: "function".to_string(),
+                name: format!("fn_{i}"),
+                qname: format!("crate::mod_{}::fn_{}", i / 100, i),
+            });
+            indexes.register_symbol(
+                SymbolKey {
+                    name: format!("fn_{i}"),
+                    kind: "function".to_string(),
+                },
+                id,
+            );
+        }
+        c.bench_function(format!("search_exact_n{n}").as_str(), |b| {
+            b.iter(|| {
+                let _ = indexes.search(&SearchQuery {
+                    name: "fn_2500".to_string(),
+                    mode: SearchMode::Exact,
+                    kind: None,
+                    path_prefix: None,
+                    limit: 64,
+                });
+            });
+        });
+        c.bench_function(format!("search_prefix_n{n}").as_str(), |b| {
+            b.iter(|| {
+                let _ = indexes.search(&SearchQuery {
+                    name: "fn_25".to_string(),
+                    mode: SearchMode::Prefix,
+                    kind: None,
+                    path_prefix: None,
+                    limit: 64,
+                });
+            });
+        });
+        c.bench_function(format!("search_contains_n{n}").as_str(), |b| {
+            b.iter(|| {
+                let _ = indexes.search(&SearchQuery {
+                    name: "_2500".to_string(),
+                    mode: SearchMode::Contains,
+                    kind: None,
+                    path_prefix: None,
+                    limit: 64,
+                });
+            });
+        });
+    }
+}
+
 criterion_group!(
     benches,
     bench_init_python_cold,
     bench_init_php_cold,
     bench_hash_skip_second_init,
     bench_hot_indexes_load,
-    bench_hot_query_find_symbol
+    bench_hot_query_find_symbol,
+    bench_hot_search,
 );
 criterion_main!(benches);

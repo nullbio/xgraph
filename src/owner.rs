@@ -25,6 +25,16 @@ use crate::scanner::{DetectedLanguage, ScanError, scan};
 
 pub const PARSER_VERSION: u32 = 1;
 
+/// Outcome of a full index pass. Includes the per-pass counts that
+/// codegraph's `SyncResult` exposes so `init_at` can print a summary
+/// without re-querying Cozo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexSummary {
+    pub files_indexed: usize,
+    pub nodes_created: u64,
+    pub edges_created: u64,
+}
+
 pub struct WorktreeOwner {
     worktree_root: PathBuf,
     matcher: IgnoreMatcher,
@@ -71,8 +81,7 @@ impl WorktreeOwner {
 
     /// Walk the worktree, extract every supported file, resolve refs into edges
     /// against the full set, then submit one `FileUpdate` per file.
-    /// Returns the number of files submitted to the writer queue.
-    pub fn index_all(&mut self) -> Result<usize, OwnerError> {
+    pub fn index_all(&mut self) -> Result<IndexSummary, OwnerError> {
         self.index_all_with_progress(&crate::progress::Progress::start())
     }
 
@@ -81,7 +90,7 @@ impl WorktreeOwner {
     pub fn index_all_with_progress(
         &mut self,
         progress: &crate::progress::Progress,
-    ) -> Result<usize, OwnerError> {
+    ) -> Result<IndexSummary, OwnerError> {
         use crate::progress::Phase;
         progress.phase(Phase::Scanning, None);
         let scanned = scan(&self.worktree_root, &self.matcher)?;
@@ -117,9 +126,13 @@ impl WorktreeOwner {
         progress.finish_phase();
 
         progress.phase(Phase::Storing, Some(prepared.len() as u64));
-        let count = prepared.len();
+        let files_indexed = prepared.len();
+        let mut nodes_created: u64 = 0;
+        let mut edges_created: u64 = 0;
         for (i, prep) in prepared.into_iter().enumerate() {
-            self.submit_prepared(prep, &symbol_table)?;
+            nodes_created += prep.extracted.nodes.len() as u64;
+            let edge_count = self.submit_prepared(prep, &symbol_table)?;
+            edges_created += edge_count as u64;
             progress.tick(i as u64 + 1);
         }
         progress.finish_phase();
@@ -127,7 +140,11 @@ impl WorktreeOwner {
         // "still booting" caveat. Incremental change-driven catching_up is
         // tracked per-path via DaemonStatus::pending_paths.
         self.status.mark_reconcile_done();
-        Ok(count)
+        Ok(IndexSummary {
+            files_indexed,
+            nodes_created,
+            edges_created,
+        })
     }
 
     /// Re-extract a single path and submit the update. Cross-file resolution
@@ -163,7 +180,7 @@ impl WorktreeOwner {
             return Ok(false);
         };
         let empty = SymbolTable::default();
-        self.submit_prepared(prep, &empty)?;
+        let _ = self.submit_prepared(prep, &empty)?;
         Ok(true)
     }
 
@@ -216,7 +233,7 @@ impl WorktreeOwner {
         &mut self,
         prep: PreparedFile,
         symbols: &SymbolTable,
-    ) -> Result<(), OwnerError> {
+    ) -> Result<usize, OwnerError> {
         let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
         let mut edges = resolve_edges(&prep.content_hash, &prep.extracted, symbols);
 
@@ -253,6 +270,16 @@ impl WorktreeOwner {
                 append_framework_edges(&facts, &mut edges);
             }
         }
+        // React resolver runs on every JS/TS/TSX file. The resolver is
+        // syntactic only — it inspects the already-extracted nodes/refs,
+        // so this is a constant-time pass per file with no re-parsing.
+        if matches!(
+            prep.language,
+            DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx
+        ) {
+            let facts = crate::react::resolve_react(&[&prep.extracted]);
+            append_framework_edges(&facts, &mut edges);
+        }
 
         let metadata = FileUpdateMetadata {
             content_hash: cozo_hash,
@@ -270,8 +297,9 @@ impl WorktreeOwner {
         // Mirror the update into the hot indexes so MCP reads see the new state
         // immediately; the writer thread persists the same facts to Cozo.
         self.indexes.apply_file_update(&update);
+        let edge_count = update.edges.len();
         self.writer.submit(update)?;
-        Ok(())
+        Ok(edge_count)
     }
 
     /// Rebuild the ignore matcher after a `.gitignore` / `.xgraphignore`
@@ -671,6 +699,9 @@ fn framework_edge_kind(kind: crate::laravel::FrameworkEdgeKind) -> &'static str 
         BladeExtendsView => "extends_view",
         BladeIncludesView => "includes_view",
         BladeUsesComponent => "uses_component",
+        ReactComponent => "react_component",
+        ReactHook => "react_hook",
+        ReactUsesHook => "react_uses_hook",
     }
 }
 
@@ -779,8 +810,11 @@ mod tests {
             status,
         )
         .expect("owner");
-        let n = owner.index_all().expect("index_all");
-        assert_eq!(n, 1, "only the .py file should produce an update");
+        let summary = owner.index_all().expect("index_all");
+        assert_eq!(
+            summary.files_indexed, 1,
+            "only the .py file should produce an update"
+        );
         let errs = owner.shutdown();
         assert!(errs.is_empty(), "writer errors: {errs:?}");
     }
@@ -810,7 +844,7 @@ mod tests {
         )
         .expect("owner");
         let first = owner.index_all().expect("index_all first");
-        assert_eq!(first, 1);
+        assert_eq!(first.files_indexed, 1);
         let errs = owner.shutdown();
         assert!(errs.is_empty());
 
@@ -825,7 +859,10 @@ mod tests {
         )
         .expect("owner2");
         let second = owner2.index_all().expect("index_all second");
-        assert_eq!(second, 0, "hash-skip should suppress re-extraction");
+        assert_eq!(
+            second.files_indexed, 0,
+            "hash-skip should suppress re-extraction"
+        );
         assert!(owner2.shutdown().is_empty());
     }
 
