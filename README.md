@@ -51,6 +51,27 @@ The project is inspired by [`colbymchenry/codegraph`](https://github.com/colbymc
 
 CozoDB is responsible for durable graph facts, transactions, snapshots, and complex Datalog queries. xgraph owns file watching, daemon lifecycle, worktree discovery, parser scheduling, hot indexes, socket/proxy transport, and agent coordination.
 
+## Install
+
+```bash
+# One-shot install / upgrade. Works on Linux with GCC 12+.
+git clone https://github.com/nullbio/xgraph && cd xgraph && ./install.sh
+```
+
+The script wraps `cargo install --git . --force` and injects
+`CXXFLAGS="-include cstdint"`. That flag works around a build failure
+on GCC 13+ where the RocksDB headers bundled by `cozo` 0.7's
+`cozorocks` crate forget to `#include <cstdint>`. Without it the build
+fails with hundreds of `uint64_t does not name a type` errors. With it,
+compilation succeeds. Re-run `./install.sh` any time to pull the latest
+master.
+
+If you'd rather invoke `cargo` directly:
+
+```bash
+CXXFLAGS="-include cstdint" cargo install --git https://github.com/nullbio/xgraph --force
+```
+
 ## Command model
 
 ```bash
