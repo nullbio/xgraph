@@ -350,6 +350,32 @@ impl CozoStore {
         self.run_immutable(script, params)
     }
 
+    /// Look up the active content hash stored for `path`. Returns `None` if
+    /// the file has never been indexed.
+    ///
+    /// Used by the hash-skip cache: if a freshly-computed hash equals the
+    /// stored hash, parsing + extraction can be skipped entirely.
+    pub fn active_file_hash(&self, path: &str) -> Result<Option<ContentHash>, CozoError> {
+        let mut params = BTreeMap::new();
+        params.insert("path".to_string(), DataValue::from(path.to_string()));
+        let rows = self.run_immutable(
+            "?[hash] := *active_file[$path, hash, _mtime, _size, _generation]",
+            params,
+        )?;
+        let Some(first) = rows.rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(DataValue::Bytes(bytes)) = first.into_iter().next() else {
+            return Ok(None);
+        };
+        if bytes.len() != CONTENT_HASH_LEN {
+            return Ok(None);
+        }
+        let mut out = [0u8; CONTENT_HASH_LEN];
+        out.copy_from_slice(&bytes);
+        Ok(Some(ContentHash::from_bytes(out)))
+    }
+
     fn install_schema(&self) -> Result<(), CozoError> {
         let existing = self.list_relations()?;
         for (name, script) in RELATION_DDL {

@@ -27,6 +27,7 @@ pub struct WorktreeOwner {
     worktree_root: PathBuf,
     matcher: IgnoreMatcher,
     registry: LanguageRegistry,
+    store: CozoStore,
     writer: WriterHandle,
     indexes: Arc<HotIndexes>,
     generation: u64,
@@ -43,11 +44,14 @@ impl WorktreeOwner {
         store: CozoStore,
         indexes: Arc<HotIndexes>,
     ) -> Result<Self, crate::cozo::CozoError> {
-        let writer = WriterQueue::start(store)?;
+        // Keep a read-side handle for the hash-skip cache; the writer thread
+        // owns its own clone of the same underlying DbInstance.
+        let writer = WriterQueue::start(store.clone())?;
         Ok(Self {
             worktree_root,
             matcher,
             registry,
+            store,
             writer,
             indexes,
             generation: 1,
@@ -120,6 +124,16 @@ impl WorktreeOwner {
             .strip_prefix(&self.worktree_root)
             .unwrap_or(&path)
             .to_path_buf();
+
+        // Hash-skip cache: if Cozo already has this exact hash for this path,
+        // skip extraction. The fastest parse is no parse.
+        let relative_str = relative.to_string_lossy();
+        if let Ok(Some(prior)) = self.store.active_file_hash(&relative_str)
+            && prior.as_bytes() == content_hash.as_bytes()
+        {
+            return Ok(None);
+        }
+
         let Some(extracted) = self.registry.extract_file(&relative, &bytes) else {
             return Ok(None);
         };
@@ -387,6 +401,48 @@ mod tests {
         assert_eq!(n, 1, "only the .py file should produce an update");
         let errs = owner.shutdown();
         assert!(errs.is_empty(), "writer errors: {errs:?}");
+    }
+
+    #[test]
+    fn index_all_is_idempotent_thanks_to_hash_skip() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+
+        let matcher = IgnoreMatcher::new(tmp.path()).expect("matcher");
+        let registry = LanguageRegistry::with_all();
+        let store_dir = tmp.path().join(".xgraph-store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = CozoStore::open(&store_dir).expect("cozo");
+        let indexes = Arc::new(HotIndexes::new());
+
+        let matcher2 = IgnoreMatcher::new(tmp.path()).expect("matcher2");
+        let registry2 = LanguageRegistry::with_all();
+
+        let mut owner = WorktreeOwner::new(
+            tmp.path().to_path_buf(),
+            matcher,
+            registry,
+            store.clone(),
+            Arc::clone(&indexes),
+        )
+        .expect("owner");
+        let first = owner.index_all().expect("index_all first");
+        assert_eq!(first, 1);
+        let errs = owner.shutdown();
+        assert!(errs.is_empty());
+
+        // Second pass: file unchanged → 0 submissions.
+        let mut owner2 = WorktreeOwner::new(
+            tmp.path().to_path_buf(),
+            matcher2,
+            registry2,
+            store,
+            Arc::clone(&indexes),
+        )
+        .expect("owner2");
+        let second = owner2.index_all().expect("index_all second");
+        assert_eq!(second, 0, "hash-skip should suppress re-extraction");
+        assert!(owner2.shutdown().is_empty());
     }
 
     #[test]
