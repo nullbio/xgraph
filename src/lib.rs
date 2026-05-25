@@ -7,6 +7,7 @@ pub mod cli;
 pub mod daemon;
 pub mod git;
 pub mod indexes;
+pub mod manifest;
 pub mod mcp;
 pub mod parser;
 pub mod runtime;
