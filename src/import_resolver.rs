@@ -150,15 +150,61 @@ struct TsCompilerOptions {
 /// JSONC parser.
 fn strip_jsonc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let cleaned = if let Some(idx) = line.find("//") {
-            &line[..idx]
-        } else {
-            line
-        };
-        out.push_str(cleaned);
-        out.push('\n');
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            continue;
+        }
+
+        if ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            out.push('\n');
+                        }
+                        if previous == '*' && c == '/' {
+                            break;
+                        }
+                        previous = c;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        out.push(ch);
     }
+
     // Drop trailing commas that follow `}` / `]` in arrays/objects.
     let mut filtered = String::with_capacity(out.len());
     let bytes = out.as_bytes();
@@ -288,6 +334,7 @@ impl PythonImportResolver {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[test]
     fn ts_alias_matches_wildcard_pattern() {
@@ -316,6 +363,35 @@ mod tests {
         assert_eq!(
             resolver.resolve("missing", Path::new("src/app.ts"), Path::new("/repo")),
             None
+        );
+    }
+
+    #[test]
+    fn tsconfig_jsonc_block_comments_still_load_aliases() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("tsconfig.json"),
+            r#"{
+              "compilerOptions": {
+                /* emitted by tsc --init */
+                "skipLibCheck": true /* inline block comment */,
+                "baseUrl": ".",
+                "paths": {
+                  "@/*": ["./resources/js/*"],
+                },
+              },
+            }"#,
+        )
+        .unwrap();
+
+        let resolver = TsAliasResolver::from_worktree(tmp.path());
+        assert_eq!(
+            resolver.resolve(
+                "@/lib/money",
+                Path::new("resources/js/components/price.tsx"),
+                tmp.path()
+            ),
+            Some("resources/js/lib/money".to_string())
         );
     }
 

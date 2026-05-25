@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -23,6 +24,7 @@ const REF_EXPORT_ESM: &str = "export_esm";
 const REF_EXPORT_CJS: &str = "export_cjs";
 const REF_CALL: &str = "call";
 const REF_MEMBER_ACCESS: &str = "member_access";
+pub(super) const REF_MEMBER_CALL: &str = "member_call";
 const REF_JSX_COMPONENT: &str = "jsx_component";
 const REF_JSX_ELEMENT: &str = "jsx_element";
 
@@ -189,8 +191,16 @@ fn extract_into(tree: &Tree, source: &[u8], out: &mut ExtractedFile) {
         &mut container_ranges,
     );
     collect_imports(&root, source, &mut out.refs, &mut ref_id);
+    let import_bindings = import_bindings_from_refs(&out.refs);
     collect_exports(&root, source, &mut out.refs, &mut ref_id);
-    collect_calls_and_jsx(root, source, &mut out.refs, &mut ref_id, &container_ranges);
+    collect_calls_and_jsx(
+        root,
+        source,
+        &mut out.refs,
+        &mut ref_id,
+        &container_ranges,
+        &import_bindings,
+    );
     collect_diagnostics(root, &mut out.diagnostics);
 }
 
@@ -504,6 +514,68 @@ fn push_binding(
     });
 }
 
+#[derive(Debug, Clone)]
+struct ImportedBinding {
+    module: String,
+    symbol: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ImportBindings {
+    values: HashMap<String, ImportedBinding>,
+    namespaces: HashMap<String, String>,
+}
+
+impl ImportBindings {
+    pub(super) fn qname_for_identifier(&self, local: &str) -> Option<String> {
+        let binding = self.values.get(local)?;
+        Some(format!("{}#{}", binding.module, binding.symbol))
+    }
+
+    pub(super) fn qname_for_member(&self, object: &str, property: &str) -> Option<String> {
+        let module = self.namespaces.get(object)?;
+        Some(format!("{module}#{property}"))
+    }
+
+    pub(super) fn qname_for_jsx_name(&self, name: &str) -> Option<String> {
+        if let Some(qname) = self.qname_for_identifier(name) {
+            return Some(qname);
+        }
+        let (object, property) = name.split_once('.')?;
+        self.qname_for_member(object, property)
+    }
+}
+
+pub(super) fn import_bindings_from_refs(refs: &[Ref]) -> ImportBindings {
+    let mut bindings = ImportBindings::default();
+    for r in refs {
+        let Some(module) = r.qname.as_deref() else {
+            continue;
+        };
+        match r.kind.as_str() {
+            REF_IMPORT_NAMED | REF_IMPORT_DEFAULT => {
+                let local = r.alias.as_deref().unwrap_or(&r.name);
+                bindings.values.insert(
+                    local.to_owned(),
+                    ImportedBinding {
+                        module: module.to_owned(),
+                        symbol: r.name.clone(),
+                    },
+                );
+            }
+            REF_IMPORT_NAMESPACE => {
+                if let Some(local) = r.alias.as_deref() {
+                    bindings
+                        .namespaces
+                        .insert(local.to_owned(), module.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings
+}
+
 fn collect_exports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id: &mut LocalRefId) {
     let query = export_query();
     let mut cursor = QueryCursor::new();
@@ -618,9 +690,17 @@ pub(super) fn collect_calls_and_jsx(
     out: &mut Vec<Ref>,
     next_id: &mut LocalRefId,
     container_ranges: &[ContainerRange],
+    import_bindings: &ImportBindings,
 ) {
     walk_tree(root, |node| {
-        visit_call_or_jsx(node, source, out, next_id, container_ranges)
+        visit_call_or_jsx(
+            node,
+            source,
+            out,
+            next_id,
+            container_ranges,
+            import_bindings,
+        )
     });
 }
 
@@ -630,41 +710,42 @@ fn visit_call_or_jsx(
     out: &mut Vec<Ref>,
     next_id: &mut LocalRefId,
     container_ranges: &[ContainerRange],
+    import_bindings: &ImportBindings,
 ) {
     match node.kind() {
         "call_expression" => {
             if let Some(callee) = node.child_by_field_name("function")
                 && !is_require_call(callee, source)
+                && let Some(call_ref) = call_ref_for_callee(callee, source, import_bindings)
             {
-                let name = callee_label(callee, source);
-                if !name.is_empty() {
-                    let id = *next_id;
-                    *next_id += 1;
-                    out.push(Ref {
-                        id,
-                        kind: REF_CALL.to_owned(),
-                        qname: None,
-                        alias: None,
-                        name,
-                        span: span_from_node(node),
-                        container: enclosing_def(
-                            container_ranges,
-                            node.start_byte(),
-                            node.end_byte(),
-                        ),
-                    });
-                }
+                let id = *next_id;
+                *next_id += 1;
+                out.push(Ref {
+                    id,
+                    kind: call_ref.kind.to_owned(),
+                    qname: call_ref.qname,
+                    alias: None,
+                    name: call_ref.name,
+                    span: span_from_node(node),
+                    container: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
+                });
             }
         }
         "member_expression" => {
+            if is_call_function(node) {
+                return;
+            }
             if let Some(prop) = node.child_by_field_name("property") {
                 let name = slice_text(source, prop);
+                let qname = member_expression_parts(node, source).and_then(|(object, property)| {
+                    import_bindings.qname_for_member(&object, &property)
+                });
                 let id = *next_id;
                 *next_id += 1;
                 out.push(Ref {
                     id,
                     kind: REF_MEMBER_ACCESS.to_owned(),
-                    qname: None,
+                    qname,
                     alias: None,
                     name,
                     span: span_from_node(node),
@@ -685,7 +766,7 @@ fn visit_call_or_jsx(
                 out.push(Ref {
                     id,
                     kind: kind.to_owned(),
-                    qname: None,
+                    qname: import_bindings.qname_for_jsx_name(&text),
                     alias: None,
                     name: text,
                     span: span_from_node(node),
@@ -701,18 +782,58 @@ pub(super) fn is_require_call(callee: TsNode<'_>, source: &[u8]) -> bool {
     callee.kind() == "identifier" && slice_text(source, callee) == "require"
 }
 
-pub(super) fn callee_label(callee: TsNode<'_>, source: &[u8]) -> String {
+pub(super) struct CallRef {
+    pub(super) kind: &'static str,
+    pub(super) name: String,
+    pub(super) qname: Option<String>,
+}
+
+pub(super) fn call_ref_for_callee(
+    callee: TsNode<'_>,
+    source: &[u8],
+    import_bindings: &ImportBindings,
+) -> Option<CallRef> {
     match callee.kind() {
-        "identifier" => slice_text(source, callee),
-        "member_expression" => {
-            if let Some(prop) = callee.child_by_field_name("property") {
-                slice_text(source, prop)
-            } else {
-                String::new()
+        "identifier" => {
+            let name = slice_text(source, callee);
+            if name.is_empty() {
+                return None;
             }
+            Some(CallRef {
+                kind: REF_CALL,
+                qname: import_bindings.qname_for_identifier(&name),
+                name,
+            })
         }
-        _ => String::new(),
+        "member_expression" => {
+            let (object, property) = member_expression_parts(callee, source)?;
+            Some(CallRef {
+                kind: REF_MEMBER_CALL,
+                qname: import_bindings.qname_for_member(&object, &property),
+                name: property,
+            })
+        }
+        _ => None,
     }
+}
+
+pub(super) fn member_expression_parts(
+    member: TsNode<'_>,
+    source: &[u8],
+) -> Option<(String, String)> {
+    let object = member.child_by_field_name("object")?;
+    let property = member.child_by_field_name("property")?;
+    Some((slice_text(source, object), slice_text(source, property)))
+}
+
+pub(super) fn is_call_function(node: TsNode<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "call_expression"
+        && parent
+            .child_by_field_name("function")
+            .is_some_and(|callee| callee == node)
 }
 
 pub(super) fn is_component_name(name: &str) -> bool {
@@ -842,7 +963,18 @@ const baz = () => 2;
         let calls = refs_of_kind(&file, REF_CALL);
         let names: Vec<_> = calls.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"foo"));
-        assert!(names.contains(&"baz"));
+        let member_calls = refs_of_kind(&file, REF_MEMBER_CALL);
+        let member_names: Vec<_> = member_calls.iter().map(|r| r.name.as_str()).collect();
+        assert!(member_names.contains(&"baz"));
+    }
+
+    #[test]
+    fn imported_call_carries_raw_module_symbol_key() {
+        let file = extract_str("import {format as money} from './money'; money();");
+        let calls = refs_of_kind(&file, REF_CALL);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "money");
+        assert_eq!(calls[0].qname.as_deref(), Some("./money#format"));
     }
 
     #[test]

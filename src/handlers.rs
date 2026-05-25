@@ -916,8 +916,8 @@ fn read_snippet_with_cap(
     Some(String::from_utf8_lossy(&bytes[start_usize..end_usize]).into_owned())
 }
 
-/// Backward transitive closure over `Calls`, `Inherits`, `Implements`, and
-/// `References` (and their lowercase variants) edge kinds — every node
+/// Backward transitive closure over calls, renders, inheritance, implementations,
+/// and references edge kinds — every node
 /// whose behavior may be affected if the target changes. Inline Datalog
 /// because `query.rs` types use `u64` ids while our edge source/target
 /// columns are strings.
@@ -931,6 +931,7 @@ fn run_impact_query(
     // confidence); the wildcards `_p, _c` bind the two we don't filter on.
     let unbounded = "\
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'calls'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'renders'
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'inherits'
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'implements'
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'references'
@@ -940,6 +941,7 @@ affected[node] := affected[downstream], impact_edge[node, downstream]
 :sort node\n";
     let bounded = "\
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'calls'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'renders'
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'inherits'
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'implements'
 impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'references'

@@ -4,7 +4,7 @@ use std::process::Command;
 use tempfile::TempDir;
 use xgraph::cli::init_at;
 use xgraph::cozo::CozoStore;
-use xgraph::indexes::HotIndexes;
+use xgraph::indexes::{HotIndexes, NodeId};
 
 fn init_git_repo(root: &std::path::Path) {
     let status = Command::new("git")
@@ -13,6 +13,50 @@ fn init_git_repo(root: &std::path::Path) {
         .status()
         .expect("git init");
     assert!(status.success());
+}
+
+fn active_node_id(store: &CozoStore, path: &str, name: &str) -> String {
+    let rows = store
+        .run_read(
+            "?[id] := *active_node[id, path, _hash, _lid, _kind, name, _q, _span], \
+             path = $path, name = $name",
+            [
+                ("path".to_string(), cozo::DataValue::from(path.to_string())),
+                ("name".to_string(), cozo::DataValue::from(name.to_string())),
+            ]
+            .into(),
+        )
+        .expect("read active node");
+    match rows.rows.into_iter().next() {
+        Some(row) => match row.into_iter().next() {
+            Some(cozo::DataValue::Str(s)) => s.to_string(),
+            _ => panic!("expected active_node id as string"),
+        },
+        None => panic!("node {path}::{name} missing"),
+    }
+}
+
+fn edge_targets_for_source(store: &CozoStore, source: &str, kind: &str) -> Vec<String> {
+    store
+        .run_read(
+            "?[target] := *edge[$source, $kind, target, _p, _c]",
+            [
+                (
+                    "source".to_string(),
+                    cozo::DataValue::from(source.to_string()),
+                ),
+                ("kind".to_string(), cozo::DataValue::from(kind.to_string())),
+            ]
+            .into(),
+        )
+        .expect("read edge targets")
+        .rows
+        .into_iter()
+        .filter_map(|row| match row.into_iter().next()? {
+            cozo::DataValue::Str(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -657,6 +701,135 @@ fn typescript_per_binding_import_emits_file_level_edge() {
             .iter()
             .any(|(s, _)| s == "file:entry.ts" || s.starts_with("file:")),
         "expected an `imports` edge sourced from a file-level node, got {edges:?}"
+    );
+}
+
+#[test]
+fn typescript_duplicate_function_names_resolve_to_import_or_same_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    fs::create_dir_all(tmp.path().join("lib")).unwrap();
+    fs::create_dir_all(tmp.path().join("components")).unwrap();
+    fs::create_dir_all(tmp.path().join("pages")).unwrap();
+    fs::write(
+        tmp.path().join("lib").join("money.ts"),
+        "export function formatCents(cents: number): string { return `$${cents}`; }\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("components").join("Price.tsx"),
+        "import { formatCents } from '../lib/money';\n\
+         export function Price(): JSX.Element { return <span>{formatCents(10)}</span>; }\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("pages").join("show.tsx"),
+        "function formatCents(cents: number): string { return `${cents}`; }\n\
+         export function LocalPrice(): string { return formatCents(10); }\n",
+    )
+    .unwrap();
+
+    init_at(tmp.path()).expect("init");
+
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    let store = CozoStore::open(&cozo_path).expect("reopen");
+
+    let lib_format = active_node_id(&store, "lib/money.ts", "formatCents");
+    let local_format = active_node_id(&store, "pages/show.tsx", "formatCents");
+    let price = active_node_id(&store, "components/Price.tsx", "Price");
+    let local_price = active_node_id(&store, "pages/show.tsx", "LocalPrice");
+
+    let price_calls = edge_targets_for_source(&store, &price, "calls");
+    assert!(
+        price_calls.contains(&lib_format),
+        "expected imported formatCents target, got {price_calls:?}"
+    );
+    assert!(
+        !price_calls.contains(&local_format),
+        "imported formatCents must not fan out to same-named local helper"
+    );
+
+    let local_calls = edge_targets_for_source(&store, &local_price, "calls");
+    assert!(
+        local_calls.contains(&local_format),
+        "expected same-file formatCents target, got {local_calls:?}"
+    );
+    assert!(
+        !local_calls.contains(&lib_format),
+        "same-file formatCents must not fan out to imported helper in another file"
+    );
+}
+
+#[test]
+fn typescript_member_calls_do_not_resolve_by_property_name() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    fs::write(
+        tmp.path().join("list.ts"),
+        "export function map(): number { return 1; }\n\
+         export function render(items: number[]): number[] { return items.map((item) => item); }\n",
+    )
+    .unwrap();
+
+    init_at(tmp.path()).expect("init");
+
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    let store = CozoStore::open(&cozo_path).expect("reopen");
+    let map_fn = active_node_id(&store, "list.ts", "map");
+    let render = active_node_id(&store, "list.ts", "render");
+
+    let calls = edge_targets_for_source(&store, &render, "calls");
+    assert!(
+        !calls.contains(&map_fn),
+        ".map() must not resolve to an unrelated function named map, got {calls:?}"
+    );
+}
+
+#[test]
+fn tsx_jsx_component_usage_emits_render_edge() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    fs::create_dir_all(tmp.path().join("components")).unwrap();
+    fs::create_dir_all(tmp.path().join("pages")).unwrap();
+    fs::write(
+        tmp.path().join("components").join("Button.tsx"),
+        "export function Button(): JSX.Element { return <button />; }\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("pages").join("Page.tsx"),
+        "import { Button } from '../components/Button';\n\
+         export function Page(): JSX.Element { return <Button />; }\n",
+    )
+    .unwrap();
+
+    init_at(tmp.path()).expect("init");
+
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    let store = CozoStore::open(&cozo_path).expect("reopen");
+    let button = active_node_id(&store, "components/Button.tsx", "Button");
+    let page = active_node_id(&store, "pages/Page.tsx", "Page");
+
+    let renders = edge_targets_for_source(&store, &page, "renders");
+    assert!(
+        renders.contains(&button),
+        "expected Page to render Button, got {renders:?}"
+    );
+
+    let indexes = HotIndexes::load_from_cozo(&store).expect("load hot indexes");
+    assert!(
+        indexes
+            .callers_of(&NodeId::from(button.as_str()))
+            .iter()
+            .any(|id| id.as_str() == page),
+        "expected hot callers_of(Button) to include Page via renders"
+    );
+    assert!(
+        indexes
+            .callees_of(&NodeId::from(page.as_str()))
+            .iter()
+            .any(|id| id.as_str() == button),
+        "expected hot callees_of(Page) to include Button via renders"
     );
 }
 

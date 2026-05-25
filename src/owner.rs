@@ -605,9 +605,9 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
     for prep in prepared {
         let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
         let family = language_family(prep.language);
-        // Path-scoped keys are only meaningful for top-level definitions —
-        // a method on `class Foo` in file `bar.ts` is not importable as
-        // `bar#method`. We precompute the path-prefix once per file.
+        // Path-scoped import keys are only meaningful for top-level
+        // definitions, but every JS/TS definition also gets a file-local key
+        // used by call/JSX refs that were not bound to an import.
         let js_path_prefix = match prep.language {
             DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx => {
                 Some(js_path_key(&prep.relative))
@@ -626,6 +626,14 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
             // Also index by bare name when it differs, so unqualified callers can resolve.
             if node.name != node.qname && should_register_bare_name(family, &node.kind) {
                 table.register(family, &node.name, node_id.clone());
+            }
+
+            if let Some(prefix) = js_path_prefix.as_deref() {
+                table.register(
+                    family,
+                    &js_local_symbol_key(prefix, &node.name),
+                    node_id.clone(),
+                );
             }
 
             // Cross-file linking: top-level defs become importable under a
@@ -669,6 +677,10 @@ fn strip_index_suffix(path_key: &str) -> Option<&str> {
     path_key.strip_suffix("/index")
 }
 
+fn js_local_symbol_key(path_prefix: &str, name: &str) -> String {
+    format!("{path_prefix}#local#{name}")
+}
+
 /// Map a Python source path (e.g. `pkg/sub/helper.py`) to its dotted module
 /// name (`pkg.sub.helper`). `__init__.py` files use the parent directory.
 fn python_module_path(relative: &Path) -> Option<String> {
@@ -701,7 +713,17 @@ fn resolve_edges(
     let cozo_hash = CozoContentHash::from_bytes(*hash.as_bytes());
     let mut edges = Vec::new();
     for r in &extracted.refs {
-        let lookup_key = r.qname.as_deref().unwrap_or(r.name.as_str());
+        let lookup_key = if family == LanguageFamily::JsTs && is_jsts_precise_ref(&r.kind) {
+            let Some(qname) = r.qname.as_deref() else {
+                continue;
+            };
+            if !qname.contains('#') {
+                continue;
+            }
+            qname
+        } else {
+            r.qname.as_deref().unwrap_or(r.name.as_str())
+        };
         if family == LanguageFamily::PhpBlade && is_php_member_call_ref(&r.kind) {
             let Some(qname) = r.qname.as_deref() else {
                 continue;
@@ -758,6 +780,13 @@ fn is_php_member_call_ref(kind: &str) -> bool {
     matches!(kind, "method_call" | "static_call" | "nullsafe_method_call")
 }
 
+fn is_jsts_precise_ref(kind: &str) -> bool {
+    matches!(
+        kind,
+        "call" | "member_call" | "member_access" | "jsx_component"
+    )
+}
+
 /// File-level synthesized node ID. The `file:` prefix avoids any collision
 /// with `active_node_id` (always starts with a 64-hex content hash) and the
 /// laravel-heuristic `lh:` prefix. Consumers reading edges with this source
@@ -772,7 +801,7 @@ fn is_file_level_edge_kind(edge_kind: &str) -> bool {
 
 fn edge_kind_for_ref(kind: &str) -> &str {
     match kind {
-        "call" | "method_call" | "static_call" | "nullsafe_method_call" => "calls",
+        "call" | "member_call" | "method_call" | "static_call" | "nullsafe_method_call" => "calls",
         "extends" | "inheritance" => "inherits",
         "implements" => "implements",
         "trait_use" => "uses",
@@ -804,6 +833,7 @@ fn rewrite_imports(
 ) {
     match language {
         DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx => {
+            let local_prefix = js_path_key(relative_path);
             for r in &mut extracted.refs {
                 match r.kind.as_str() {
                     // Module-level refs: name carries the raw import string,
@@ -822,6 +852,25 @@ fn rewrite_imports(
                         {
                             r.qname = Some(format!("{resolved}#{}", r.name));
                         }
+                    }
+                    // Imported call/render refs leave the extractor as
+                    // `<raw_module>#<symbol>`. Local identifier call/render
+                    // refs get a file-local key. Either path avoids the
+                    // old repo-wide bare-name fallback.
+                    "call" | "jsx_component" => {
+                        if rewrite_js_import_ref_qname(r, relative_path, ts, worktree_root) {
+                            continue;
+                        }
+                        if r.qname.is_none() && is_js_simple_identifier(&r.name) {
+                            r.qname = Some(js_local_symbol_key(&local_prefix, &r.name));
+                        }
+                    }
+                    // Member refs only resolve when they came from a
+                    // namespace import (`Utils.format()` / `<Icons.Home />`).
+                    // Ordinary property names such as `.map()` stay
+                    // unresolved, so they cannot fan out to unrelated symbols.
+                    "member_call" | "member_access" => {
+                        let _ = rewrite_js_import_ref_qname(r, relative_path, ts, worktree_root);
                     }
                     _ => {}
                 }
@@ -853,6 +902,34 @@ fn rewrite_imports(
         }
         DetectedLanguage::Php | DetectedLanguage::Blade => {}
     }
+}
+
+fn rewrite_js_import_ref_qname(
+    r: &mut crate::extract::Ref,
+    relative_path: &Path,
+    ts: &TsAliasResolver,
+    worktree_root: &Path,
+) -> bool {
+    let Some(qname) = r.qname.clone() else {
+        return false;
+    };
+    let Some((module_src, symbol)) = qname.split_once('#') else {
+        return false;
+    };
+    let Some(resolved) = ts.resolve(module_src, relative_path, worktree_root) else {
+        return false;
+    };
+    r.qname = Some(format!("{resolved}#{symbol}"));
+    true
+}
+
+fn is_js_simple_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 fn framework_edge_kind(kind: crate::laravel::FrameworkEdgeKind) -> &'static str {

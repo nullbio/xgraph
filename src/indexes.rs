@@ -191,10 +191,12 @@ impl HotIndexes {
             self.register_symbol(SymbolKey { name, kind }, NodeId::from(node_id));
         }
 
-        // edge[source, kind, target] => provenance, confidence — wire call edges.
+        // edge[source, kind, target] => provenance, confidence — wire hot
+        // traversal edges.
         let rows = store.run_read(
-            "?[source, target] := *edge[source, $kind, target, _prov, _conf]",
-            [("kind".to_string(), DataValue::from("calls".to_string()))].into(),
+            "?[source, target] := *edge[source, kind, target, _prov, _conf], kind = 'calls'\n\
+             ?[source, target] := *edge[source, kind, target, _prov, _conf], kind = 'renders'",
+            BTreeMap::new(),
         )?;
         for row in rows.rows {
             let mut iter = row.into_iter();
@@ -279,9 +281,9 @@ impl HotIndexes {
             self.files.write().insert(path, new_ids);
         }
 
-        // Wire in edges.
+        // Wire in hot traversal edges.
         for edge in &update.edges {
-            if edge.kind == "calls" {
+            if is_hot_traversal_edge(&edge.kind) {
                 self.add_call_edge(
                     NodeId::from(edge.source_node_id.clone()),
                     NodeId::from(edge.target_node_id.clone()),
@@ -686,6 +688,10 @@ impl HotIndexes {
             }
         }
     }
+}
+
+fn is_hot_traversal_edge(kind: &str) -> bool {
+    matches!(kind, "calls" | "renders")
 }
 
 impl Default for HotIndexes {

@@ -133,7 +133,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "impact",
-        description: "Transitive backward closure over Calls / Inherits / Implements / References edges. 'What changes if this changes?' Optionally bounded by depth.",
+        description: "Transitive backward closure over Calls / Renders / Inherits / Implements / References edges. 'What changes if this changes?' Optionally bounded by depth.",
         input_schema: r#"{
             "type": "object",
             "properties": {

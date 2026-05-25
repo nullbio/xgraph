@@ -247,11 +247,12 @@ impl<E: CozoQueryExecutor> Cycles<'_, E> {
 // ---------------------------------------------------------------------------
 
 /// All nodes that transitively depend on `$target`: callers via `Calls`,
-/// subclasses via `Inherits`, implementers via `Implements`. Edges are
-/// followed *backwards* (caller -> callee becomes callee -> caller in the
-/// reverse traversal). Sorted for determinism.
+/// renderers via `Renders`, subclasses via `Inherits`, implementers via
+/// `Implements`. Edges are followed *backwards* (caller -> callee becomes
+/// callee -> caller in the reverse traversal). Sorted for determinism.
 pub const QUERY_DEPENDENCY_CONE: &str = "\
 dependency_edge[from, to] := *edge[from, kind, to], kind = 'Calls'
+dependency_edge[from, to] := *edge[from, kind, to], kind = 'Renders'
 dependency_edge[from, to] := *edge[from, kind, to], kind = 'Inherits'
 dependency_edge[from, to] := *edge[from, kind, to], kind = 'Implements'
 dependent[node] := dependency_edge[node, $target]
@@ -442,10 +443,11 @@ impl<E: CozoQueryExecutor> ModuleBoundary<'_, E> {
 
 /// "What changes if `$target` changes": every symbol whose meaning may be
 /// affected if the target node's behavior changes. Combines callers,
-/// subclasses, implementers, and references, transitively in the reverse
-/// direction. Sorted for determinism.
+/// renderers, subclasses, implementers, and references, transitively in the
+/// reverse direction. Sorted for determinism.
 pub const QUERY_CHANGES_IF: &str = "\
 impact_edge[from, to] := *edge[from, kind, to], kind = 'Calls'
+impact_edge[from, to] := *edge[from, kind, to], kind = 'Renders'
 impact_edge[from, to] := *edge[from, kind, to], kind = 'Inherits'
 impact_edge[from, to] := *edge[from, kind, to], kind = 'Implements'
 impact_edge[from, to] := *edge[from, kind, to], kind = 'References'
@@ -751,7 +753,7 @@ mod tests {
 
     #[test]
     fn golden_dependency_cone() {
-        let expected = "dependency_edge[from, to] := *edge[from, kind, to], kind = 'Calls'\ndependency_edge[from, to] := *edge[from, kind, to], kind = 'Inherits'\ndependency_edge[from, to] := *edge[from, kind, to], kind = 'Implements'\ndependent[node] := dependency_edge[node, $target]\ndependent[node] := dependent[downstream], dependency_edge[node, downstream]\n?[node] := dependent[node]\n:sort node\n";
+        let expected = "dependency_edge[from, to] := *edge[from, kind, to], kind = 'Calls'\ndependency_edge[from, to] := *edge[from, kind, to], kind = 'Renders'\ndependency_edge[from, to] := *edge[from, kind, to], kind = 'Inherits'\ndependency_edge[from, to] := *edge[from, kind, to], kind = 'Implements'\ndependent[node] := dependency_edge[node, $target]\ndependent[node] := dependent[downstream], dependency_edge[node, downstream]\n?[node] := dependent[node]\n:sort node\n";
         assert_eq!(QUERY_DEPENDENCY_CONE, expected);
     }
 
@@ -769,7 +771,7 @@ mod tests {
 
     #[test]
     fn golden_changes_if() {
-        let expected = "impact_edge[from, to] := *edge[from, kind, to], kind = 'Calls'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'Inherits'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'Implements'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'References'\naffected[node] := impact_edge[node, $target]\naffected[node] := affected[downstream], impact_edge[node, downstream]\n?[node] := affected[node]\n:sort node\n";
+        let expected = "impact_edge[from, to] := *edge[from, kind, to], kind = 'Calls'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'Renders'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'Inherits'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'Implements'\nimpact_edge[from, to] := *edge[from, kind, to], kind = 'References'\naffected[node] := impact_edge[node, $target]\naffected[node] := affected[downstream], impact_edge[node, downstream]\n?[node] := affected[node]\n:sort node\n";
         assert_eq!(QUERY_CHANGES_IF, expected);
     }
 
