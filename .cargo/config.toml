@@ -1,0 +1,7 @@
+# The vendored RocksDB headers in cozorocks 0.1.7 (pulled in by cozo 0.7's
+# storage-rocksdb feature) omit <cstdint> in several headers and therefore fail
+# to compile against GCC 13+, which no longer transitively includes it. Force
+# the include via CXXFLAGS so the cozo RocksDB backend builds cleanly on
+# modern Linux toolchains.
+[env]
+CXXFLAGS = { value = "-include cstdint", force = false, relative = false }
