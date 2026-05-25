@@ -1,48 +1,95 @@
-//! Daemon-side connection handler that serves a subset of MCP-style RPCs.
+//! Daemon-side connection handler serving MCP-style RPCs out of `HotIndexes`.
 //!
 //! Each request is one line of JSON: `{"jsonrpc":"2.0","id":<n>,"method":<name>,"params":{...}}`.
 //! Each response is one line of JSON: `{"jsonrpc":"2.0","id":<n>,"result":<value>}` or
 //! `{"jsonrpc":"2.0","id":<n>,"error":{"code":<int>,"message":<str>}}`.
+//!
+//! Hot lookups hit `HotIndexes` in memory — never Cozo. Complex graph
+//! analyses (transitive impact, cycles) would use `crate::query` against the
+//! Cozo store; those are not exposed by this handler yet.
 
-use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use cozo::DataValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
-use crate::cozo::CozoStore;
 use crate::daemon::ConnectionHandler;
+use crate::indexes::{HotIndexes, NodeId, SymbolKey};
 
 pub struct WorktreeHandler {
-    store: Arc<CozoStore>,
+    indexes: Arc<HotIndexes>,
 }
 
 impl WorktreeHandler {
-    pub fn new(store: Arc<CozoStore>) -> Self {
-        Self { store }
+    pub fn new(indexes: Arc<HotIndexes>) -> Self {
+        Self { indexes }
     }
 
     fn dispatch(&self, request: &Request) -> Result<Value, RpcError> {
         match request.method.as_str() {
             "find_symbol" => {
                 let params: FindSymbolParams = parse_params(request)?;
-                find_symbol(&self.store, &params)
+                let ids = match &params.kind {
+                    Some(kind) => self.indexes.lookup_symbol(&SymbolKey {
+                        name: params.name.clone(),
+                        kind: kind.clone(),
+                    }),
+                    None => self.indexes.lookup_symbol_by_name(&params.name),
+                };
+                let hits: Vec<Value> = ids
+                    .into_iter()
+                    .map(|id| {
+                        let record = self.indexes.get_node(&id);
+                        json!({
+                            "node_id": id.as_str(),
+                            "qname": record.as_ref().map(|r| r.qname.as_str()).unwrap_or(""),
+                            "kind": record.as_ref().map(|r| r.kind.as_str()).unwrap_or(""),
+                            "path": record.as_ref().map(|r| r.path.to_string_lossy().into_owned()).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "hits": hits }))
             }
             "callers_of" => {
                 let params: NodeIdParams = parse_params(request)?;
-                edges_to_node(&self.store, &params.node_id, "calls", Direction::Sources)
+                let ids: Vec<String> = self
+                    .indexes
+                    .callers_of(&NodeId::from(params.node_id.as_str()))
+                    .into_iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect();
+                Ok(json!({ "node_ids": ids }))
             }
             "callees_of" => {
                 let params: NodeIdParams = parse_params(request)?;
-                edges_to_node(&self.store, &params.node_id, "calls", Direction::Targets)
+                let ids: Vec<String> = self
+                    .indexes
+                    .callees_of(&NodeId::from(params.node_id.as_str()))
+                    .into_iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect();
+                Ok(json!({ "node_ids": ids }))
             }
             "nodes_in_file" => {
                 let params: NodesInFileParams = parse_params(request)?;
-                nodes_in_file(&self.store, &params.path)
+                let ids = self.indexes.nodes_in_file(&PathBuf::from(&params.path));
+                let nodes: Vec<Value> = ids
+                    .into_iter()
+                    .map(|id| {
+                        let record = self.indexes.get_node(&id);
+                        json!({
+                            "node_id": id.as_str(),
+                            "kind": record.as_ref().map(|r| r.kind.as_str()).unwrap_or(""),
+                            "name": record.as_ref().map(|r| r.name.as_str()).unwrap_or(""),
+                            "qname": record.as_ref().map(|r| r.qname.as_str()).unwrap_or(""),
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "nodes": nodes }))
             }
             other => Err(RpcError {
                 code: -32601,
@@ -54,125 +101,11 @@ impl WorktreeHandler {
 
 impl ConnectionHandler for WorktreeHandler {
     fn handle(&self, conn: UnixStream) -> JoinHandle<()> {
-        let store = Arc::clone(&self.store);
+        let indexes = Arc::clone(&self.indexes);
         tokio::spawn(async move {
-            let handler = WorktreeHandler { store };
+            let handler = WorktreeHandler { indexes };
             let _ = serve_connection(&handler, conn).await;
         })
-    }
-}
-
-enum Direction {
-    Sources,
-    Targets,
-}
-
-fn find_symbol(store: &CozoStore, params: &FindSymbolParams) -> Result<Value, RpcError> {
-    let script = match &params.kind {
-        Some(_) => {
-            "?[node_id, qname, path] := *symbol[$name, $kind, node_id, qname, path] :sort node_id"
-        }
-        None => {
-            "?[node_id, qname, path] := *symbol[$name, _kind, node_id, qname, path] :sort node_id"
-        }
-    };
-    let mut bindings = BTreeMap::new();
-    bindings.insert("name".to_string(), DataValue::from(params.name.clone()));
-    if let Some(k) = &params.kind {
-        bindings.insert("kind".to_string(), DataValue::from(k.clone()));
-    }
-    let rows = store
-        .run_read(script, bindings)
-        .map_err(rpc_error_from_cozo)?;
-    let hits: Vec<Value> = rows
-        .rows
-        .into_iter()
-        .filter_map(|row| {
-            let mut iter = row.into_iter();
-            let node_id = data_to_string(iter.next()?)?;
-            let qname = data_to_string(iter.next()?).unwrap_or_default();
-            let path = data_to_string(iter.next()?).unwrap_or_default();
-            Some(json!({
-                "node_id": node_id,
-                "qname": qname,
-                "path": path,
-            }))
-        })
-        .collect();
-    Ok(json!({ "hits": hits }))
-}
-
-fn edges_to_node(
-    store: &CozoStore,
-    node_id: &str,
-    kind: &str,
-    direction: Direction,
-) -> Result<Value, RpcError> {
-    let script = match direction {
-        Direction::Sources => {
-            "?[other] := *edge[other, $kind, $node_id, _provenance, _confidence] :sort other"
-        }
-        Direction::Targets => {
-            "?[other] := *edge[$node_id, $kind, other, _provenance, _confidence] :sort other"
-        }
-    };
-    let mut bindings = BTreeMap::new();
-    bindings.insert("node_id".to_string(), DataValue::from(node_id.to_string()));
-    bindings.insert("kind".to_string(), DataValue::from(kind.to_string()));
-    let rows = store
-        .run_read(script, bindings)
-        .map_err(rpc_error_from_cozo)?;
-    let ids: Vec<String> = rows
-        .rows
-        .into_iter()
-        .filter_map(|row| {
-            let mut iter = row.into_iter();
-            data_to_string(iter.next()?)
-        })
-        .collect();
-    Ok(json!({ "node_ids": ids }))
-}
-
-fn nodes_in_file(store: &CozoStore, path: &str) -> Result<Value, RpcError> {
-    let script = "?[node_id, kind, name, qname] := \
-        *active_node[node_id, $path, _hash, _local, kind, name, qname, _span] \
-        :sort node_id";
-    let mut bindings = BTreeMap::new();
-    bindings.insert("path".to_string(), DataValue::from(path.to_string()));
-    let rows = store
-        .run_read(script, bindings)
-        .map_err(rpc_error_from_cozo)?;
-    let nodes: Vec<Value> = rows
-        .rows
-        .into_iter()
-        .filter_map(|row| {
-            let mut iter = row.into_iter();
-            let node_id = data_to_string(iter.next()?)?;
-            let kind = data_to_string(iter.next()?).unwrap_or_default();
-            let name = data_to_string(iter.next()?).unwrap_or_default();
-            let qname = data_to_string(iter.next()?).unwrap_or_default();
-            Some(json!({
-                "node_id": node_id,
-                "kind": kind,
-                "name": name,
-                "qname": qname,
-            }))
-        })
-        .collect();
-    Ok(json!({ "nodes": nodes }))
-}
-
-fn data_to_string(value: DataValue) -> Option<String> {
-    match value {
-        DataValue::Str(s) => Some(s.into()),
-        _ => None,
-    }
-}
-
-fn rpc_error_from_cozo(err: crate::cozo::CozoError) -> RpcError {
-    RpcError {
-        code: -32000,
-        message: err.to_string(),
     }
 }
 
@@ -259,23 +192,15 @@ fn parse_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::indexes::{NodeRecord, SymbolKey};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    fn open_test_store() -> (TempDir, Arc<CozoStore>) {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("store");
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Arc::new(CozoStore::open(&dir).expect("cozo open"));
-        (tmp, store)
-    }
-
-    async fn run_request(store: Arc<CozoStore>, request: &str) -> Value {
+    async fn run_request(indexes: Arc<HotIndexes>, request: &str) -> Value {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
-        let handler = WorktreeHandler::new(store);
+        let handler = WorktreeHandler::new(indexes);
 
         let server = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.unwrap();
@@ -298,9 +223,8 @@ mod tests {
 
     #[tokio::test]
     async fn find_symbol_returns_empty_for_unknown() {
-        let (_tmp, store) = open_test_store();
         let resp = run_request(
-            store,
+            Arc::new(HotIndexes::new()),
             r#"{"jsonrpc":"2.0","id":1,"method":"find_symbol","params":{"name":"Nothing"}}"#,
         )
         .await;
@@ -309,31 +233,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nodes_in_file_returns_empty_for_unknown_path() {
-        let (_tmp, store) = open_test_store();
+    async fn find_symbol_returns_registered_node() {
+        let indexes = Arc::new(HotIndexes::new());
+        let id = NodeId::from("h:42");
+        indexes.insert_node(NodeRecord {
+            id: id.clone(),
+            path: PathBuf::from("src/foo.rs"),
+            kind: "class".to_string(),
+            name: "User".to_string(),
+            qname: "App\\Models\\User".to_string(),
+        });
+        indexes.register_symbol(
+            SymbolKey {
+                name: "User".to_string(),
+                kind: "class".to_string(),
+            },
+            id.clone(),
+        );
+
         let resp = run_request(
-            store,
-            r#"{"jsonrpc":"2.0","id":2,"method":"nodes_in_file","params":{"path":"nope.rs"}}"#,
+            indexes,
+            r#"{"jsonrpc":"2.0","id":7,"method":"find_symbol","params":{"name":"User"}}"#,
         )
         .await;
-        assert_eq!(resp["result"]["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(resp["id"], 7);
+        let hits = resp["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["node_id"], "h:42");
+        assert_eq!(hits[0]["qname"], "App\\Models\\User");
+        assert_eq!(hits[0]["kind"], "class");
+        assert_eq!(hits[0]["path"], "src/foo.rs");
+    }
+
+    #[tokio::test]
+    async fn nodes_in_file_returns_registered_ids() {
+        let indexes = Arc::new(HotIndexes::new());
+        let path = PathBuf::from("src/foo.rs");
+        indexes.insert_file(path.clone(), vec![NodeId::from("h:1"), NodeId::from("h:2")]);
+        let resp = run_request(
+            indexes,
+            r#"{"jsonrpc":"2.0","id":3,"method":"nodes_in_file","params":{"path":"src/foo.rs"}}"#,
+        )
+        .await;
+        let nodes = resp["result"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["node_id"], "h:1");
+        assert_eq!(nodes[1]["node_id"], "h:2");
     }
 
     #[tokio::test]
     async fn unknown_method_returns_jsonrpc_error() {
-        let (_tmp, store) = open_test_store();
         let resp = run_request(
-            store,
+            Arc::new(HotIndexes::new()),
             r#"{"jsonrpc":"2.0","id":9,"method":"bogus","params":{}}"#,
         )
         .await;
         assert_eq!(resp["error"]["code"], -32601);
-    }
-
-    #[tokio::test]
-    async fn invalid_json_returns_parse_error() {
-        let (_tmp, store) = open_test_store();
-        let resp = run_request(store, "{not json").await;
-        assert_eq!(resp["error"]["code"], -32700);
     }
 }

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cozo::{
@@ -16,6 +17,7 @@ use crate::cozo::{
 use crate::extract::ExtractedFile;
 use crate::hash::ContentHash;
 use crate::ignore::IgnoreMatcher;
+use crate::indexes::HotIndexes;
 use crate::language::LanguageRegistry;
 use crate::scanner::{DetectedLanguage, ScanError, scan};
 
@@ -26,17 +28,20 @@ pub struct WorktreeOwner {
     matcher: IgnoreMatcher,
     registry: LanguageRegistry,
     writer: WriterHandle,
+    indexes: Arc<HotIndexes>,
     generation: u64,
 }
 
 impl WorktreeOwner {
     /// Build an owner against a freshly-opened Cozo store. Caller supplies
-    /// the store; the owner takes responsibility for the writer queue.
+    /// the store and the hot indexes; the owner takes responsibility for the
+    /// writer queue and mirrors every accepted `FileUpdate` into the indexes.
     pub fn new(
         worktree_root: PathBuf,
         matcher: IgnoreMatcher,
         registry: LanguageRegistry,
         store: CozoStore,
+        indexes: Arc<HotIndexes>,
     ) -> Result<Self, crate::cozo::CozoError> {
         let writer = WriterQueue::start(store)?;
         Ok(Self {
@@ -44,6 +49,7 @@ impl WorktreeOwner {
             matcher,
             registry,
             writer,
+            indexes,
             generation: 1,
         })
     }
@@ -148,6 +154,44 @@ impl WorktreeOwner {
         let mut update = FileUpdate::from_extracted(&prep.extracted, metadata);
         update.path = prep.relative.to_string_lossy().into_owned();
         update.edges = edges;
+        // Mirror the update into the hot indexes so MCP reads see the new state
+        // immediately; the writer thread persists the same facts to Cozo.
+        self.indexes.apply_file_update(&update);
+        self.writer.submit(update)?;
+        Ok(())
+    }
+
+    /// Drop all facts for a path that no longer exists on disk. Submits an
+    /// empty `FileUpdate` so the Cozo transaction removes the active rows;
+    /// also clears the hot-index state for the path.
+    pub fn process_delete(&mut self, path: PathBuf) -> Result<(), OwnerError> {
+        let relative = path
+            .strip_prefix(&self.worktree_root)
+            .unwrap_or(&path)
+            .to_path_buf();
+        let metadata = FileUpdateMetadata {
+            content_hash: CozoContentHash::from_bytes([0u8; 32]),
+            language: String::new(),
+            parser_version: PARSER_VERSION,
+            mtime: 0,
+            size: 0,
+            generation: self.generation,
+        };
+        self.generation += 1;
+        let update = FileUpdate {
+            path: relative.to_string_lossy().into_owned(),
+            content_hash: metadata.content_hash,
+            language: metadata.language,
+            parser_version: metadata.parser_version,
+            mtime: metadata.mtime,
+            size: metadata.size,
+            generation: metadata.generation,
+            diagnostics: Vec::new(),
+            nodes: Vec::new(),
+            refs: Vec::new(),
+            edges: Vec::new(),
+        };
+        self.indexes.remove_path(&relative);
         self.writer.submit(update)?;
         Ok(())
     }
@@ -335,8 +379,10 @@ mod tests {
         std::fs::create_dir_all(&store_dir).unwrap();
         let store = CozoStore::open(&store_dir).expect("cozo");
 
+        let indexes = Arc::new(HotIndexes::new());
         let mut owner =
-            WorktreeOwner::new(tmp.path().to_path_buf(), matcher, registry, store).expect("owner");
+            WorktreeOwner::new(tmp.path().to_path_buf(), matcher, registry, store, indexes)
+                .expect("owner");
         let n = owner.index_all().expect("index_all");
         assert_eq!(n, 1, "only the .py file should produce an update");
         let errs = owner.shutdown();
@@ -354,8 +400,10 @@ mod tests {
         std::fs::create_dir_all(&store_dir).unwrap();
         let store = CozoStore::open(&store_dir).expect("cozo");
 
+        let indexes = Arc::new(HotIndexes::new());
         let mut owner =
-            WorktreeOwner::new(tmp.path().to_path_buf(), matcher, registry, store).expect("owner");
+            WorktreeOwner::new(tmp.path().to_path_buf(), matcher, registry, store, indexes)
+                .expect("owner");
         let changed = owner
             .process_change(tmp.path().join("README.md"))
             .expect("process_change");

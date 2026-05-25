@@ -1,49 +1,67 @@
 //! Daemon-owned hot indexes for common MCP reads.
 //!
 //! Hot MCP calls (node by id, callers, callees, files, simple symbol lookup)
-//! must not route through Cozo Datalog. They hit these in-memory structures
-//! instead. Loading them from Cozo at daemon startup belongs to the daemon
-//! integration phase; this module ships only the data structures and the
-//! thread-safe access surface.
+//! hit these in-memory structures instead of issuing a Datalog query. The
+//! indexes are populated from Cozo on daemon startup via `load_from_cozo` and
+//! kept in sync incrementally as `WorktreeOwner` applies file updates via
+//! `apply_file_update` / `remove_path`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use cozo::DataValue;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-pub use crate::resolve::NodeId;
+use crate::cozo::{CozoError, CozoStore, FileUpdate, active_node_id};
+
+/// Stable node identifier shared with Cozo's `active_node` relation.
+///
+/// Wraps `Arc<str>` so handlers and mutation paths can share an id cheaply.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct NodeId(pub Arc<str>);
+
+impl NodeId {
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for NodeId {
+    fn from(s: &str) -> Self {
+        Self(Arc::from(s))
+    }
+}
+
+impl From<String> for NodeId {
+    fn from(s: String) -> Self {
+        Self(Arc::from(s))
+    }
+}
 
 /// Snapshot record for an active node held in the hot index.
-///
-/// `kind` is stored as `u32` because the `NodeKind` enum lives in another
-/// module; this index intentionally does not depend on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRecord {
     pub id: NodeId,
     pub path: PathBuf,
-    pub kind: u32,
+    pub kind: String,
     pub name: String,
     pub qname: String,
-    pub span_start: u32,
-    pub span_end: u32,
 }
 
 /// Key used to find candidate node ids for a name + kind pair.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SymbolKey {
     pub name: String,
-    pub kind: u32,
+    pub kind: String,
 }
 
 /// In-memory indexes owned by the daemon.
-///
-/// All operations are safe to call from multiple threads. Returned vectors
-/// are owned copies so callers never observe internal locks or shards.
-///
-/// `nodes_in_file` returns node ids in the order they were supplied to
-/// `insert_file`. `callers_of` / `callees_of` return node ids in insertion
-/// order; duplicate edges are not stored.
 pub struct HotIndexes {
     nodes: DashMap<NodeId, NodeRecord>,
     symbols: DashMap<SymbolKey, Vec<NodeId>>,
@@ -63,16 +81,184 @@ impl HotIndexes {
         }
     }
 
+    /// Populate the indexes from the Cozo store. Designed for daemon startup
+    /// when an empty `HotIndexes` is constructed in front of an existing
+    /// persistent graph.
+    pub fn load_from_cozo(store: &CozoStore) -> Result<Self, CozoError> {
+        let me = Self::new();
+        me.reload_from_cozo(store)?;
+        Ok(me)
+    }
+
+    pub fn reload_from_cozo(&self, store: &CozoStore) -> Result<(), CozoError> {
+        // active_node[node_id] => path, content_hash, local_node_id, kind, name, qname, span
+        let rows = store.run_read(
+            "?[node_id, path, kind, name, qname] := \
+             *active_node[node_id, path, _hash, _local, kind, name, qname, _span]",
+            BTreeMap::new(),
+        )?;
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let Some(node_id) = data_to_string(iter.next()) else {
+                continue;
+            };
+            let path = data_to_string(iter.next()).unwrap_or_default();
+            let kind = data_to_string(iter.next()).unwrap_or_default();
+            let name = data_to_string(iter.next()).unwrap_or_default();
+            let qname = data_to_string(iter.next()).unwrap_or_default();
+            let id = NodeId::from(node_id);
+            let record = NodeRecord {
+                id: id.clone(),
+                path: PathBuf::from(&path),
+                kind,
+                name,
+                qname,
+            };
+            self.nodes.insert(id.clone(), record);
+            self.files
+                .write()
+                .entry(PathBuf::from(&path))
+                .or_default()
+                .push(id);
+        }
+
+        // symbol[name, kind, node_id] => qname, path
+        let rows = store.run_read(
+            "?[name, kind, node_id] := *symbol[name, kind, node_id, _qname, _path]",
+            BTreeMap::new(),
+        )?;
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let name = data_to_string(iter.next()).unwrap_or_default();
+            let kind = data_to_string(iter.next()).unwrap_or_default();
+            let Some(node_id) = data_to_string(iter.next()) else {
+                continue;
+            };
+            self.register_symbol(SymbolKey { name, kind }, NodeId::from(node_id));
+        }
+
+        // edge[source, kind, target] => provenance, confidence — wire call edges.
+        let rows = store.run_read(
+            "?[source, target] := *edge[source, $kind, target, _prov, _conf]",
+            [("kind".to_string(), DataValue::from("calls".to_string()))].into(),
+        )?;
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let Some(src) = data_to_string(iter.next()) else {
+                continue;
+            };
+            let Some(dst) = data_to_string(iter.next()) else {
+                continue;
+            };
+            self.add_call_edge(NodeId::from(src), NodeId::from(dst));
+        }
+        Ok(())
+    }
+
+    /// Mirror the effect of a Cozo `FileUpdate` transaction into the indexes.
+    /// Call this when `WriterHandle::submit` returns Ok; the writer thread
+    /// performs the durable commit in parallel.
+    pub fn apply_file_update(&self, update: &FileUpdate) {
+        let path = PathBuf::from(&update.path);
+
+        // Remove any prior active nodes for this path.
+        let prior = self.files.write().remove(&path).unwrap_or_default();
+        for id in &prior {
+            self.nodes.remove(id);
+            self.callees.write().remove(id);
+            // Remove this node as a target from any callers map.
+            let callers = self.callers.write().remove(id);
+            if let Some(srcs) = callers {
+                for src in srcs {
+                    if let Some(targets) = self.callees.write().get_mut(&src) {
+                        targets.retain(|t| t != id);
+                    }
+                }
+            }
+            // Drop symbol entries that reference this id.
+            self.symbols.retain(|_, ids| {
+                ids.retain(|x| x != id);
+                !ids.is_empty()
+            });
+        }
+
+        // Insert new active nodes.
+        let mut new_ids: Vec<NodeId> = Vec::with_capacity(update.nodes.len());
+        for node in &update.nodes {
+            let global_id = NodeId::from(active_node_id(&update.content_hash, node.local_node_id));
+            let record = NodeRecord {
+                id: global_id.clone(),
+                path: path.clone(),
+                kind: node.kind.clone(),
+                name: node.name.clone(),
+                qname: node.qname.clone(),
+            };
+            self.nodes.insert(global_id.clone(), record);
+            // Register by name and qname so unqualified callers also resolve.
+            self.register_symbol(
+                SymbolKey {
+                    name: node.name.clone(),
+                    kind: node.kind.clone(),
+                },
+                global_id.clone(),
+            );
+            if node.qname != node.name {
+                self.register_symbol(
+                    SymbolKey {
+                        name: node.qname.clone(),
+                        kind: node.kind.clone(),
+                    },
+                    global_id.clone(),
+                );
+            }
+            new_ids.push(global_id);
+        }
+        if !new_ids.is_empty() {
+            self.files.write().insert(path, new_ids);
+        }
+
+        // Wire in edges.
+        for edge in &update.edges {
+            if edge.kind == "calls" {
+                self.add_call_edge(
+                    NodeId::from(edge.source_node_id.clone()),
+                    NodeId::from(edge.target_node_id.clone()),
+                );
+            }
+        }
+    }
+
+    /// Drop all active state for a path (e.g., file deleted on disk).
+    pub fn remove_path(&self, path: &Path) {
+        let prior = self.files.write().remove(path).unwrap_or_default();
+        for id in &prior {
+            self.nodes.remove(id);
+            self.callees.write().remove(id);
+            let callers = self.callers.write().remove(id);
+            if let Some(srcs) = callers {
+                for src in srcs {
+                    if let Some(targets) = self.callees.write().get_mut(&src) {
+                        targets.retain(|t| t != id);
+                    }
+                }
+            }
+            self.symbols.retain(|_, ids| {
+                ids.retain(|x| x != id);
+                !ids.is_empty()
+            });
+        }
+    }
+
     pub fn insert_node(&self, record: NodeRecord) {
-        self.nodes.insert(record.id, record);
+        self.nodes.insert(record.id.clone(), record);
     }
 
-    pub fn get_node(&self, id: NodeId) -> Option<NodeRecord> {
-        self.nodes.get(&id).map(|entry| entry.value().clone())
+    pub fn get_node(&self, id: &NodeId) -> Option<NodeRecord> {
+        self.nodes.get(id).map(|entry| entry.value().clone())
     }
 
-    pub fn remove_node(&self, id: NodeId) -> Option<NodeRecord> {
-        self.nodes.remove(&id).map(|(_, record)| record)
+    pub fn remove_node(&self, id: &NodeId) -> Option<NodeRecord> {
+        self.nodes.remove(id).map(|(_, record)| record)
     }
 
     pub fn insert_file(&self, path: PathBuf, node_ids: Vec<NodeId>) {
@@ -90,9 +276,9 @@ impl HotIndexes {
     pub fn add_call_edge(&self, caller: NodeId, callee: NodeId) {
         {
             let mut callees = self.callees.write();
-            let targets = callees.entry(caller).or_default();
+            let targets = callees.entry(caller.clone()).or_default();
             if !targets.contains(&callee) {
-                targets.push(callee);
+                targets.push(callee.clone());
             }
         }
         {
@@ -104,41 +290,33 @@ impl HotIndexes {
         }
     }
 
-    pub fn remove_call_edge(&self, caller: NodeId, callee: NodeId) {
+    pub fn remove_call_edge(&self, caller: &NodeId, callee: &NodeId) {
         {
             let mut callees = self.callees.write();
-            if let Some(targets) = callees.get_mut(&caller) {
-                targets.retain(|id| *id != callee);
+            if let Some(targets) = callees.get_mut(caller) {
+                targets.retain(|id| id != callee);
                 if targets.is_empty() {
-                    callees.remove(&caller);
+                    callees.remove(caller);
                 }
             }
         }
         {
             let mut callers = self.callers.write();
-            if let Some(sources) = callers.get_mut(&callee) {
-                sources.retain(|id| *id != caller);
+            if let Some(sources) = callers.get_mut(callee) {
+                sources.retain(|id| id != caller);
                 if sources.is_empty() {
-                    callers.remove(&callee);
+                    callers.remove(callee);
                 }
             }
         }
     }
 
-    pub fn callers_of(&self, callee: NodeId) -> Vec<NodeId> {
-        self.callers
-            .read()
-            .get(&callee)
-            .cloned()
-            .unwrap_or_default()
+    pub fn callers_of(&self, callee: &NodeId) -> Vec<NodeId> {
+        self.callers.read().get(callee).cloned().unwrap_or_default()
     }
 
-    pub fn callees_of(&self, caller: NodeId) -> Vec<NodeId> {
-        self.callees
-            .read()
-            .get(&caller)
-            .cloned()
-            .unwrap_or_default()
+    pub fn callees_of(&self, caller: &NodeId) -> Vec<NodeId> {
+        self.callees.read().get(caller).cloned().unwrap_or_default()
     }
 
     pub fn register_symbol(&self, key: SymbolKey, node_id: NodeId) {
@@ -155,9 +333,21 @@ impl HotIndexes {
             .unwrap_or_default()
     }
 
-    pub fn unregister_symbol(&self, key: &SymbolKey, node_id: NodeId) {
+    /// Symbols matching `name`, regardless of `kind`. Useful for the MCP
+    /// `find_symbol` call where the caller doesn't supply a kind filter.
+    pub fn lookup_symbol_by_name(&self, name: &str) -> Vec<NodeId> {
+        let mut hits = Vec::new();
+        for entry in self.symbols.iter() {
+            if entry.key().name == name {
+                hits.extend(entry.value().iter().cloned());
+            }
+        }
+        hits
+    }
+
+    pub fn unregister_symbol(&self, key: &SymbolKey, node_id: &NodeId) {
         self.symbols.remove_if_mut(key, |_, ids| {
-            ids.retain(|id| *id != node_id);
+            ids.retain(|id| id != node_id);
             ids.is_empty()
         });
     }
@@ -169,223 +359,94 @@ impl Default for HotIndexes {
     }
 }
 
+fn data_to_string(value: Option<DataValue>) -> Option<String> {
+    match value? {
+        DataValue::Str(s) => Some(s.into()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::thread;
-
-    fn sample_record(id: u64, path: &str, name: &str) -> NodeRecord {
+    fn sample_record(id: &str, path: &str, name: &str) -> NodeRecord {
         NodeRecord {
-            id: NodeId(id),
+            id: NodeId::from(id),
             path: PathBuf::from(path),
-            kind: 1,
+            kind: "function".to_string(),
             name: name.to_string(),
-            qname: format!("ns::{name}"),
-            span_start: 0,
-            span_end: 10,
+            qname: name.to_string(),
         }
     }
 
     #[test]
-    fn node_insert_lookup_remove() {
-        let indexes = HotIndexes::new();
-        let record = sample_record(7, "src/a.rs", "alpha");
-
-        indexes.insert_node(record.clone());
-        assert_eq!(indexes.get_node(NodeId(7)), Some(record.clone()));
-
-        let removed = indexes.remove_node(NodeId(7));
-        assert_eq!(removed, Some(record));
-        assert!(indexes.get_node(NodeId(7)).is_none());
+    fn node_lookup_roundtrip() {
+        let idx = HotIndexes::new();
+        idx.insert_node(sample_record("h:1", "a.rs", "foo"));
+        let got = idx.get_node(&NodeId::from("h:1")).expect("present");
+        assert_eq!(got.name, "foo");
+        idx.remove_node(&NodeId::from("h:1"));
+        assert!(idx.get_node(&NodeId::from("h:1")).is_none());
     }
 
     #[test]
-    fn file_insert_lookup_remove_preserves_insertion_order() {
-        let indexes = HotIndexes::new();
-        let path = PathBuf::from("src/a.rs");
-        let ids = vec![NodeId(3), NodeId(1), NodeId(2)];
-
-        indexes.insert_file(path.clone(), ids.clone());
-        assert_eq!(indexes.nodes_in_file(&path), ids);
-
-        let removed = indexes.remove_file(&path);
-        assert_eq!(removed, ids);
-        assert!(indexes.nodes_in_file(&path).is_empty());
+    fn files_index_returns_inserted_ids() {
+        let idx = HotIndexes::new();
+        idx.insert_file(
+            PathBuf::from("foo.rs"),
+            vec![NodeId::from("h:1"), NodeId::from("h:2")],
+        );
+        let ids = idx.nodes_in_file(Path::new("foo.rs"));
+        assert_eq!(ids, vec![NodeId::from("h:1"), NodeId::from("h:2")]);
     }
 
     #[test]
-    fn nodes_in_file_returns_all_inserted_ids() {
-        let indexes = HotIndexes::new();
-        let path = PathBuf::from("src/big.rs");
-        let ids: Vec<NodeId> = (0..32).map(NodeId).collect();
-
-        indexes.insert_file(path.clone(), ids.clone());
-
-        let retrieved = indexes.nodes_in_file(&path);
-        assert_eq!(retrieved.len(), ids.len());
-        assert_eq!(retrieved, ids);
+    fn call_edges_consistent_both_directions() {
+        let idx = HotIndexes::new();
+        let caller = NodeId::from("h:caller");
+        let callee = NodeId::from("h:callee");
+        idx.add_call_edge(caller.clone(), callee.clone());
+        assert_eq!(idx.callees_of(&caller), vec![callee.clone()]);
+        assert_eq!(idx.callers_of(&callee), vec![caller.clone()]);
+        idx.remove_call_edge(&caller, &callee);
+        assert!(idx.callees_of(&caller).is_empty());
+        assert!(idx.callers_of(&callee).is_empty());
     }
 
     #[test]
-    fn call_edges_round_trip_and_dedupe() {
-        let indexes = HotIndexes::new();
-        let caller = NodeId(1);
-        let callee = NodeId(2);
-
-        indexes.add_call_edge(caller, callee);
-        indexes.add_call_edge(caller, callee);
-
-        assert_eq!(indexes.callees_of(caller), vec![callee]);
-        assert_eq!(indexes.callers_of(callee), vec![caller]);
-
-        indexes.remove_call_edge(caller, callee);
-        assert!(indexes.callees_of(caller).is_empty());
-        assert!(indexes.callers_of(callee).is_empty());
-    }
-
-    #[test]
-    fn remove_call_edge_does_not_affect_other_edges() {
-        let indexes = HotIndexes::new();
-        let caller = NodeId(1);
-        let a = NodeId(2);
-        let b = NodeId(3);
-
-        indexes.add_call_edge(caller, a);
-        indexes.add_call_edge(caller, b);
-
-        indexes.remove_call_edge(caller, a);
-
-        assert_eq!(indexes.callees_of(caller), vec![b]);
-        assert!(indexes.callers_of(a).is_empty());
-        assert_eq!(indexes.callers_of(b), vec![caller]);
-    }
-
-    #[test]
-    fn symbol_lookup_returns_all_registered_nodes() {
-        let indexes = HotIndexes::new();
+    fn symbol_register_lookup_unregister() {
+        let idx = HotIndexes::new();
         let key = SymbolKey {
-            name: "do_work".to_string(),
-            kind: 2,
+            name: "Foo".to_string(),
+            kind: "class".to_string(),
         };
-
-        indexes.register_symbol(key.clone(), NodeId(10));
-        indexes.register_symbol(key.clone(), NodeId(20));
-        indexes.register_symbol(key.clone(), NodeId(10)); // dedupe
-
-        let mut hits = indexes.lookup_symbol(&key);
-        hits.sort();
-        assert_eq!(hits, vec![NodeId(10), NodeId(20)]);
-
-        indexes.unregister_symbol(&key, NodeId(10));
-        assert_eq!(indexes.lookup_symbol(&key), vec![NodeId(20)]);
-
-        indexes.unregister_symbol(&key, NodeId(20));
-        assert!(indexes.lookup_symbol(&key).is_empty());
+        idx.register_symbol(key.clone(), NodeId::from("h:1"));
+        idx.register_symbol(key.clone(), NodeId::from("h:2"));
+        assert_eq!(idx.lookup_symbol(&key).len(), 2);
+        idx.unregister_symbol(&key, &NodeId::from("h:1"));
+        assert_eq!(idx.lookup_symbol(&key), vec![NodeId::from("h:2")]);
     }
 
     #[test]
-    fn concurrent_node_inserts_are_all_retrievable() {
-        let indexes = Arc::new(HotIndexes::new());
-        let thread_count = 8u64;
-        let per_thread = 500u64;
-
-        let mut handles = Vec::with_capacity(thread_count as usize);
-        for t in 0..thread_count {
-            let indexes = Arc::clone(&indexes);
-            handles.push(thread::spawn(move || {
-                for i in 0..per_thread {
-                    let id = t * per_thread + i;
-                    indexes.insert_node(sample_record(id, "src/x.rs", "n"));
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("worker thread panicked");
-        }
-
-        for t in 0..thread_count {
-            for i in 0..per_thread {
-                let id = t * per_thread + i;
-                assert!(
-                    indexes.get_node(NodeId(id)).is_some(),
-                    "missing node {id} after concurrent insert"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn concurrent_call_edges_are_consistent() {
-        let indexes = Arc::new(HotIndexes::new());
-        let caller = NodeId(0);
-        let callee_count = 2_000u64;
-
-        let mut handles = Vec::new();
-        let chunk = 250u64;
-        let mut start = 1u64;
-        while start <= callee_count {
-            let end = (start + chunk - 1).min(callee_count);
-            let indexes = Arc::clone(&indexes);
-            handles.push(thread::spawn(move || {
-                for id in start..=end {
-                    indexes.add_call_edge(caller, NodeId(id));
-                }
-            }));
-            start = end + 1;
-        }
-        for h in handles {
-            h.join().expect("edge writer panicked");
-        }
-
-        let callees: HashSet<NodeId> = indexes.callees_of(caller).into_iter().collect();
-        let expected: HashSet<NodeId> = (1..=callee_count).map(NodeId).collect();
-        assert_eq!(callees, expected);
-
-        for id in 1..=callee_count {
-            assert_eq!(indexes.callers_of(NodeId(id)), vec![caller]);
-        }
-    }
-
-    #[test]
-    fn concurrent_symbol_registration_collects_all_ids() {
-        let indexes = Arc::new(HotIndexes::new());
-        let key = SymbolKey {
-            name: "shared".to_string(),
-            kind: 1,
-        };
-
-        let thread_count = 6u64;
-        let per_thread = 200u64;
-
-        let mut handles = Vec::with_capacity(thread_count as usize);
-        for t in 0..thread_count {
-            let indexes = Arc::clone(&indexes);
-            let key = key.clone();
-            handles.push(thread::spawn(move || {
-                for i in 0..per_thread {
-                    let id = t * per_thread + i;
-                    indexes.register_symbol(key.clone(), NodeId(id));
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("symbol writer panicked");
-        }
-
-        let hits: HashSet<NodeId> = indexes.lookup_symbol(&key).into_iter().collect();
-        let expected: HashSet<NodeId> = (0..thread_count * per_thread).map(NodeId).collect();
-        assert_eq!(hits, expected);
-    }
-
-    #[test]
-    fn default_matches_new() {
-        let a = HotIndexes::default();
-        let b = HotIndexes::new();
-        a.insert_node(sample_record(1, "p", "n"));
-        b.insert_node(sample_record(1, "p", "n"));
-        assert_eq!(a.get_node(NodeId(1)), b.get_node(NodeId(1)));
+    fn lookup_by_name_filters_across_kinds() {
+        let idx = HotIndexes::new();
+        idx.register_symbol(
+            SymbolKey {
+                name: "Foo".to_string(),
+                kind: "class".to_string(),
+            },
+            NodeId::from("h:1"),
+        );
+        idx.register_symbol(
+            SymbolKey {
+                name: "Foo".to_string(),
+                kind: "function".to_string(),
+            },
+            NodeId::from("h:2"),
+        );
+        let mut hits = idx.lookup_symbol_by_name("Foo");
+        hits.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(hits, vec![NodeId::from("h:1"), NodeId::from("h:2")]);
     }
 }

@@ -354,11 +354,16 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     let store = CozoStore::open(&persistent.cozo_db_path())?;
     let matcher = IgnoreMatcher::new(worktree.as_path())?;
     let registry = LanguageRegistry::with_all();
+
+    // Hot indexes are loaded from Cozo first so any restart sees the prior
+    // graph immediately; the owner then mirrors fresh updates into them.
+    let indexes = Arc::new(crate::indexes::HotIndexes::load_from_cozo(&store)?);
     let mut owner = WorktreeOwner::new(
         worktree.as_path().to_path_buf(),
         matcher,
         registry,
-        store.clone(),
+        store,
+        Arc::clone(&indexes),
     )?;
 
     let indexed = owner.index_all()?;
@@ -370,10 +375,13 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("build tokio runtime");
+        .map_err(|err| CliError::Io {
+            path: PathBuf::from("<tokio runtime>"),
+            source: err,
+        })?;
 
     let result: Result<(), DaemonError> = runtime_tokio.block_on(async move {
-        let handler = Arc::new(WorktreeHandler::new(Arc::new(store)));
+        let handler = Arc::new(WorktreeHandler::new(indexes));
         let config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
         let handle = crate::daemon::start(config).await?;
         let socket_path = handle.socket_path().to_path_buf();
