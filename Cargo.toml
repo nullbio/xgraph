@@ -40,3 +40,7 @@ tempfile = "3.27"
 [[bench]]
 name = "index"
 harness = false
+
+[[bench]]
+name = "parse"
+harness = false

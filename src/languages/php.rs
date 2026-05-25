@@ -599,6 +599,17 @@ struct Extractor<'src> {
     /// for it. Used so a ref capture or call site can attribute itself to the
     /// enclosing class/function.
     container_index: std::collections::HashMap<usize, LocalNodeId>,
+    /// Container byte-ranges in registration order. Used by
+    /// `enclosing_definition_local_id` to find the smallest containing scope
+    /// for a given (start, end) range in O(N_containers) instead of walking
+    /// the full Tree-sitter parse for every lookup.
+    container_ranges: Vec<(usize, usize, LocalNodeId)>,
+    /// Precomputed namespace scopes for the file: `(applies_from, applies_to,
+    /// namespace_name)`. Block-scope namespaces (`namespace X { ... }`) use
+    /// their body's byte range. File-scope namespaces (`namespace X;`) span
+    /// from their statement end to the next namespace's start (or EOF).
+    /// Looked up linearly by `enclosing_namespace_v2` once per emitted def.
+    namespace_scopes: Vec<(usize, usize, String)>,
 }
 
 impl<'src> Extractor<'src> {
@@ -609,6 +620,8 @@ impl<'src> Extractor<'src> {
             refs: Vec::new(),
             diagnostics: Vec::new(),
             container_index: std::collections::HashMap::new(),
+            container_ranges: Vec::new(),
+            namespace_scopes: Vec::new(),
         }
     }
 
@@ -623,10 +636,48 @@ impl<'src> Extractor<'src> {
 
     fn run(&mut self, tree: &Tree) {
         let root = tree.root_node();
+        self.collect_namespace_scopes(root);
         self.collect_definitions(root);
         self.collect_imports(root);
         self.collect_calls(root);
         self.collect_syntax_diagnostics(root);
+    }
+
+    fn collect_namespace_scopes(&mut self, root: TsNode<'_>) {
+        // First pass: block-scope namespaces (those with a body) anywhere
+        // in the tree. Body byte range IS the applicable scope.
+        let mut cursor = root.walk();
+        walk_collect_block_namespaces(&mut cursor, self.source, &mut self.namespace_scopes);
+
+        // Second pass: file-scope namespaces (`namespace X;`). Each applies
+        // from its declaration's end byte until the next file-scope
+        // declaration starts (or EOF). Walk only root-level children.
+        let mut file_scope_starts: Vec<(usize, String)> = Vec::new();
+        let mut walker = root.walk();
+        for child in root.named_children(&mut walker) {
+            if child.kind() != "namespace_definition" {
+                continue;
+            }
+            if child.child_by_field_name("body").is_some() {
+                continue;
+            }
+            let Some(name_node) = child.child_by_field_name("name") else {
+                continue;
+            };
+            let Ok(name) = std::str::from_utf8(&self.source[name_node.byte_range()]) else {
+                continue;
+            };
+            file_scope_starts.push((child.end_byte(), name.to_string()));
+        }
+        let file_end = root.end_byte();
+        for i in 0..file_scope_starts.len() {
+            let (start, name) = file_scope_starts[i].clone();
+            let end = file_scope_starts
+                .get(i + 1)
+                .map(|(s, _)| *s)
+                .unwrap_or(file_end);
+            self.namespace_scopes.push((start, end, name));
+        }
     }
 
     fn collect_definitions(&mut self, root: TsNode<'_>) {
@@ -704,21 +755,21 @@ impl<'src> Extractor<'src> {
         }
 
         for pending in pending_refs {
-            self.emit_class_ref(pending, root);
+            self.emit_class_ref(pending);
         }
     }
 
     fn emit_definition(&mut self, pending: PendingDefinition, root: TsNode<'_>) {
+        let _ = root; // namespace lookup now uses precomputed scopes
         let namespace = if pending.kind == "namespace" {
             None
         } else {
-            enclosing_namespace(root, pending.span.start.byte, self.source)
+            enclosing_namespace_v2(&self.namespace_scopes, pending.span.start.byte)
         };
-        let parent_local_id = enclosing_definition_local_id(
-            root,
+        let parent_local_id = enclosing_definition_local_id_v2(
+            &self.container_ranges,
             pending.span.start.byte,
             pending.span.end.byte,
-            &self.container_index,
         );
 
         let qname = build_qname(
@@ -740,15 +791,16 @@ impl<'src> Extractor<'src> {
 
         self.container_index
             .insert(pending.container_node_id, local_id);
+        self.container_ranges
+            .push((pending.span.start.byte, pending.span.end.byte, local_id));
         self.nodes.push(node);
     }
 
-    fn emit_class_ref(&mut self, pending: PendingClassRef, root: TsNode<'_>) {
-        let container = enclosing_definition_local_id(
-            root,
+    fn emit_class_ref(&mut self, pending: PendingClassRef) {
+        let container = enclosing_definition_local_id_v2(
+            &self.container_ranges,
             pending.span.start.byte,
             pending.span.end.byte,
-            &self.container_index,
         );
 
         let id = self.refs.len() as LocalRefId;
@@ -778,12 +830,12 @@ impl<'src> Extractor<'src> {
                 if capture_name != "import_declaration" {
                     continue;
                 }
-                self.emit_imports_for_declaration(cap.node, root);
+                self.emit_imports_for_declaration(cap.node);
             }
         }
     }
 
-    fn emit_imports_for_declaration(&mut self, decl: TsNode<'_>, root: TsNode<'_>) {
+    fn emit_imports_for_declaration(&mut self, decl: TsNode<'_>) {
         let mut prefix: Option<String> = None;
         let mut walker = decl.walk();
         for child in decl.named_children(&mut walker) {
@@ -792,13 +844,13 @@ impl<'src> Extractor<'src> {
                     prefix = Some(self.slice_text(child).to_string());
                 }
                 "namespace_use_clause" => {
-                    self.emit_use_clause(child, prefix.as_deref(), root);
+                    self.emit_use_clause(child, prefix.as_deref());
                 }
                 "namespace_use_group" => {
                     let mut group_walker = child.walk();
                     for clause in child.named_children(&mut group_walker) {
                         if clause.kind() == "namespace_use_clause" {
-                            self.emit_use_clause(clause, prefix.as_deref(), root);
+                            self.emit_use_clause(clause, prefix.as_deref());
                         }
                     }
                 }
@@ -807,7 +859,7 @@ impl<'src> Extractor<'src> {
         }
     }
 
-    fn emit_use_clause(&mut self, clause: TsNode<'_>, prefix: Option<&str>, root: TsNode<'_>) {
+    fn emit_use_clause(&mut self, clause: TsNode<'_>, prefix: Option<&str>) {
         let mut walker = clause.walk();
         let mut name_node: Option<TsNode<'_>> = None;
         for child in clause.named_children(&mut walker) {
@@ -840,11 +892,10 @@ impl<'src> Extractor<'src> {
             .clone()
             .unwrap_or_else(|| last_segment(&qname).to_string());
 
-        let container = enclosing_definition_local_id(
-            root,
+        let container = enclosing_definition_local_id_v2(
+            &self.container_ranges,
             clause.start_byte(),
             clause.end_byte(),
-            &self.container_index,
         );
 
         let id = self.refs.len() as LocalRefId;
@@ -861,38 +912,38 @@ impl<'src> Extractor<'src> {
 
     fn collect_calls(&mut self, root: TsNode<'_>) {
         let mut cursor = root.walk();
-        self.walk_calls(&mut cursor, root);
+        self.walk_calls(&mut cursor);
     }
 
-    fn walk_calls(&mut self, cursor: &mut TreeCursor<'_>, root: TsNode<'_>) {
+    fn walk_calls(&mut self, cursor: &mut TreeCursor<'_>) {
         let node = cursor.node();
         match node.kind() {
             "function_call_expression" => {
                 if let Some(function) = node.child_by_field_name("function")
                     && let Some((name, name_node)) = callee_name(function, self.source)
                 {
-                    self.emit_call(node, name_node, name, "call", root);
+                    self.emit_call(node, name_node, name, "call");
                 }
             }
             "member_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, "method_call", root);
+                    self.emit_call(node, name_node, name, "method_call");
                 }
             }
             "nullsafe_member_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, "nullsafe_method_call", root);
+                    self.emit_call(node, name_node, name, "nullsafe_method_call");
                 }
             }
             "scoped_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, "static_call", root);
+                    self.emit_call(node, name_node, name, "static_call");
                 }
             }
             _ => {}
@@ -900,7 +951,7 @@ impl<'src> Extractor<'src> {
 
         if cursor.goto_first_child() {
             loop {
-                self.walk_calls(cursor, root);
+                self.walk_calls(cursor);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -915,13 +966,11 @@ impl<'src> Extractor<'src> {
         _name_node: TsNode<'_>,
         name: String,
         kind: &'static str,
-        root: TsNode<'_>,
     ) {
-        let container = enclosing_definition_local_id(
-            root,
+        let container = enclosing_definition_local_id_v2(
+            &self.container_ranges,
             call.start_byte(),
             call.end_byte(),
-            &self.container_index,
         );
         let id = self.refs.len() as LocalRefId;
         self.refs.push(Ref {
@@ -1009,6 +1058,51 @@ fn simple_identifier(node: TsNode<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
+/// O(N_scopes) namespace lookup over a precomputed scope table. The smallest
+/// matching scope wins so block-scoped namespaces inside file-scoped ones
+/// are picked correctly.
+fn enclosing_namespace_v2(
+    namespace_scopes: &[(usize, usize, String)],
+    byte: usize,
+) -> Option<String> {
+    let mut best: Option<(usize, &str)> = None;
+    for (start, end, name) in namespace_scopes {
+        if *start <= byte && byte < *end {
+            let span = end - start;
+            if best.as_ref().is_none_or(|(s, _)| span < *s) {
+                best = Some((span, name.as_str()));
+            }
+        }
+    }
+    best.map(|(_, name)| name.to_string())
+}
+
+fn walk_collect_block_namespaces(
+    cursor: &mut TreeCursor<'_>,
+    source: &[u8],
+    out: &mut Vec<(usize, usize, String)>,
+) {
+    let node = cursor.node();
+    if node.kind() == "namespace_definition"
+        && let Some(body) = node.child_by_field_name("body")
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = std::str::from_utf8(&source[name_node.byte_range()])
+    {
+        let r = body.byte_range();
+        out.push((r.start, r.end, name.to_string()));
+    }
+    if cursor.goto_first_child() {
+        loop {
+            walk_collect_block_namespaces(cursor, source, out);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
+}
+
+#[allow(dead_code)]
 fn enclosing_namespace(root: TsNode<'_>, byte: usize, source: &[u8]) -> Option<String> {
     // PHP namespaces come in two forms:
     //   1. `namespace Foo { ... }` — block scope; the namespace_definition has
@@ -1088,55 +1182,30 @@ fn walk_block_namespaces(
     }
 }
 
-fn enclosing_definition_local_id(
-    root: TsNode<'_>,
+/// Find the smallest containing definition for the byte range `[start, end]`
+/// in `O(N_containers)` time. Replaces an earlier `O(N_tree)` recursive walk
+/// that turned the extractor quadratic for large files.
+///
+/// `container_ranges` is the order-preserving Vec of (start, end, local_id)
+/// triples maintained by `emit_definition`. Smaller (`end - start`) wins ties,
+/// so methods are picked over their enclosing class.
+fn enclosing_definition_local_id_v2(
+    container_ranges: &[(usize, usize, LocalNodeId)],
     start: usize,
     end: usize,
-    container_index: &std::collections::HashMap<usize, LocalNodeId>,
 ) -> Option<LocalNodeId> {
     let mut best: Option<(usize, LocalNodeId)> = None;
-    let mut cursor = root.walk();
-    walk_definition_containers(
-        &mut cursor,
-        start,
-        end,
-        container_index,
-        &mut best,
-        root.id(),
-    );
-    best.map(|(_, id)| id)
-}
-
-fn walk_definition_containers(
-    cursor: &mut TreeCursor<'_>,
-    start: usize,
-    end: usize,
-    container_index: &std::collections::HashMap<usize, LocalNodeId>,
-    best: &mut Option<(usize, LocalNodeId)>,
-    root_id: usize,
-) {
-    let node = cursor.node();
-    if let Some(local_id) = container_index.get(&node.id())
-        && node.id() != root_id
-    {
-        let range = node.byte_range();
-        if range.start <= start && range.end >= end {
-            let span = range.end - range.start;
+    for &(c_start, c_end, id) in container_ranges {
+        // Strict inequality on at least one side: a container does not
+        // enclose itself.
+        if c_start <= start && c_end >= end && (c_start < start || c_end > end) {
+            let span = c_end - c_start;
             if best.as_ref().is_none_or(|(s, _)| span < *s) {
-                *best = Some((span, *local_id));
+                best = Some((span, id));
             }
         }
     }
-
-    if cursor.goto_first_child() {
-        loop {
-            walk_definition_containers(cursor, start, end, container_index, best, root_id);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-        cursor.goto_parent();
-    }
+    best.map(|(_, id)| id)
 }
 
 fn build_qname(
