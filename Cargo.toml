@@ -5,3 +5,4 @@ edition = "2024"
 description = "Linux-native code graph daemon for Git worktrees"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
