@@ -370,7 +370,15 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     persistent.ensure_created()?;
     let runtime = ensure_runtime_dir(worktree.as_path())?;
 
-    let store = CozoStore::open(&persistent.cozo_db_path())?;
+    // Opening the Cozo store can fail transiently with a RocksDB
+    // file-lock conflict if another xgraph process is holding it —
+    // most commonly `xgraph reindex` mid-run, or another daemon
+    // shutting down. Retry with backoff rather than exiting; the
+    // proxy's reconnect path counts on us eventually succeeding.
+    let store = open_store_with_lock_retry(
+        &persistent.cozo_db_path(),
+        std::time::Duration::from_secs(60),
+    )?;
     let registry = LanguageRegistry::with_all();
     // The watcher and the scanner share a matcher view of the worktree.
     let watcher_matcher = std::sync::Arc::new(IgnoreMatcher::new(worktree.as_path())?);
@@ -717,6 +725,54 @@ fn process_alive(pid: i32) -> bool {
         return false;
     }
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Open the Cozo store, retrying when RocksDB reports a file-lock
+/// conflict (another writer is currently holding the LOCK file).
+/// Used at daemon startup to ride through transient lock contention
+/// — most commonly `xgraph reindex` running concurrently.
+///
+/// Returns the first non-lock error verbatim. Returns the last
+/// lock-contention error if the budget runs out.
+fn open_store_with_lock_retry(
+    path: &Path,
+    total_budget: std::time::Duration,
+) -> Result<CozoStore, CliError> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + total_budget;
+    let mut delay = Duration::from_millis(50);
+    let mut announced = false;
+    loop {
+        match CozoStore::open(path) {
+            Ok(store) => return Ok(store),
+            Err(err) if is_lock_contention(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err.into());
+                }
+                if !announced {
+                    eprintln!(
+                        "xgraph: cozo store is locked by another process; waiting up to {}s",
+                        total_budget.as_secs()
+                    );
+                    announced = true;
+                }
+                std::thread::sleep(delay.min(deadline.saturating_duration_since(now)));
+                delay = (delay * 2).min(Duration::from_millis(500));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Detect RocksDB's "file lock held by another process" condition by
+/// substring-matching the Cozo error message. RocksDB's `IOStatus`
+/// surfaces `Resource temporarily unavailable` (EAGAIN on Linux) and
+/// always mentions the LOCK file path when it can't acquire it.
+fn is_lock_contention(err: &crate::cozo::CozoError) -> bool {
+    let s = err.to_string();
+    s.contains("Resource temporarily unavailable")
+        || (s.contains("lock file") && s.contains("LOCK"))
 }
 
 /// Send a JSON-RPC request to the worktree's daemon socket and pretty-
