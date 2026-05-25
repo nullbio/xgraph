@@ -7,6 +7,7 @@ pub mod cli;
 pub mod daemon;
 pub mod git;
 pub mod indexes;
+pub mod languages;
 pub mod laravel;
 pub mod manifest;
 pub mod mcp;
