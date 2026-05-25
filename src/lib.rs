@@ -12,6 +12,7 @@ pub mod laravel;
 pub mod manifest;
 pub mod mcp;
 pub mod parser;
+pub mod query;
 pub mod runtime;
 pub mod scanner;
 pub mod storage;
