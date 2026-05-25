@@ -1,0 +1,60 @@
+# Core project docs are source files, not generated output.
+!README.md
+!AGENTS.md
+
+# Local planning/spec detail that should not be committed.
+/IMPLEMENTATION_GUIDE.md
+
+# Rust build output.
+/target/
+
+# Local xgraph state. Real persistent state belongs under `git rev-parse --git-path xgraph`;
+# these entries catch accidental in-tree state while developing.
+/.xgraph/
+/xgraph/
+/graph.cozo/
+/schema.version
+/xgraph.sock
+/daemon.pid
+/startup.lock
+/daemon.lock
+
+# Coverage, profiling, and diagnostics.
+*.profraw
+*.profdata
+*.lcov
+/coverage/
+/tarpaulin-report.html
+*.log
+*.trace
+*.dump
+
+# Generated fixtures, snapshots, and benchmarks.
+/fixtures/generated/
+/tests/fixtures/generated/
+/benches/fixtures/generated/
+/bench-results/
+/criterion/
+
+# Vendored or generated dependency/build output from projects used as fixtures.
+node_modules/
+vendor/
+dist/
+build/
+coverage/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+
+.direnv/
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+.DS_Store
