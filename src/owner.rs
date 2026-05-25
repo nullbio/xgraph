@@ -22,6 +22,7 @@ use crate::import_resolver::{PythonImportResolver, TsAliasResolver};
 use crate::indexes::HotIndexes;
 use crate::language::LanguageRegistry;
 use crate::scanner::{DetectedLanguage, ScanError, scan};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use rayon::prelude::*;
 
 pub const PARSER_VERSION: u32 = 1;
@@ -48,6 +49,32 @@ pub struct PhaseTimings {
     pub parse_us: u64,
     pub resolve_us: u64,
     pub store_us: u64,
+}
+
+pub type MaintenanceResult = Result<IndexSummary, OwnerError>;
+pub type MaintenanceSender = Sender<MaintenanceCommand>;
+pub type MaintenanceReceiver = Receiver<MaintenanceCommand>;
+
+#[derive(Debug)]
+pub enum MaintenanceCommand {
+    Sync { reply: Sender<MaintenanceResult> },
+    Reindex { reply: Sender<MaintenanceResult> },
+}
+
+impl MaintenanceCommand {
+    pub fn sync() -> (Self, Receiver<MaintenanceResult>) {
+        let (reply, rx) = crossbeam_channel::bounded(1);
+        (Self::Sync { reply }, rx)
+    }
+
+    pub fn reindex() -> (Self, Receiver<MaintenanceResult>) {
+        let (reply, rx) = crossbeam_channel::bounded(1);
+        (Self::Reindex { reply }, rx)
+    }
+}
+
+pub fn maintenance_channel() -> (MaintenanceSender, MaintenanceReceiver) {
+    unbounded()
 }
 
 pub struct WorktreeOwner {
@@ -201,6 +228,26 @@ impl WorktreeOwner {
                 store_us,
             },
         })
+    }
+
+    pub fn sync_all_with_progress(
+        &mut self,
+        progress: &crate::progress::Progress,
+    ) -> Result<IndexSummary, OwnerError> {
+        self.status.mark_reconcile_running();
+        self.index_all_with_progress(progress)
+    }
+
+    pub fn reindex_all_with_progress(
+        &mut self,
+        progress: &crate::progress::Progress,
+    ) -> Result<IndexSummary, OwnerError> {
+        self.status.mark_reconcile_running();
+        self.writer.flush()?;
+        self.writer.truncate_graph()?;
+        self.indexes.clear();
+        self.generation = 1;
+        self.index_all_with_progress(progress)
     }
 
     /// Re-extract a single path and submit the update. Cross-file resolution

@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,6 +33,7 @@ use crate::cozo::CozoStore;
 use crate::daemon::ConnectionHandler;
 use crate::daemon_status::{DaemonStatus, RSS_WARNING_THRESHOLD_BYTES};
 use crate::indexes::{HotIndexes, NodeId, SearchMode, SearchQuery, SymbolKey};
+use crate::owner::{IndexSummary, MaintenanceCommand, MaintenanceSender};
 
 pub struct WorktreeHandler {
     indexes: Arc<HotIndexes>,
@@ -42,6 +44,8 @@ pub struct WorktreeHandler {
     /// (`impact`) which the in-memory hot index can't satisfy because it
     /// only tracks call edges, not inherits/implements/references.
     store: Arc<CozoStore>,
+    maintenance: Option<MaintenanceSender>,
+    maintenance_gate: Arc<RwLock<()>>,
 }
 
 impl WorktreeHandler {
@@ -56,12 +60,43 @@ impl WorktreeHandler {
             status,
             worktree_root,
             store,
+            maintenance: None,
+            maintenance_gate: Arc::new(RwLock::new(())),
+        }
+    }
+
+    pub fn with_maintenance(
+        indexes: Arc<HotIndexes>,
+        status: Arc<DaemonStatus>,
+        worktree_root: PathBuf,
+        store: Arc<CozoStore>,
+        maintenance: MaintenanceSender,
+        maintenance_gate: Arc<RwLock<()>>,
+    ) -> Self {
+        Self {
+            indexes,
+            status,
+            worktree_root,
+            store,
+            maintenance: Some(maintenance),
+            maintenance_gate,
         }
     }
 
     /// Tool dispatch + per-tool `catching_up` scoping. Returns the result
     /// payload AND whether this specific request scope is mid-flight.
     fn dispatch(&self, request: &Request) -> Result<(Value, bool), RpcError> {
+        match request.method.as_str() {
+            "sync" => return self.dispatch_maintenance(MaintenanceOp::Sync),
+            "reindex" => return self.dispatch_maintenance(MaintenanceOp::Reindex),
+            _ => {}
+        }
+
+        let _maintenance_read = self.maintenance_gate.read();
+        self.dispatch_read(request)
+    }
+
+    fn dispatch_read(&self, request: &Request) -> Result<(Value, bool), RpcError> {
         match request.method.as_str() {
             "find_symbol" => {
                 let params: FindSymbolParams = parse_params(request)?;
@@ -284,6 +319,34 @@ impl WorktreeHandler {
             other => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {other}"),
+            }),
+        }
+    }
+
+    fn dispatch_maintenance(&self, op: MaintenanceOp) -> Result<(Value, bool), RpcError> {
+        let Some(sender) = &self.maintenance else {
+            return Err(RpcError {
+                code: -32601,
+                message: "maintenance commands are not available on this handler".to_string(),
+            });
+        };
+        let (cmd, rx) = match op {
+            MaintenanceOp::Sync => MaintenanceCommand::sync(),
+            MaintenanceOp::Reindex => MaintenanceCommand::reindex(),
+        };
+        sender.send(cmd).map_err(|_| RpcError {
+            code: -32000,
+            message: "maintenance worker is not running".to_string(),
+        })?;
+        let summary = rx.recv().map_err(|_| RpcError {
+            code: -32000,
+            message: "maintenance worker stopped before replying".to_string(),
+        })?;
+        match summary {
+            Ok(summary) => Ok((maintenance_summary_json(op, summary), false)),
+            Err(err) => Err(RpcError {
+                code: -32000,
+                message: err.to_string(),
             }),
         }
     }
@@ -550,16 +613,44 @@ impl ConnectionHandler for WorktreeHandler {
         let status = Arc::clone(&self.status);
         let worktree_root = self.worktree_root.clone();
         let store = Arc::clone(&self.store);
+        let maintenance = self.maintenance.clone();
+        let maintenance_gate = Arc::clone(&self.maintenance_gate);
         tokio::spawn(async move {
             let handler = WorktreeHandler {
                 indexes,
                 status,
                 worktree_root,
                 store,
+                maintenance,
+                maintenance_gate,
             };
             let _ = serve_connection(&handler, conn).await;
         })
     }
+}
+
+#[derive(Clone, Copy)]
+enum MaintenanceOp {
+    Sync,
+    Reindex,
+}
+
+fn maintenance_summary_json(op: MaintenanceOp, summary: IndexSummary) -> Value {
+    json!({
+        "operation": match op {
+            MaintenanceOp::Sync => "sync",
+            MaintenanceOp::Reindex => "reindex",
+        },
+        "files_indexed": summary.files_indexed,
+        "nodes_created": summary.nodes_created,
+        "edges_created": summary.edges_created,
+        "timings": {
+            "scan_us": summary.timings.scan_us,
+            "parse_us": summary.timings.parse_us,
+            "resolve_us": summary.timings.resolve_us,
+            "store_us": summary.timings.store_us,
+        },
+    })
 }
 
 async fn serve_connection(handler: &WorktreeHandler, conn: UnixStream) -> std::io::Result<()> {
@@ -849,10 +940,17 @@ mod tests {
         store: Arc<CozoStore>,
         request: &str,
     ) -> Value {
+        run_request_with_handler(
+            WorktreeHandler::new(indexes, status, worktree_root, store),
+            request,
+        )
+        .await
+    }
+
+    async fn run_request_with_handler(handler: WorktreeHandler, request: &str) -> Value {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
-        let handler = WorktreeHandler::new(indexes, status, worktree_root, store);
 
         let server = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.unwrap();
@@ -871,6 +969,41 @@ mod tests {
         reader.read_line(&mut line).await.unwrap();
         let _ = server.await;
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reindex_request_runs_through_maintenance_channel() {
+        let (indexes, status, root, store) = empty_setup();
+        let (tx, rx) = crate::owner::maintenance_channel();
+        let gate = Arc::new(RwLock::new(()));
+        let worker = std::thread::spawn(move || {
+            let command = rx.recv().expect("maintenance command");
+            match command {
+                crate::owner::MaintenanceCommand::Reindex { reply } => {
+                    let _ = reply.send(Ok(IndexSummary {
+                        files_indexed: 2,
+                        nodes_created: 3,
+                        edges_created: 4,
+                        ..IndexSummary::default()
+                    }));
+                }
+                other => panic!("expected reindex, got {other:?}"),
+            }
+        });
+
+        let handler = WorktreeHandler::with_maintenance(indexes, status, root, store, tx, gate);
+        let resp = run_request_with_handler(
+            handler,
+            r#"{"jsonrpc":"2.0","id":31,"method":"reindex","params":{}}"#,
+        )
+        .await;
+        worker.join().expect("maintenance worker joins");
+
+        assert_eq!(resp["id"], 31);
+        assert_eq!(resp["result"]["operation"], "reindex");
+        assert_eq!(resp["result"]["files_indexed"], 2);
+        assert_eq!(resp["result"]["nodes_created"], 3);
+        assert_eq!(resp["result"]["edges_created"], 4);
     }
 
     #[tokio::test]

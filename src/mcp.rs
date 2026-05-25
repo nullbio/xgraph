@@ -178,8 +178,7 @@ impl McpProxy {
     /// Run the full proxy lifecycle against the supplied stdio streams.
     ///
     /// Sessions are bounded by the daemon connection. If the daemon
-    /// dies mid-session (e.g. an `xgraph reindex` killed it to take
-    /// the Cozo lock), the proxy lazy-spawns a fresh daemon and
+    /// dies mid-session, the proxy lazy-spawns a fresh daemon and
     /// resumes pumping rather than propagating the closure up to the
     /// LLM CLI as "Transport closed".
     pub async fn proxy<R, W>(&self, stdin: R, stdout: W) -> Result<(), McpError>
@@ -204,8 +203,8 @@ impl McpProxy {
 }
 
 /// Why a [`mcp_pump_session`] returned. Used by [`McpProxy::proxy`] to
-/// decide whether to reconnect (daemon went away — usually because
-/// `xgraph reindex` killed it) or exit (client closed stdin).
+/// decide whether to reconnect (daemon went away) or exit (client
+/// closed stdin).
 enum PumpOutcome {
     /// stdin reached EOF — the LLM CLI is done with us, exit cleanly.
     ClientClosed,

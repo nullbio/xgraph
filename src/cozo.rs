@@ -560,6 +560,7 @@ pub fn active_node_id(hash: &ContentHash, local_node_id: u32) -> String {
 /// per-message channel overhead.
 enum WriterMessage {
     Update(Box<FileUpdate>),
+    Truncate(crossbeam_channel::Sender<Result<(), WriterError>>),
     /// Sync barrier: the writer commits everything submitted before this
     /// message, then signals the bundled `Sender`. Used by callers that
     /// need a "writer has drained" point — e.g., `init_at` reporting
@@ -623,6 +624,15 @@ impl WriterHandle {
             .map_err(|_| WriterError::QueueClosed)?;
         rx.recv().map_err(|_| WriterError::QueueClosed)?;
         Ok(())
+    }
+
+    pub fn truncate_graph(&self) -> Result<(), WriterError> {
+        let sender = self.sender.as_ref().ok_or(WriterError::QueueClosed)?;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        sender
+            .send(WriterMessage::Truncate(tx))
+            .map_err(|_| WriterError::QueueClosed)?;
+        rx.recv().map_err(|_| WriterError::QueueClosed)?
     }
 
     /// Drain pending submissions, signal the worker to stop, and join the
@@ -697,6 +707,10 @@ fn writer_loop(
         // Block until the first message.
         match receiver.recv() {
             Ok(WriterMessage::Update(first)) => batch.push(first),
+            Ok(WriterMessage::Truncate(ack)) => {
+                let _ = ack.send(store.truncate_graph().map_err(WriterError::Apply));
+                continue;
+            }
             Ok(WriterMessage::Flush(ack)) => {
                 // No work to do; ack immediately and continue waiting.
                 let _ = ack.send(());
@@ -706,9 +720,14 @@ fn writer_loop(
             Err(_) => break,
         }
         // Greedily drain additional messages without blocking.
+        let mut pending_truncate: Option<crossbeam_channel::Sender<Result<(), WriterError>>> = None;
         while batch.len() < WRITER_BATCH_MAX {
             match receiver.try_recv() {
                 Ok(WriterMessage::Update(u)) => batch.push(u),
+                Ok(WriterMessage::Truncate(ack)) => {
+                    pending_truncate = Some(ack);
+                    break;
+                }
                 Ok(WriterMessage::Flush(ack)) => {
                     // Defer the ack until the in-flight batch commits so
                     // the caller sees "fully drained" semantics.
@@ -732,6 +751,9 @@ fn writer_loop(
         // it — they're guaranteed all prior submissions are durable.
         for ack in pending_flushes {
             let _ = ack.send(());
+        }
+        if let Some(ack) = pending_truncate {
+            let _ = ack.send(store.truncate_graph().map_err(WriterError::Apply));
         }
         if shutdown_pending {
             break;

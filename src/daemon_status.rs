@@ -38,6 +38,11 @@ impl DaemonStatus {
         self.initial_reconcile_done.store(true, Ordering::Release);
     }
 
+    pub fn mark_reconcile_running(&self) {
+        self.initial_reconcile_done.store(false, Ordering::Release);
+        self.pending_paths.clear();
+    }
+
     pub fn is_reconcile_done(&self) -> bool {
         self.initial_reconcile_done.load(Ordering::Acquire)
     }

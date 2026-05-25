@@ -273,7 +273,10 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
     // updated graph.
     ensure_no_running_daemon(worktree.as_path())?;
 
-    let store = CozoStore::open(&persistent.cozo_db_path())?;
+    let store = open_store_with_lock_retry(
+        &persistent.cozo_db_path(),
+        std::time::Duration::from_secs(60),
+    )?;
     let matcher = IgnoreMatcher::new(worktree.as_path())?;
     let registry = LanguageRegistry::with_all();
     let indexes = Arc::new(crate::indexes::HotIndexes::new());
@@ -370,11 +373,6 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     persistent.ensure_created()?;
     let runtime = ensure_runtime_dir(worktree.as_path())?;
 
-    // Opening the Cozo store can fail transiently with a RocksDB
-    // file-lock conflict if another xgraph process is holding it —
-    // most commonly `xgraph reindex` mid-run, or another daemon
-    // shutting down. Retry with backoff rather than exiting; the
-    // proxy's reconnect path counts on us eventually succeeding.
     let store = open_store_with_lock_retry(
         &persistent.cozo_db_path(),
         std::time::Duration::from_secs(60),
@@ -398,6 +396,8 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         Arc::clone(&indexes),
         Arc::clone(&status),
     )?;
+    let (maintenance_tx, maintenance_rx) = crate::owner::maintenance_channel();
+    let maintenance_gate = Arc::new(parking_lot::RwLock::new(()));
 
     let summary = owner.index_all()?;
     println!(
@@ -421,28 +421,24 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         source: std::io::Error::other(err.to_string()),
     })?;
 
-    let worktree_root_for_thread = worktree.as_path().to_path_buf();
+    let maintenance_gate_for_thread = Arc::clone(&maintenance_gate);
     let watcher_thread = std::thread::Builder::new()
         .name("xgraph-watcher-handler".into())
         .spawn(move || {
-            while let Ok(batch) = batch_rx.recv() {
-                for path in batch.created.iter().chain(batch.modified.iter()) {
-                    if let Err(err) = owner.process_change(path.clone()) {
-                        eprintln!("watcher: process_change {}: {err}", path.display());
-                    }
-                }
-                for path in &batch.deleted {
-                    if let Err(err) = owner.process_delete(path.clone()) {
-                        eprintln!("watcher: process_delete {}: {err}", path.display());
-                    }
-                }
-                // worktree_root_for_thread is captured for the diagnostic logs above; the
-                // strip_prefix happens inside process_delete itself.
-                let _ = &worktree_root_for_thread;
-                if batch.ignore_file_changed
-                    && let Err(err) = owner.reconcile_after_ignore_change()
-                {
-                    eprintln!("watcher: ignore-change reconciliation failed: {err}");
+            loop {
+                crossbeam_channel::select! {
+                    recv(batch_rx) -> msg => match msg {
+                        Ok(batch) => process_watcher_batch(&mut owner, batch),
+                        Err(_) => break,
+                    },
+                    recv(maintenance_rx) -> msg => match msg {
+                        Ok(command) => run_maintenance_command(
+                            &mut owner,
+                            &maintenance_gate_for_thread,
+                            command,
+                        ),
+                        Err(_) => break,
+                    },
                 }
             }
             let _ = owner.shutdown();
@@ -462,11 +458,13 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
 
     let worktree_root_for_handler = worktree.as_path().to_path_buf();
     let result: Result<(), DaemonError> = runtime_tokio.block_on(async move {
-        let handler = Arc::new(WorktreeHandler::new(
+        let handler = Arc::new(WorktreeHandler::with_maintenance(
             indexes,
             status,
             worktree_root_for_handler,
             store_for_handler,
+            maintenance_tx,
+            maintenance_gate,
         ));
         let config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
         let handle = crate::daemon::start(config).await?;
@@ -517,6 +515,46 @@ async fn wait_for_shutdown() -> Result<(), std::io::Error> {
         _ = sigint.recv() => {}
     }
     Ok(())
+}
+
+fn process_watcher_batch(owner: &mut WorktreeOwner, batch: crate::watcher::BatchedChanges) {
+    for path in batch.created.iter().chain(batch.modified.iter()) {
+        if let Err(err) = owner.process_change(path.clone()) {
+            eprintln!("watcher: process_change {}: {err}", path.display());
+        }
+    }
+    for path in &batch.deleted {
+        if let Err(err) = owner.process_delete(path.clone()) {
+            eprintln!("watcher: process_delete {}: {err}", path.display());
+        }
+    }
+    if batch.ignore_file_changed
+        && let Err(err) = owner.reconcile_after_ignore_change()
+    {
+        eprintln!("watcher: ignore-change reconciliation failed: {err}");
+    }
+}
+
+fn run_maintenance_command(
+    owner: &mut WorktreeOwner,
+    maintenance_gate: &parking_lot::RwLock<()>,
+    command: crate::owner::MaintenanceCommand,
+) {
+    let _guard = maintenance_gate.write();
+    match command {
+        crate::owner::MaintenanceCommand::Sync { reply } => {
+            let progress = crate::progress::Progress::start();
+            let result = owner.sync_all_with_progress(&progress);
+            progress.stop();
+            let _ = reply.send(result);
+        }
+        crate::owner::MaintenanceCommand::Reindex { reply } => {
+            let progress = crate::progress::Progress::start();
+            let result = owner.reindex_all_with_progress(&progress);
+            progress.stop();
+            let _ = reply.send(result);
+        }
+    }
 }
 
 /// Outcome of [`stop_daemon`] so callers can surface a useful message.
@@ -660,6 +698,18 @@ fn cmd_sync() -> Result<ExitCode, CliError> {
     // Drift between disk and the active manifest is healed by the same
     // pipeline as init.
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    let persistent = PersistentPaths::for_worktree(&worktree)?;
+    if let Some(response) =
+        send_daemon_request_if_reachable(&worktree, "sync", serde_json::json!({}))?
+    {
+        if print_daemon_error_if_any(&response) {
+            return Ok(ExitCode::FAILURE);
+        }
+        let result = response.get("result").unwrap_or(&response);
+        print_index_summary(result, persistent.root_dir());
+        return Ok(ExitCode::SUCCESS);
+    }
     init_at(&cwd)
 }
 
@@ -667,8 +717,19 @@ fn cmd_reindex() -> Result<ExitCode, CliError> {
     // Reindex truncates the graph relations and runs a full fresh scan.
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
     let worktree = WorktreeRoot::discover(&cwd)?;
-    ensure_no_running_daemon(worktree.as_path())?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
+    if let Some(response) =
+        send_daemon_request_if_reachable(&worktree, "reindex", serde_json::json!({}))?
+    {
+        if print_daemon_error_if_any(&response) {
+            return Ok(ExitCode::FAILURE);
+        }
+        let result = response.get("result").unwrap_or(&response);
+        print_index_summary(result, persistent.root_dir());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    ensure_no_running_daemon(worktree.as_path())?;
     persistent.ensure_created()?;
     let store = CozoStore::open(&persistent.cozo_db_path())?;
     store.truncate_graph()?;
@@ -727,18 +788,12 @@ fn process_alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// Open the Cozo store, retrying when RocksDB reports a file-lock
-/// conflict (another writer is currently holding the LOCK file).
-/// Used at daemon startup to ride through transient lock contention
-/// — most commonly `xgraph reindex` running concurrently.
-///
-/// Returns the first non-lock error verbatim. Returns the last
-/// lock-contention error if the budget runs out.
 fn open_store_with_lock_retry(
     path: &Path,
     total_budget: std::time::Duration,
 ) -> Result<CozoStore, CliError> {
     use std::time::{Duration, Instant};
+
     let deadline = Instant::now() + total_budget;
     let mut delay = Duration::from_millis(50);
     let mut announced = false;
@@ -765,10 +820,6 @@ fn open_store_with_lock_retry(
     }
 }
 
-/// Detect RocksDB's "file lock held by another process" condition by
-/// substring-matching the Cozo error message. RocksDB's `IOStatus`
-/// surfaces `Resource temporarily unavailable` (EAGAIN on Linux) and
-/// always mentions the LOCK file path when it can't acquire it.
 fn is_lock_contention(err: &crate::cozo::CozoError) -> bool {
     let s = err.to_string();
     s.contains("Resource temporarily unavailable")
@@ -784,28 +835,64 @@ fn is_lock_contention(err: &crate::cozo::CozoError) -> bool {
 /// thin client over the same socket the MCP transport uses. No language
 /// extractors are loaded in this process; all the work happens daemon-side.
 fn cmd_send_query(method: &str, params: serde_json::Value) -> Result<ExitCode, CliError> {
+    let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    let Some(parsed) = send_daemon_request_if_reachable(&worktree, method, params)? else {
+        let runtime = runtime_dir(worktree.as_path())?;
+        eprintln!(
+            "xgraph: daemon socket not found at {}. Start the daemon with `xgraph daemon start`.",
+            runtime.socket_path().display()
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+    if print_daemon_error_if_any(&parsed) {
+        return Ok(ExitCode::FAILURE);
+    }
+    let pretty = serde_json::to_string_pretty(&parsed.get("result").unwrap_or(&parsed))
+        .unwrap_or_else(|_| parsed.to_string());
+    println!("{pretty}");
+    if let Some(meta) = parsed.get("meta")
+        && let Some(catching_up) = meta.get("catching_up").and_then(|v| v.as_bool())
+        && catching_up
+    {
+        eprintln!("note: daemon is catching up — result may be stale");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn send_daemon_request_if_reachable(
+    worktree: &WorktreeRoot,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<Option<serde_json::Value>, CliError> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
     let runtime = runtime_dir(worktree.as_path())?;
     let socket_path = runtime.socket_path();
     if !socket_path.exists() {
-        eprintln!(
-            "xgraph: daemon socket not found at {}. Start the daemon with `xgraph daemon start`.",
-            socket_path.display()
-        );
-        return Ok(ExitCode::FAILURE);
+        return Ok(None);
     }
 
-    let mut stream = UnixStream::connect(&socket_path).map_err(|source| CliError::Io {
-        path: socket_path.clone(),
-        source,
-    })?;
-    // Short read/write timeout so a hung daemon doesn't block the CLI.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(stream) => stream,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(CliError::Io {
+                path: socket_path,
+                source,
+            });
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
     let request = serde_json::json!({
@@ -831,33 +918,45 @@ fn cmd_send_query(method: &str, params: serde_json::Value) -> Result<ExitCode, C
             path: socket_path.clone(),
             source,
         })?;
-    let parsed: serde_json::Value = match serde_json::from_str(response.trim()) {
-        Ok(v) => v,
+    match serde_json::from_str(response.trim()) {
+        Ok(v) => Ok(Some(v)),
         Err(err) => {
             eprintln!("xgraph: malformed daemon response: {err}");
             eprintln!("raw: {response}");
-            return Ok(ExitCode::FAILURE);
+            Ok(Some(serde_json::json!({
+                "error": { "message": "malformed daemon response" }
+            })))
         }
+    }
+}
+
+fn print_daemon_error_if_any(response: &serde_json::Value) -> bool {
+    let Some(err) = response.get("error") else {
+        return false;
     };
-    if let Some(err) = parsed.get("error") {
-        eprintln!(
-            "xgraph: {}",
-            err.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error")
-        );
-        return Ok(ExitCode::FAILURE);
+    eprintln!(
+        "xgraph: {}",
+        err.get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+    );
+    true
+}
+
+fn print_index_summary(result: &serde_json::Value, dir: &Path) {
+    let files = result.get("files_indexed").and_then(|v| v.as_u64());
+    let nodes = result.get("nodes_created").and_then(|v| v.as_u64());
+    let edges = result.get("edges_created").and_then(|v| v.as_u64());
+    match (files, nodes, edges) {
+        (Some(files), Some(nodes), Some(edges)) => println!(
+            "indexed {files} files: {nodes} nodes, {edges} edges into {dir}",
+            dir = dir.display(),
+        ),
+        _ => println!(
+            "{}",
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())
+        ),
     }
-    let pretty = serde_json::to_string_pretty(&parsed.get("result").unwrap_or(&parsed))
-        .unwrap_or_else(|_| parsed.to_string());
-    println!("{pretty}");
-    if let Some(meta) = parsed.get("meta")
-        && let Some(catching_up) = meta.get("catching_up").and_then(|v| v.as_bool())
-        && catching_up
-    {
-        eprintln!("note: daemon is catching up — result may be stale");
-    }
-    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -1026,6 +1125,53 @@ mod tests {
     fn parses_files_command() {
         let cli = parse(["xgraph", "files"]).expect("parses");
         assert_eq!(cli.command, Command::Files);
+    }
+
+    #[test]
+    fn daemon_request_helper_uses_worktree_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Command as ProcessCommand;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .arg(tmp.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        let worktree = WorktreeRoot::discover(tmp.path()).expect("discover worktree");
+        let runtime = ensure_runtime_dir(worktree.as_path()).expect("runtime dir");
+        let socket_path = runtime.socket_path();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            conn.read_to_string(&mut request).expect("read request");
+            tx.send(request).expect("send request");
+            conn.write_all(
+                br#"{"jsonrpc":"2.0","id":1,"result":{"files_indexed":1,"nodes_created":2,"edges_created":3}}"#,
+            )
+            .expect("write response");
+            conn.write_all(b"\n").expect("write newline");
+        });
+
+        let response =
+            send_daemon_request_if_reachable(&worktree, "reindex", serde_json::json!({}))
+                .expect("request succeeds")
+                .expect("socket reachable");
+        let request = rx.recv().expect("request captured");
+        server.join().expect("server joins");
+
+        assert!(request.contains(r#""method":"reindex""#), "{request}");
+        assert_eq!(response["result"]["files_indexed"], 1);
+        assert_eq!(response["result"]["nodes_created"], 2);
+        assert_eq!(response["result"]["edges_created"], 3);
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]

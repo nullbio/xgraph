@@ -123,6 +123,18 @@ impl HotIndexes {
         }
     }
 
+    pub fn clear(&self) {
+        self.nodes.clear();
+        self.symbols.clear();
+        self.symbols_by_name.clear();
+        self.trigrams.clear();
+        self.names.write().clear();
+        self.name_to_idx.clear();
+        self.files.write().clear();
+        self.callers.write().clear();
+        self.callees.write().clear();
+    }
+
     /// Populate the indexes from the Cozo store. Designed for daemon startup
     /// when an empty `HotIndexes` is constructed in front of an existing
     /// persistent graph.

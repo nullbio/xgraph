@@ -100,6 +100,7 @@ xgraph reindex
 ```
 
 Operational commands for inspecting state, stopping the daemon, reconciling the manifest with disk, and rebuilding the graph.
+When a daemon is reachable, `sync` and `reindex` are sent to that daemon so connected MCP clients keep their socket transport. If no daemon is reachable, they fall back to direct store maintenance after clearing stale runtime state.
 
 ```bash
 xgraph find-symbol User --kind class
@@ -197,6 +198,7 @@ The daemon owns:
 - Single writer queue.
 - In-memory hot indexes.
 - MCP request dispatcher.
+- Maintenance command channel for daemon-owned `sync` / `reindex`.
 
 Each parser worker owns:
 
@@ -460,6 +462,8 @@ TypeScript / JavaScript / TSX / Python.
 - `xgraph daemon start` opens a Unix socket and serves the 12 MCP tools
   out of in-memory hot indexes loaded from the persistent graph.
 - `xgraph mcp` lazy-spawns the daemon and proxies MCP-style JSON-RPC.
+- `xgraph sync` and `xgraph reindex` use the live daemon when available,
+  so terminal maintenance does not drop connected agent transports.
 - Per-binding TS/JS/Python import refs + container tracking + composite
   path-scoped symbol-table keys: `import { helper } from './b'` in file
   A produces a real `calls` edge to the `helper` function in file B.
