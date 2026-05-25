@@ -6,3 +6,5 @@ description = "Linux-native code graph daemon for Git worktrees"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+parking_lot = "0.12"
