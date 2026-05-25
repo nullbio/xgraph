@@ -6,13 +6,17 @@ description = "Linux-native code graph daemon for Git worktrees"
 
 [dependencies]
 [build-dependencies]
+[dev-dependencies]
 cc = "1"
 clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
 dashmap = "6"
 fs2 = "0.4"
 hex = "0.4"
+notify = "8.2"
 parking_lot = "0.12"
 sha2 = "0.11"
+tempfile = "3"
 tree-sitter = "0.26"
 tree-sitter-language = "0.1"
 tree-sitter-python = "0.23"
