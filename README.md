@@ -398,7 +398,30 @@ Simple requests should not pay for the general graph query engine. Complex graph
 
 ## Project status
 
-xgraph has a foundation Rust scaffold but no implemented indexing or daemon behavior yet. See [`AGENTS.md`](./AGENTS.md) for engineering rules and [`IMPLEMENTATION_GUIDE.md`](./IMPLEMENTATION_GUIDE.md) for implementation phases, checklists, and invariants.
+xgraph runs end-to-end. `xgraph init` indexes a worktree into Cozo with
+cross-file edges resolved; `xgraph daemon start` opens a Unix socket and
+serves in-memory hot indexes loaded from the persistent graph; `xgraph mcp`
+lazy-spawns the daemon and proxies MCP-style JSON-RPC; the filesystem
+watcher reconciles incremental changes, including ignore-file edits. A
+performance pass landed thread-local parser caches, hot-index integration,
+content-hash skip caching, and a parallel rayon-backed scanner.
+
+What's deferred (called out in `IMPLEMENTATION_GUIDE.md`'s "Status"
+section):
+
+- Incremental Tree-sitter parsing (`old_tree.edit + parse(new, Some(&old))`)
+  — full-file parse is always used today. Needs a memory-vs-throughput
+  benchmark before being worth the retention cost.
+- Laravel resolver wiring. `src/laravel.rs` is implemented and tested but
+  not yet invoked by `WorktreeOwner`; it requires the PHP extractor to
+  preserve structured call-argument data that the canonical
+  `ExtractedFile` doesn't carry today.
+- Performance benchmarks (Criterion harness, tracked baselines) — a
+  separate scaffolded effort.
+
+See [`AGENTS.md`](./AGENTS.md) for engineering rules and
+[`IMPLEMENTATION_GUIDE.md`](./IMPLEMENTATION_GUIDE.md) for the full phase
+checklist.
 
 For local verification, run:
 

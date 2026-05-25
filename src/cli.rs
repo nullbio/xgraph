@@ -339,10 +339,10 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
                         eprintln!("watcher: process_delete {}: {err}", path.display());
                     }
                 }
-                if batch.ignore_file_changed {
-                    // TODO: rebuild ignore matcher + reconcile manifest. For
-                    // now we log the event so it's not silently dropped.
-                    eprintln!("watcher: ignore file changed; manifest reconciliation pending");
+                if batch.ignore_file_changed
+                    && let Err(err) = owner.reconcile_after_ignore_change()
+                {
+                    eprintln!("watcher: ignore-change reconciliation failed: {err}");
                 }
             }
             let _ = owner.shutdown();

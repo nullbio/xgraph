@@ -175,6 +175,58 @@ impl WorktreeOwner {
         Ok(())
     }
 
+    /// Rebuild the ignore matcher after a `.gitignore` / `.xgraphignore`
+    /// change, then reconcile the active manifest: previously-indexed paths
+    /// that are now ignored (or missing) get a delete; new or changed paths
+    /// get an extract.
+    ///
+    /// Cheap for unchanged files because of the hash-skip cache.
+    pub fn reconcile_after_ignore_change(&mut self) -> Result<(), OwnerError> {
+        // Swap in a fresh matcher.
+        self.matcher = IgnoreMatcher::new(&self.worktree_root).map_err(|err| OwnerError::Io {
+            path: self.worktree_root.clone(),
+            source: std::io::Error::other(err.to_string()),
+        })?;
+
+        // Walk current files under the new matcher and submit anything
+        // changed (hash-skip suppresses no-ops).
+        let scanned_set: std::collections::HashSet<PathBuf> =
+            scan(&self.worktree_root, &self.matcher)?
+                .iter()
+                .map(|f| {
+                    f.path
+                        .strip_prefix(&self.worktree_root)
+                        .unwrap_or(&f.path)
+                        .to_path_buf()
+                })
+                .collect();
+        self.index_all()?;
+
+        // Find paths in `active_file` that no longer pass the new matcher.
+        let active_paths: Vec<String> = self
+            .store
+            .run_read(
+                "?[path] := *active_file[path, _hash, _mtime, _size, _gen]",
+                std::collections::BTreeMap::new(),
+            )?
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter().next().and_then(|v| match v {
+                    cozo::DataValue::Str(s) => Some(String::from(s.as_str())),
+                    _ => None,
+                })
+            })
+            .collect();
+        for rel in active_paths {
+            let rel_path = PathBuf::from(&rel);
+            if !scanned_set.contains(&rel_path) {
+                self.process_delete(self.worktree_root.join(&rel_path))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Drop all facts for a path that no longer exists on disk. Submits an
     /// empty `FileUpdate` so the Cozo transaction removes the active rows;
     /// also clears the hot-index state for the path.
