@@ -220,6 +220,12 @@ impl WorktreeOwner {
     /// get an extract.
     ///
     /// Cheap for unchanged files because of the hash-skip cache.
+    ///
+    /// **Recovery semantics:** if `index_all` fails partway through, the
+    /// new matcher has already been swapped in but only some files have
+    /// been re-indexed. A subsequent retry continues from where it left off
+    /// because the hash-skip cache treats already-submitted files as no-ops;
+    /// no explicit rollback is needed.
     pub fn reconcile_after_ignore_change(&mut self) -> Result<(), OwnerError> {
         // Swap in a fresh matcher.
         self.matcher = IgnoreMatcher::new(&self.worktree_root).map_err(|err| OwnerError::Io {

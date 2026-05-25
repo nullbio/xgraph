@@ -162,6 +162,14 @@ impl HotIndexes {
     /// Mirror the effect of a Cozo `FileUpdate` transaction into the indexes.
     /// Call this when `WriterHandle::submit` returns Ok; the writer thread
     /// performs the durable commit in parallel.
+    ///
+    /// **Consistency:** the remove-then-insert sequence is NOT atomic across
+    /// the whole operation; a concurrent reader may briefly observe a path
+    /// with no nodes between the old set being removed and the new set
+    /// being inserted. This is acceptable for MCP read paths where a brief
+    /// "0 results" answer self-heals on retry. If stronger atomicity becomes
+    /// required, wrap the body in a single write barrier (e.g., move every
+    /// field under one `RwLock`).
     pub fn apply_file_update(&self, update: &FileUpdate) {
         let path = PathBuf::from(&update.path);
 

@@ -1,4 +1,13 @@
-//! Language registry, parser workers, and extraction.
+//! Generic parser worker pool — bounded queue, per-worker `Parser` and
+//! `QueryCursor`, shared `Arc<Query>` set per language.
+//!
+//! **Currently unused in production.** Each language plugin caches its own
+//! `Parser` via `thread_local!` (see `src/languages/*.rs`), which has been
+//! sufficient and avoids the queue+dispatch indirection. This pool stays
+//! in the codebase as dormant infrastructure: it's needed if and when we
+//! want to apply explicit backpressure on parsing (Phase 7 / Phase 10
+//! checklist items) or run extraction on a dedicated thread pool. Until
+//! then, the thread-local pattern is the canonical path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
