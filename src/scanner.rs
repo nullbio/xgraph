@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use walkdir::WalkDir;
 
 use crate::hash::{ContentHash, HashError, hash_file};
+use crate::ignore::Matcher;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetectedLanguage {
@@ -17,10 +18,6 @@ pub enum DetectedLanguage {
     TypeScript,
     Tsx,
     Python,
-}
-
-pub trait IgnoreMatcher {
-    fn matched(&self, path: &Path) -> bool;
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +94,7 @@ pub fn detect_language(path: &Path) -> Option<DetectedLanguage> {
     }
 }
 
-pub fn scan(root: &Path, matcher: &dyn IgnoreMatcher) -> Result<Vec<ScannedFile>, ScanError> {
+pub fn scan(root: &Path, matcher: &dyn Matcher) -> Result<Vec<ScannedFile>, ScanError> {
     let mut files = Vec::new();
 
     let walker = WalkDir::new(root)
@@ -170,14 +167,14 @@ mod tests {
         ignored: Vec<PathBuf>,
     }
 
-    impl IgnoreMatcher for PrefixMatcher {
+    impl Matcher for PrefixMatcher {
         fn matched(&self, path: &Path) -> bool {
             self.ignored.iter().any(|p| path.starts_with(p))
         }
     }
 
     struct AllowAll;
-    impl IgnoreMatcher for AllowAll {
+    impl Matcher for AllowAll {
         fn matched(&self, _path: &Path) -> bool {
             false
         }

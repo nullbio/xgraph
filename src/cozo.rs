@@ -119,6 +119,87 @@ pub struct FileUpdate {
     pub edges: Vec<EdgeFact>,
 }
 
+/// Metadata that must be supplied alongside an `ExtractedFile` to build a `FileUpdate`.
+pub struct FileUpdateMetadata {
+    pub content_hash: ContentHash,
+    pub language: String,
+    pub parser_version: u32,
+    pub mtime: i64,
+    pub size: u64,
+    pub generation: u64,
+}
+
+impl FileUpdate {
+    /// Convert a canonical `ExtractedFile` plus storage metadata into a writer-queue `FileUpdate`.
+    /// Cross-file resolution (edges) is performed elsewhere; this conversion produces an empty
+    /// `edges` list. Language-extractor diagnostics are translated; spans drop their `end_row`/
+    /// `end_column` because Cozo's row schema captures only the start position.
+    pub fn from_extracted(
+        extracted: &crate::extract::ExtractedFile,
+        metadata: FileUpdateMetadata,
+    ) -> Self {
+        let nodes = extracted
+            .nodes
+            .iter()
+            .map(|n| NodeFact {
+                local_node_id: n.id,
+                kind: n.kind.clone(),
+                name: n.name.clone(),
+                qname: n.qname.clone(),
+                span: span_from_extract(n.span),
+            })
+            .collect();
+        let refs = extracted
+            .refs
+            .iter()
+            .map(|r| RefFact {
+                local_ref_id: r.id,
+                kind: r.kind.clone(),
+                name: r.name.clone(),
+                span: span_from_extract(r.span),
+            })
+            .collect();
+        let diagnostics = extracted
+            .diagnostics
+            .iter()
+            .map(|d| Diagnostic {
+                severity: severity_label(d.severity).to_owned(),
+                message: d.message.clone(),
+                span: d.span.map(span_from_extract),
+            })
+            .collect();
+        Self {
+            path: extracted.path.to_string_lossy().into_owned(),
+            content_hash: metadata.content_hash,
+            language: metadata.language,
+            parser_version: metadata.parser_version,
+            mtime: metadata.mtime,
+            size: metadata.size,
+            generation: metadata.generation,
+            diagnostics,
+            nodes,
+            refs,
+            edges: Vec::new(),
+        }
+    }
+}
+
+fn span_from_extract(span: crate::extract::Span) -> Span {
+    Span {
+        start_byte: span.start.byte as u32,
+        end_byte: span.end.byte as u32,
+        start_row: span.start.row as u32,
+        start_col: span.start.column as u32,
+    }
+}
+
+fn severity_label(severity: crate::extract::Severity) -> &'static str {
+    match severity {
+        crate::extract::Severity::Error => "error",
+        crate::extract::Severity::Warning => "warning",
+    }
+}
+
 /// Errors returned when opening the store, running queries, or driving the
 /// writer queue.
 #[derive(Debug)]

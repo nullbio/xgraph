@@ -57,6 +57,16 @@ impl From<ignore_crate::Error> for IgnoreError {
     }
 }
 
+pub trait Matcher: Send + Sync {
+    fn matched(&self, path: &Path) -> bool;
+}
+
+impl Matcher for IgnoreMatcher {
+    fn matched(&self, path: &Path) -> bool {
+        IgnoreMatcher::matched(self, path)
+    }
+}
+
 pub struct IgnoreMatcher {
     root: PathBuf,
     built_in_overrides: Override,

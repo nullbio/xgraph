@@ -10,12 +10,9 @@ use crossbeam_channel::{Receiver, Sender, after, never, select, unbounded};
 use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 
-const DEFAULT_DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
+use crate::ignore::Matcher;
 
-pub trait IgnoreMatcher: Send + Sync {
-    /// Returns `true` when the path is excluded by the ignore matcher.
-    fn matched(&self, path: &Path) -> bool;
-}
+const DEFAULT_DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
@@ -93,7 +90,7 @@ pub struct Watcher {
 impl Watcher {
     pub fn start(
         root: &Path,
-        matcher: Arc<dyn IgnoreMatcher>,
+        matcher: Arc<dyn Matcher>,
         config: WatcherConfig,
     ) -> Result<(WatcherHandle, Receiver<BatchedChanges>), WatcherError> {
         let (raw_tx, raw_rx) = unbounded::<RawEvent>();
@@ -247,7 +244,7 @@ fn run_debounce_loop(
     raw_rx: Receiver<RawEvent>,
     shutdown_rx: Receiver<()>,
     batch_tx: Sender<BatchedChanges>,
-    matcher: Arc<dyn IgnoreMatcher>,
+    matcher: Arc<dyn Matcher>,
     debounce: Duration,
 ) {
     let mut pending: HashMap<PathBuf, ChangeKind> = HashMap::new();
@@ -308,7 +305,7 @@ fn record_event(pending: &mut HashMap<PathBuf, ChangeKind>, event: RawEvent) {
 
 fn flush(
     pending: &mut HashMap<PathBuf, ChangeKind>,
-    matcher: &Arc<dyn IgnoreMatcher>,
+    matcher: &Arc<dyn Matcher>,
     batch_tx: &Sender<BatchedChanges>,
 ) {
     if pending.is_empty() {
@@ -321,7 +318,7 @@ fn flush(
     }
 }
 
-fn build_batch(events: Vec<(PathBuf, ChangeKind)>, matcher: &dyn IgnoreMatcher) -> BatchedChanges {
+fn build_batch(events: Vec<(PathBuf, ChangeKind)>, matcher: &dyn Matcher) -> BatchedChanges {
     let mut batch = BatchedChanges::default();
     for (path, kind) in events {
         let is_ignore_source = path_is_ignore_source(&path);
@@ -380,14 +377,14 @@ mod tests {
     use tempfile::TempDir;
 
     struct AcceptAll;
-    impl IgnoreMatcher for AcceptAll {
+    impl Matcher for AcceptAll {
         fn matched(&self, _: &Path) -> bool {
             false
         }
     }
 
     struct Excludes(&'static str);
-    impl IgnoreMatcher for Excludes {
+    impl Matcher for Excludes {
         fn matched(&self, path: &Path) -> bool {
             path.to_string_lossy().contains(self.0)
         }
@@ -396,7 +393,7 @@ mod tests {
     struct Counting {
         calls: AtomicUsize,
     }
-    impl IgnoreMatcher for Counting {
+    impl Matcher for Counting {
         fn matched(&self, _: &Path) -> bool {
             self.calls.fetch_add(1, Ordering::Relaxed);
             false
@@ -466,7 +463,7 @@ mod tests {
 
     fn start(
         root: &Path,
-        matcher: Arc<dyn IgnoreMatcher>,
+        matcher: Arc<dyn Matcher>,
         config: WatcherConfig,
     ) -> (WatcherHandle, Receiver<BatchedChanges>, Duration) {
         let debounce = config.debounce_window;
@@ -560,7 +557,7 @@ mod tests {
     fn ignored_paths_are_filtered_out() {
         let dir = TempDir::new().expect("tempdir");
         let root = canonical_root(&dir);
-        let matcher: Arc<dyn IgnoreMatcher> = Arc::new(Excludes("ignored"));
+        let matcher: Arc<dyn Matcher> = Arc::new(Excludes("ignored"));
         let (handle, rx, debounce) = start(&root, matcher, test_config());
 
         let kept = root.join("foo.txt");
@@ -643,7 +640,7 @@ mod tests {
         let counting = Arc::new(Counting {
             calls: AtomicUsize::new(0),
         });
-        let matcher: Arc<dyn IgnoreMatcher> = counting.clone();
+        let matcher: Arc<dyn Matcher> = counting.clone();
         let (handle, rx, debounce) = start(&root, matcher, test_config());
 
         let file = root.join("touched.txt");
@@ -716,7 +713,7 @@ mod tests {
         // we should not see a batch on the receiver.
         let dir = TempDir::new().expect("tempdir");
         let root = canonical_root(&dir);
-        let matcher: Arc<dyn IgnoreMatcher> = Arc::new(Excludes(""));
+        let matcher: Arc<dyn Matcher> = Arc::new(Excludes(""));
         let (handle, rx, debounce) = start(&root, matcher, test_config());
 
         let file = root.join("hidden.txt");

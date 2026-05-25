@@ -68,12 +68,36 @@ impl LanguageRegistry {
         }
     }
 
+    /// Build a registry populated with every supported language plugin.
+    pub fn with_all() -> Self {
+        let mut registry = Self::new();
+        registry.register(crate::languages::php::PhpPlugin::new());
+        registry.register(crate::languages::blade::BladePlugin);
+        registry.register(crate::languages::javascript::JavaScriptPlugin);
+        registry.register(crate::languages::typescript::TypeScriptPlugin::typescript());
+        registry.register(crate::languages::typescript::TypeScriptPlugin::tsx());
+        registry.register(crate::languages::python::PythonPlugin);
+        registry
+    }
+
     pub fn register<P: LanguagePlugin + 'static>(&mut self, plugin: P) {
         self.plugins.insert(plugin.id(), Arc::new(plugin));
     }
 
     pub fn get(&self, id: LanguageId) -> Option<&dyn LanguagePlugin> {
         self.plugins.get(&id).map(|p| p.as_ref())
+    }
+
+    /// Parse and extract a single file via the registered plugin for its language.
+    /// Returns `None` if the path doesn't match any supported language.
+    pub fn extract_file(
+        &self,
+        path: &Path,
+        source: &[u8],
+    ) -> Option<crate::extract::ExtractedFile> {
+        let id = self.detect_by_path(path)?;
+        let plugin = self.get(id)?;
+        Some(plugin.extract(source, path))
     }
 
     pub fn detect_by_path(&self, path: &Path) -> Option<LanguageId> {
@@ -402,5 +426,39 @@ mod tests {
         assert_eq!(LanguageId::TypeScript.to_string(), "typescript");
         assert_eq!(LanguageId::Tsx.to_string(), "tsx");
         assert_eq!(LanguageId::Python.to_string(), "python");
+    }
+
+    #[test]
+    fn with_all_registers_every_supported_language() {
+        let registry = LanguageRegistry::with_all();
+        for id in [
+            LanguageId::Php,
+            LanguageId::Blade,
+            LanguageId::JavaScript,
+            LanguageId::TypeScript,
+            LanguageId::Tsx,
+            LanguageId::Python,
+        ] {
+            assert!(registry.get(id).is_some(), "missing plugin for {id}");
+        }
+    }
+
+    #[test]
+    fn extract_file_dispatches_to_language_plugin() {
+        let registry = LanguageRegistry::with_all();
+        let extracted = registry
+            .extract_file(&PathBuf::from("hello.py"), b"def greet():\n    pass\n")
+            .expect("python plugin should match .py path");
+        assert!(extracted.nodes.iter().any(|n| n.kind == "function"));
+    }
+
+    #[test]
+    fn extract_file_returns_none_for_unsupported_extension() {
+        let registry = LanguageRegistry::with_all();
+        assert!(
+            registry
+                .extract_file(&PathBuf::from("README.md"), b"# hi\n")
+                .is_none()
+        );
     }
 }
