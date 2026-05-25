@@ -53,6 +53,8 @@ pub trait LanguagePlugin: Send + Sync {
     fn id(&self) -> LanguageId;
     fn extensions(&self) -> &'static [&'static str];
     fn queries(&self) -> &'static LanguageQueries;
+    fn tree_sitter_language(&self) -> tree_sitter::Language;
+    fn extract(&self, source: &[u8], path: &Path) -> crate::extract::ExtractedFile;
 }
 
 pub struct LanguageRegistry {
@@ -169,6 +171,14 @@ mod tests {
 
         fn queries(&self) -> &'static LanguageQueries {
             self.queries
+        }
+
+        fn tree_sitter_language(&self) -> tree_sitter::Language {
+            tree_sitter_python::LANGUAGE.into()
+        }
+
+        fn extract(&self, _source: &[u8], _path: &Path) -> crate::extract::ExtractedFile {
+            crate::extract::ExtractedFile::default()
         }
     }
 

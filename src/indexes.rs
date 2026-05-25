@@ -12,12 +12,7 @@ use std::path::{Path, PathBuf};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-/// Stable identifier for an active node in the graph.
-///
-/// The concrete numeric value is assigned by the storage layer. This module
-/// only treats it as an opaque key.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
-pub struct NodeId(pub u64);
+pub use crate::resolve::NodeId;
 
 /// Snapshot record for an active node held in the hot index.
 ///
