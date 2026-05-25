@@ -160,11 +160,20 @@ impl LanguagePlugin for PythonPlugin {
     }
 }
 
+thread_local! {
+    static PARSER: std::cell::RefCell<Option<Parser>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn parse(source: &[u8]) -> Option<Tree> {
-    let mut parser = Parser::new();
-    let language = python_language();
-    parser.set_language(&language).ok()?;
-    parser.parse(source, None)
+    PARSER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut p = Parser::new();
+            p.set_language(&python_language()).ok()?;
+            *slot = Some(p);
+        }
+        slot.as_mut().unwrap().parse(source, None)
+    })
 }
 
 pub fn extract(source: &[u8]) -> ExtractedFile {

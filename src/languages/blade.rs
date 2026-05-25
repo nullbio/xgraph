@@ -89,14 +89,25 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+thread_local! {
+    static PARSER: std::cell::RefCell<Option<Parser>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn parse(source: &[u8]) -> Result<Tree, ParseError> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language())
-        .map_err(|e| ParseError(format!("set_language: {e}")))?;
-    parser
-        .parse(source, None)
-        .ok_or_else(|| ParseError("parser returned no tree".to_owned()))
+    PARSER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&language())
+                .map_err(|e| ParseError(format!("set_language: {e}")))?;
+            *slot = Some(parser);
+        }
+        slot.as_mut()
+            .unwrap()
+            .parse(source, None)
+            .ok_or_else(|| ParseError("parser returned no tree".to_owned()))
+    })
 }
 
 #[derive(Default)]

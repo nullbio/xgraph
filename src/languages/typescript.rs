@@ -218,10 +218,24 @@ fn export_query(flavor: TsFlavor) -> &'static Arc<Query> {
     })
 }
 
+thread_local! {
+    static PARSERS: std::cell::RefCell<std::collections::HashMap<TsFlavor, Parser>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 fn parse(flavor: TsFlavor, source: &[u8]) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser.set_language(language_for(flavor)).ok()?;
-    parser.parse(source, None)
+    PARSERS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let parser = match map.get_mut(&flavor) {
+            Some(p) => p,
+            None => {
+                let mut p = Parser::new();
+                p.set_language(language_for(flavor)).ok()?;
+                map.entry(flavor).or_insert(p)
+            }
+        };
+        parser.parse(source, None)
+    })
 }
 
 fn span_from_node(node: TsNode<'_>) -> Span {

@@ -6,6 +6,7 @@
 //! we can attribute callees to their enclosing definition without paying for
 //! a broad "match everything" query.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -81,17 +82,7 @@ impl LanguagePlugin for PhpPlugin {
     }
 
     fn extract(&self, source: &[u8], path: &Path) -> ExtractedFile {
-        let mut parser = Parser::new();
-        let language: Language = tree_sitter_php::LANGUAGE_PHP.into();
-        if parser.set_language(&language).is_err() {
-            return file_with_diagnostic(
-                path,
-                Severity::Error,
-                "failed to install PHP grammar on parser",
-            );
-        }
-
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = parse(source) else {
             return file_with_diagnostic(path, Severity::Error, "PHP parser returned no tree");
         };
 
@@ -99,6 +90,28 @@ impl LanguagePlugin for PhpPlugin {
         extractor.run(&tree);
         extractor.into_file(path)
     }
+}
+
+fn language() -> &'static Language {
+    static LANG: OnceLock<Language> = OnceLock::new();
+    LANG.get_or_init(|| tree_sitter_php::LANGUAGE_PHP.into())
+}
+
+thread_local! {
+    static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+}
+
+/// Parse a PHP source with a thread-local parser that's reused across calls.
+fn parse(source: &[u8]) -> Option<Tree> {
+    PARSER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut parser = Parser::new();
+            parser.set_language(language()).ok()?;
+            *slot = Some(parser);
+        }
+        slot.as_mut().unwrap().parse(source, None)
+    })
 }
 
 fn file_with_diagnostic(path: &Path, severity: Severity, message: &str) -> ExtractedFile {
