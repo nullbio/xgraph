@@ -16,7 +16,7 @@ The project is inspired by [`colbymchenry/codegraph`](https://github.com/colbymc
 - Initial language focus:
   - PHP
   - Laravel framework conventions, including Blade
-  - TypeScript / JavaScript
+  - TypeScript / JavaScript / TSX (with React-aware resolver)
   - Python
 
 ## Non-goals
@@ -79,6 +79,20 @@ xgraph reindex
 ```
 
 Operational commands for inspecting state, stopping the daemon, reconciling the manifest with disk, and rebuilding the graph.
+
+```bash
+xgraph find-symbol User --kind class
+xgraph search User --mode prefix
+xgraph search Controller --mode contains --path-prefix app/Http
+xgraph callers <node-id>
+xgraph callees <node-id>
+xgraph impact <node-id> --max-depth 3
+xgraph context UserService
+xgraph trace <from-id> <to-id>
+xgraph files
+```
+
+Query subcommands: thin clients that send a JSON-RPC request to the daemon socket and pretty-print the response. The daemon is the source of truth — these commands do no extraction or graph work themselves. They mirror the MCP tools an agent would invoke.
 
 ## Project discovery
 
@@ -278,7 +292,9 @@ Laravel-specific resolution should model:
 
 Tree-sitter gets syntax nodes. Laravel meaning comes from a framework resolver pass. Framework-derived edges must carry explicit provenance and confidence.
 
-Framework-edge node IDs use the synthetic `lh:` prefix (e.g. `lh:route:get /users`, `lh:UserController::index`) so they cannot collide with parser-extracted IDs (which always start with a 64-character content hash). MCP clients reading framework edges via `callers_of`/`callees_of` should treat `lh:*` IDs as synthesis points: they do not appear in `active_node` and are not directly queryable by `nodes_in_file`. Edge provenance is `"laravel_heuristic"` and confidence ranges 40 (low) — 70 (medium) — 90 (high) depending on the pattern.
+Framework-edge node IDs use the synthetic `lh:` prefix (e.g. `lh:route:get /users`, `lh:UserController::index`, `lh:react.component`, `lh:react.hook.useState`) so they cannot collide with parser-extracted IDs (which always start with a 64-character content hash). MCP clients reading framework edges via `callers_of`/`callees_of` should treat `lh:*` IDs as synthesis points: they do not appear in `active_node` and are not directly queryable by `nodes_in_file`. Edge provenance is `"laravel_heuristic"` and confidence ranges 40 (low) — 70 (medium) — 90 (high) depending on the pattern.
+
+The same resolver path serves the React resolver (`src/react.rs`): JSX-producing PascalCase functions and class components are tagged `lh:react.component`; functions matching `use[A-Z]...` are tagged `lh:react.hook`; calls to React's built-in hooks (the 18 hooks shipped with React 19) from inside a component or hook produce `react_uses_hook` edges to `lh:react.hook.<name>`.
 
 ## Language growth
 
@@ -369,22 +385,34 @@ If a crash happens during an update, Cozo rolls back the incomplete transaction.
 
 Use in-memory indexes for hot MCP calls:
 
-- Node by ID.
-- Callers.
-- Callees.
-- Files.
-- Simple symbol lookup.
+- `find_symbol` — exact symbol lookup by name (+ optional kind).
+- `search` — exact / prefix / contains filtering with optional `kind` and `path_prefix`. Contains mode uses a lowercase 3-byte trigram inverted index; sub-microsecond at 50k symbols.
+- `node` — single record + bounded source snippet.
+- `nodes_in_file` — file scope.
+- `callers_of` / `callees_of` — call graph by node id.
+- `context` — composes `find_symbol` + `node` + callers + callees in one call.
+- `explore` — multi-node source browsing with a shared byte budget.
+- `trace` — shortest call path via bidirectional BFS over the in-memory call graph.
+- `files` — list of indexed paths.
+- `status` — file / node / symbol / call-edge counts + RSS + reconcile state.
 
 Use Cozo Datalog for complex graph queries:
 
-- Transitive impact.
-- Cycles.
+- `impact` — transitive reverse closure over `calls` / `inherits` / `implements` / `references` edges, optionally depth-bounded.
+- Cycle detection (`cycles_via_calls`).
 - Dependency cones.
 - Path queries.
 - Module boundary checks.
 - "What changes if X changes?"
 
 Simple requests should not pay for the general graph query engine. Complex graph analysis should use Cozo instead of being hand-rolled in ad hoc indexes.
+
+Every response carries a `meta` envelope with:
+
+- `catching_up` — whether the daemon's view of the requested scope may be incomplete (initial reconcile still running, or a relevant path is mid-flight from the watcher). File-scoped queries (`nodes_in_file`, `node`) get a precise per-path answer; graph-scoped queries get a conservative answer (any pending or pre-reconcile).
+- `rss_bytes` — daemon process resident-set size at response time, read from `/proc/self/statm` (cheap, one syscall).
+- `pending_paths` — count of paths the watcher has queued but not yet finished processing.
+- `warnings` — populated when the daemon notices a pressure signal worth surfacing (e.g. `high_memory_usage` when RSS exceeds the threshold).
 
 ## References
 
@@ -400,26 +428,46 @@ Simple requests should not pay for the general graph query engine. Complex graph
 
 ## Project status
 
-xgraph runs end-to-end. `xgraph init` indexes a worktree into Cozo with
-cross-file edges resolved; `xgraph daemon start` opens a Unix socket and
-serves in-memory hot indexes loaded from the persistent graph; `xgraph mcp`
-lazy-spawns the daemon and proxies MCP-style JSON-RPC; the filesystem
-watcher reconciles incremental changes, including ignore-file edits. A
-performance pass landed thread-local parser caches, hot-index integration,
-content-hash skip caching, and a parallel rayon-backed scanner.
+xgraph runs end-to-end with full cross-file linking across PHP / Blade /
+TypeScript / JavaScript / TSX / Python.
 
-What's deferred (called out in `IMPLEMENTATION_GUIDE.md`'s "Status"
-section):
+**What works:**
 
-- Incremental Tree-sitter parsing (`old_tree.edit + parse(new, Some(&old))`)
-  — full-file parse is always used today. Needs a memory-vs-throughput
-  benchmark before being worth the retention cost.
-- Laravel resolver wiring. `src/laravel.rs` is implemented and tested but
-  not yet invoked by `WorktreeOwner`; it requires the PHP extractor to
-  preserve structured call-argument data that the canonical
-  `ExtractedFile` doesn't carry today.
-- Performance benchmarks (Criterion harness, tracked baselines) — a
-  separate scaffolded effort.
+- `xgraph init` indexes a worktree into Cozo, prints a colored
+  shimmer-bar progress UX, and reports a `{files_indexed, nodes_created,
+  edges_created}` summary.
+- `xgraph daemon start` opens a Unix socket and serves the 12 MCP tools
+  out of in-memory hot indexes loaded from the persistent graph.
+- `xgraph mcp` lazy-spawns the daemon and proxies MCP-style JSON-RPC.
+- Per-binding TS/JS/Python import refs + container tracking + composite
+  path-scoped symbol-table keys: `import { helper } from './b'` in file
+  A produces a real `calls` edge to the `helper` function in file B.
+- Laravel framework resolver (routes, Eloquent relationships, facades,
+  service container bindings, events, jobs, controller-to-model) +
+  Blade resolver (`@extends`, `@include`, `<x-foo>`, `@component`).
+- React framework resolver (function components, custom hooks, builtin
+  hook calls, `memo`/`forwardRef` wrappers, class components).
+- Filesystem watcher with debounce + incremental processing, including
+  reconciliation when an ignore file changes.
+- Thread-local parser caches, hot-index integration, content-hash skip
+  cache, rayon-backed scanner, FTS trigram index for sub-µs contains
+  search at 50k symbols.
+- Criterion benchmark harness with per-phase timing (`bench_index_phases`).
+
+**Deferred:**
+
+- Incremental Tree-sitter parsing (`old_tree.edit + parse(new, Some(&old))`).
+  Full-file parse is always used today; the benchmark fixture in
+  `benches/parse.rs` is the baseline against which incremental would be
+  compared. Needs the memory cost (retain old bytes + old tree per file)
+  weighed against the speedup before it lands.
+- Framework resolvers beyond Laravel / Blade / React (Vue, Svelte,
+  Express, NestJS, Django, Flask, FastAPI). The resolver pattern is
+  well-established; each is ~1-2 hours of work plus integration test.
+- Wiring `src/parser.rs::ParserPool`. The `thread_local!` pattern gives
+  equivalent parser-reuse properties for now; the pool would matter if
+  the parse phase becomes the bottleneck after rayon-parallelizing
+  extraction.
 
 See [`AGENTS.md`](./AGENTS.md) for engineering rules and
 [`IMPLEMENTATION_GUIDE.md`](./IMPLEMENTATION_GUIDE.md) for the full phase

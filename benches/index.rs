@@ -231,6 +231,80 @@ fn bench_hot_search(c: &mut Criterion) {
     }
 }
 
+/// Per-phase breakdown of `index_all_with_progress`. Reports
+/// scan/parse/resolve/store separately so the next optimization target
+/// is obvious — e.g., if parse dominates, parallelize extraction; if
+/// store dominates, batch Cozo transactions.
+///
+/// Each sample builds a fresh fixture, runs the full pipeline, and
+/// returns only the requested phase's micros via `iter_custom`. The
+/// downside is that all four phases re-run a fresh fixture build per
+/// sample. That's acceptable here — we care about per-phase signal, not
+/// wall-clock efficiency of the bench itself.
+fn bench_index_phases(c: &mut Criterion) {
+    use std::time::Duration;
+    use xgraph::cozo::CozoStore;
+    use xgraph::daemon_status::DaemonStatus;
+    use xgraph::git::WorktreeRoot;
+    use xgraph::ignore::IgnoreMatcher;
+    use xgraph::indexes::HotIndexes;
+    use xgraph::language::LanguageRegistry;
+    use xgraph::owner::WorktreeOwner;
+    use xgraph::storage::PersistentPaths;
+
+    let fixtures = [(100usize, 5usize), (500, 10)];
+    type PhaseExtract = fn(&xgraph::owner::PhaseTimings) -> u64;
+    let phases: [(&str, PhaseExtract); 4] = [
+        ("scan", |t| t.scan_us),
+        ("parse", |t| t.parse_us),
+        ("resolve", |t| t.resolve_us),
+        ("store", |t| t.store_us),
+    ];
+
+    for &(files, methods) in &fixtures {
+        for (phase, extract) in phases {
+            let label = format!("phase_{phase}_files{files}_methods{methods}");
+            c.bench_function(&label, |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let tmp = TempDir::new().unwrap();
+                        make_python_project(tmp.path(), files, methods);
+
+                        let worktree = WorktreeRoot::discover(tmp.path()).expect("git");
+                        let persistent =
+                            PersistentPaths::for_worktree(&worktree).expect("persistent");
+                        persistent.ensure_created().expect("ensure");
+                        let store =
+                            CozoStore::open(&persistent.cozo_db_path()).expect("cozo");
+                        let matcher = IgnoreMatcher::new(worktree.as_path()).expect("matcher");
+                        let registry = LanguageRegistry::with_all();
+                        let indexes = Arc::new(HotIndexes::new());
+                        let status = Arc::new(DaemonStatus::new());
+                        let mut owner = WorktreeOwner::new(
+                            worktree.as_path().to_path_buf(),
+                            matcher,
+                            registry,
+                            store,
+                            indexes,
+                            status,
+                        )
+                        .expect("owner");
+                        let progress = xgraph::progress::Progress::start();
+                        let summary = owner
+                            .index_all_with_progress(&progress)
+                            .expect("index_all");
+                        progress.stop();
+                        let _ = owner.shutdown();
+                        total += Duration::from_micros(extract(&summary.timings));
+                    }
+                    total
+                });
+            });
+        }
+    }
+}
+
 criterion_group!(
     benches,
     bench_init_python_cold,
@@ -239,5 +313,6 @@ criterion_group!(
     bench_hot_indexes_load,
     bench_hot_query_find_symbol,
     bench_hot_search,
+    bench_index_phases,
 );
 criterion_main!(benches);

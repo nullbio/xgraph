@@ -27,12 +27,26 @@ pub const PARSER_VERSION: u32 = 1;
 
 /// Outcome of a full index pass. Includes the per-pass counts that
 /// codegraph's `SyncResult` exposes so `init_at` can print a summary
-/// without re-querying Cozo.
+/// without re-querying Cozo, plus a phase-level wall-clock breakdown
+/// the benchmarks read to identify which phase dominates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexSummary {
     pub files_indexed: usize,
     pub nodes_created: u64,
     pub edges_created: u64,
+    pub timings: PhaseTimings,
+}
+
+/// Wall-clock duration of each phase of `index_all_with_progress`, in
+/// microseconds. Reported even when no `Progress` renderer is active so
+/// benchmarks and callers can attribute hot-path costs without
+/// re-running the indexer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTimings {
+    pub scan_us: u64,
+    pub parse_us: u64,
+    pub resolve_us: u64,
+    pub store_us: u64,
 }
 
 pub struct WorktreeOwner {
@@ -92,8 +106,12 @@ impl WorktreeOwner {
         progress: &crate::progress::Progress,
     ) -> Result<IndexSummary, OwnerError> {
         use crate::progress::Phase;
+        use std::time::Instant;
+
         progress.phase(Phase::Scanning, None);
+        let t_scan_start = Instant::now();
         let scanned = scan(&self.worktree_root, &self.matcher)?;
+        let scan_us = t_scan_start.elapsed().as_micros() as u64;
         progress.tick(scanned.len() as u64);
         progress.finish_phase();
 
@@ -102,6 +120,7 @@ impl WorktreeOwner {
         let py_resolver = PythonImportResolver::from_worktree(&self.worktree_root);
 
         progress.phase(Phase::Parsing, Some(scanned.len() as u64));
+        let t_parse_start = Instant::now();
         let mut prepared: Vec<PreparedFile> = Vec::with_capacity(scanned.len());
         for (i, file) in scanned.into_iter().enumerate() {
             progress.tick(i as u64 + 1);
@@ -118,14 +137,18 @@ impl WorktreeOwner {
                 prepared.push(p);
             }
         }
+        let parse_us = t_parse_start.elapsed().as_micros() as u64;
         progress.finish_phase();
 
         progress.phase(Phase::Resolving, Some(prepared.len() as u64));
+        let t_resolve_start = Instant::now();
         let symbol_table = build_symbol_table(&prepared);
+        let resolve_us = t_resolve_start.elapsed().as_micros() as u64;
         progress.tick(prepared.len() as u64);
         progress.finish_phase();
 
         progress.phase(Phase::Storing, Some(prepared.len() as u64));
+        let t_store_start = Instant::now();
         let files_indexed = prepared.len();
         let mut nodes_created: u64 = 0;
         let mut edges_created: u64 = 0;
@@ -135,6 +158,7 @@ impl WorktreeOwner {
             edges_created += edge_count as u64;
             progress.tick(i as u64 + 1);
         }
+        let store_us = t_store_start.elapsed().as_micros() as u64;
         progress.finish_phase();
         // After the initial walk completes, MCP queries no longer need the
         // "still booting" caveat. Incremental change-driven catching_up is
@@ -144,6 +168,12 @@ impl WorktreeOwner {
             files_indexed,
             nodes_created,
             edges_created,
+            timings: PhaseTimings {
+                scan_us,
+                parse_us,
+                resolve_us,
+                store_us,
+            },
         })
     }
 

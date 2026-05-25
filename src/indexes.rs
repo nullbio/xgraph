@@ -89,6 +89,20 @@ pub struct HotIndexes {
     /// Secondary index: `name -> [SymbolKey]` so `lookup_symbol_by_name`
     /// doesn't have to scan every symbol entry.
     symbols_by_name: DashMap<String, Vec<SymbolKey>>,
+    /// Trigram inverted index over lowercase symbol names. Keyed by a
+    /// 3-byte window; each posting list is the indices into `names`.
+    /// Used by `search` in `Contains` mode to drop from ~6 ms to ~tens
+    /// of µs at 50k symbols by narrowing the candidate set before the
+    /// expensive `str::contains` verify.
+    trigrams: DashMap<[u8; 3], Vec<u32>>,
+    /// Case-preserved name strings indexed by their position. Stable —
+    /// we only ever append. Read-locked during search, write-locked
+    /// only during first-insert of a brand-new name.
+    names: RwLock<Vec<Arc<str>>>,
+    /// Reverse: name → its index in `names`. Used to dedupe on
+    /// `register_symbol` so trigram lists don't accumulate duplicates
+    /// when the same name registers under multiple kinds.
+    name_to_idx: DashMap<Arc<str>, u32>,
     files: RwLock<HashMap<PathBuf, Vec<NodeId>>>,
     callers: RwLock<HashMap<NodeId, Vec<NodeId>>>,
     callees: RwLock<HashMap<NodeId, Vec<NodeId>>>,
@@ -100,6 +114,9 @@ impl HotIndexes {
             nodes: DashMap::new(),
             symbols: DashMap::new(),
             symbols_by_name: DashMap::new(),
+            trigrams: DashMap::new(),
+            names: RwLock::new(Vec::new()),
+            name_to_idx: DashMap::new(),
             files: RwLock::new(HashMap::new()),
             callers: RwLock::new(HashMap::new()),
             callees: RwLock::new(HashMap::new()),
@@ -366,8 +383,22 @@ impl HotIndexes {
             return results;
         }
 
-        // Prefix / contains: scan the names secondary index. For each
-        // matching name, fan out across its SymbolKey set, then nodes.
+        // Contains mode: use the trigram inverted index when the query
+        // is ≥3 bytes. Pick the shortest trigram posting list as the
+        // candidate set, then verify each candidate with the actual
+        // `str::contains`. This drops the cost from O(N_unique_names)
+        // string searches to O(smallest trigram posting list) at the
+        // price of one extra DashMap lookup per query trigram.
+        if matches!(query.mode, SearchMode::Contains)
+            && query.name.len() >= 3
+            && let Some(candidate_name_ids) = self.candidate_name_ids_for_contains(&query.name)
+        {
+            return self.collect_contains_hits(query, &candidate_name_ids);
+        }
+
+        // Prefix (or contains for queries shorter than a trigram): scan
+        // the names secondary index. For each matching name, fan out
+        // across its SymbolKey set, then nodes.
         let needle = query.name.as_str();
         for entry in self.symbols_by_name.iter() {
             if results.len() >= query.limit {
@@ -383,6 +414,77 @@ impl HotIndexes {
                 continue;
             }
             for key in entry.value() {
+                if let Some(filter_kind) = &query.kind
+                    && &key.kind != filter_kind
+                {
+                    continue;
+                }
+                let Some(ids_ref) = self.symbols.get(key) else {
+                    continue;
+                };
+                for id in ids_ref.value().iter() {
+                    if results.len() >= query.limit {
+                        break;
+                    }
+                    if !self.path_filter_passes(id, query.path_prefix.as_deref()) {
+                        continue;
+                    }
+                    results.push(id.clone());
+                }
+            }
+        }
+        results
+    }
+
+    /// Return the posting list of candidate name ids for a contains
+    /// query, using the smallest trigram posting list as the seed. The
+    /// caller still has to verify each candidate against the full query
+    /// (with `str::contains`) because the trigram index only narrows;
+    /// it never decides matches.
+    ///
+    /// Returns `None` if any query trigram has no entries — that means
+    /// no name in the index contains the full query, so the contains
+    /// query has zero hits.
+    fn candidate_name_ids_for_contains(&self, query: &str) -> Option<Vec<u32>> {
+        let lower: Vec<u8> = query
+            .as_bytes()
+            .iter()
+            .map(|b| b.to_ascii_lowercase())
+            .collect();
+        let mut smallest: Option<Vec<u32>> = None;
+        for window in lower.windows(3) {
+            let tg = [window[0], window[1], window[2]];
+            let posting = self.trigrams.get(&tg)?;
+            if smallest
+                .as_ref()
+                .is_none_or(|cur| posting.value().len() < cur.len())
+            {
+                smallest = Some(posting.value().clone());
+            }
+        }
+        smallest
+    }
+
+    fn collect_contains_hits(&self, query: &SearchQuery, candidate_ids: &[u32]) -> Vec<NodeId> {
+        let mut results: Vec<NodeId> = Vec::with_capacity(query.limit.min(64));
+        let needle = query.name.as_str();
+        let names = self.names.read();
+        for &name_id in candidate_ids {
+            if results.len() >= query.limit {
+                break;
+            }
+            let Some(name) = names.get(name_id as usize) else {
+                continue;
+            };
+            if !name.contains(needle) {
+                continue;
+            }
+            // Map the name back to its SymbolKey list and fan out to
+            // NodeIds, applying the kind + path filters.
+            let Some(keys) = self.symbols_by_name.get(name.as_ref()) else {
+                continue;
+            };
+            for key in keys.value() {
                 if let Some(filter_kind) = &query.kind
                     && &key.kind != filter_kind
                 {
@@ -474,9 +576,55 @@ impl HotIndexes {
         drop(entry);
         // Secondary map: name -> set of registered keys, so a kind-less
         // lookup avoids scanning every entry.
-        let mut by_name = self.symbols_by_name.entry(key.name.clone()).or_default();
+        let name = key.name.clone();
+        let mut by_name = self.symbols_by_name.entry(name.clone()).or_default();
         if !by_name.contains(&key) {
             by_name.push(key);
+        }
+        drop(by_name);
+        // Trigram index. Only index a name the first time we see it —
+        // multiple symbols with the same name share trigram entries.
+        self.index_name_trigrams(name);
+    }
+
+    /// Tokenize `name` into lowercase 3-byte windows and append a single
+    /// id to each trigram's posting list. Idempotent for previously-seen
+    /// names. Names shorter than 3 bytes are stored in `names` but not
+    /// trigram-indexed (the contains search falls back to a linear scan
+    /// for queries shorter than 3 chars).
+    fn index_name_trigrams(&self, name: String) {
+        let name_arc: Arc<str> = Arc::from(name.as_str());
+        if self.name_to_idx.contains_key(&name_arc) {
+            return; // already indexed
+        }
+        let id = {
+            let mut names = self.names.write();
+            // Race re-check after acquiring the write lock.
+            if let Some(existing) = self.name_to_idx.get(&name_arc) {
+                return drop(existing);
+            }
+            let id = names.len() as u32;
+            names.push(Arc::clone(&name_arc));
+            self.name_to_idx.insert(Arc::clone(&name_arc), id);
+            id
+        };
+        let bytes = name.as_bytes();
+        if bytes.len() < 3 {
+            return;
+        }
+        // Lowercase on the fly. ASCII-only fast path; non-ASCII falls
+        // through bytewise which is still correct for trigram matching
+        // because the query uses the same bytewise lowering.
+        let lower: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let mut seen: std::collections::HashSet<[u8; 3]> =
+            std::collections::HashSet::with_capacity(bytes.len());
+        for window in lower.windows(3) {
+            let tg = [window[0], window[1], window[2]];
+            // Dedupe within a single name so a name like "aaaa" doesn't
+            // bloat the "aaa" posting list.
+            if seen.insert(tg) {
+                self.trigrams.entry(tg).or_default().push(id);
+            }
         }
     }
 
@@ -623,5 +771,166 @@ mod tests {
         let mut hits = idx.lookup_symbol_by_name("Foo");
         hits.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(hits, vec![NodeId::from("h:1"), NodeId::from("h:2")]);
+    }
+
+    fn populate_search_corpus(idx: &HotIndexes) {
+        for (name, kind, path) in [
+            ("UserController", "class", "app/Http/UserController.php"),
+            ("UserService", "class", "app/Services/UserService.php"),
+            ("PostController", "class", "app/Http/PostController.php"),
+            ("PostService", "class", "app/Services/PostService.php"),
+            ("loginUser", "function", "auth/login.ts"),
+            ("logoutUser", "function", "auth/logout.ts"),
+            ("AB", "function", "tiny.ts"),
+        ] {
+            let node_id = NodeId::from(format!("h:{name}"));
+            idx.insert_node(NodeRecord {
+                id: node_id.clone(),
+                path: PathBuf::from(path),
+                kind: kind.to_string(),
+                name: name.to_string(),
+                qname: name.to_string(),
+            });
+            idx.register_symbol(
+                SymbolKey {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                },
+                node_id,
+            );
+        }
+    }
+
+    #[test]
+    fn search_contains_via_trigram_finds_substring_hits() {
+        let idx = HotIndexes::new();
+        populate_search_corpus(&idx);
+        let hits = idx.search(&SearchQuery {
+            name: "Controller".to_string(),
+            mode: SearchMode::Contains,
+            kind: None,
+            path_prefix: None,
+            limit: 64,
+        });
+        assert_eq!(hits.len(), 2, "expected User+Post controllers; got {hits:?}");
+    }
+
+    #[test]
+    fn search_contains_via_trigram_returns_zero_when_no_trigram_match() {
+        let idx = HotIndexes::new();
+        populate_search_corpus(&idx);
+        let hits = idx.search(&SearchQuery {
+            name: "ZZZ".to_string(),
+            mode: SearchMode::Contains,
+            kind: None,
+            path_prefix: None,
+            limit: 64,
+        });
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_contains_below_trigram_length_falls_back_to_linear_scan() {
+        let idx = HotIndexes::new();
+        populate_search_corpus(&idx);
+        // Two-byte query "AB" is shorter than a trigram. Falls back to
+        // linear scan, which still finds the exact-name "AB" entry plus
+        // any name containing "AB" as a substring.
+        let hits = idx.search(&SearchQuery {
+            name: "AB".to_string(),
+            mode: SearchMode::Contains,
+            kind: None,
+            path_prefix: None,
+            limit: 64,
+        });
+        assert!(
+            !hits.is_empty(),
+            "linear-scan fallback must still find the 'AB' entry"
+        );
+    }
+
+    #[test]
+    fn search_contains_filter_by_kind_narrows_hits() {
+        let idx = HotIndexes::new();
+        populate_search_corpus(&idx);
+        let hits = idx.search(&SearchQuery {
+            name: "User".to_string(),
+            mode: SearchMode::Contains,
+            kind: Some("function".to_string()),
+            path_prefix: None,
+            limit: 64,
+        });
+        // loginUser + logoutUser are functions; the Controllers/Services are classes.
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_contains_filter_by_path_narrows_hits() {
+        let idx = HotIndexes::new();
+        populate_search_corpus(&idx);
+        let hits = idx.search(&SearchQuery {
+            name: "Controller".to_string(),
+            mode: SearchMode::Contains,
+            kind: None,
+            path_prefix: Some("app/Http".to_string()),
+            limit: 64,
+        });
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_contains_respects_limit() {
+        let idx = HotIndexes::new();
+        populate_search_corpus(&idx);
+        let hits = idx.search(&SearchQuery {
+            name: "er".to_string(),
+            mode: SearchMode::Contains,
+            kind: None,
+            path_prefix: None,
+            limit: 2,
+        });
+        assert!(hits.len() <= 2);
+    }
+
+    #[test]
+    fn trigram_index_is_deduped_per_name() {
+        // A name like "aaaaa" tokenizes into ["aaa", "aaa", "aaa"]. The
+        // first-write dedupe avoids inflating the "aaa" posting list.
+        let idx = HotIndexes::new();
+        idx.register_symbol(
+            SymbolKey {
+                name: "aaaaa".to_string(),
+                kind: "function".to_string(),
+            },
+            NodeId::from("h:1"),
+        );
+        let posting = idx
+            .trigrams
+            .get(b"aaa")
+            .map(|p| p.value().clone())
+            .unwrap_or_default();
+        assert_eq!(posting.len(), 1, "trigram list must not duplicate for repeated windows");
+    }
+
+    #[test]
+    fn trigram_index_is_idempotent_across_same_name_registrations() {
+        let idx = HotIndexes::new();
+        let key1 = SymbolKey {
+            name: "Foo".to_string(),
+            kind: "class".to_string(),
+        };
+        let key2 = SymbolKey {
+            name: "Foo".to_string(),
+            kind: "function".to_string(),
+        };
+        idx.register_symbol(key1, NodeId::from("h:1"));
+        idx.register_symbol(key2, NodeId::from("h:2"));
+        // Same name under two kinds must produce ONE trigram entry.
+        let posting = idx
+            .trigrams
+            .get(b"foo")
+            .map(|p| p.value().clone())
+            .unwrap_or_default();
+        assert_eq!(posting.len(), 1);
     }
 }
