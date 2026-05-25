@@ -116,8 +116,15 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "files",
-        description: "List every indexed file path (sorted).",
-        input_schema: r#"{ "type": "object", "properties": {}, "additionalProperties": false }"#,
+        description: "List indexed file paths (sorted), with optional prefix filtering and pagination.",
+        input_schema: r#"{
+            "type": "object",
+            "properties": {
+                "prefix": { "type": "string", "description": "Optional path prefix such as app/Services" },
+                "limit": { "type": "integer", "description": "Maximum paths to return" },
+                "offset": { "type": "integer", "description": "Number of matching paths to skip" }
+            }
+        }"#,
     },
     ToolDef {
         name: "status",
@@ -144,6 +151,8 @@ pub const TOOLS: &[ToolDef] = &[
             "properties": {
                 "name": { "type": "string", "description": "Symbol name to look up" },
                 "kind": { "type": "string", "description": "Optional kind filter" },
+                "path_prefix": { "type": "string", "description": "Optional path-prefix filter" },
+                "limit": { "type": "integer", "description": "Maximum matching symbols to expand (default 20, max 200)" },
                 "related_limit": { "type": "integer", "description": "Cap on callers/callees per direction (default 20, max 200)" },
                 "snippet_bytes": { "type": "integer", "description": "Source snippet byte cap (default 2048, max 8192)" }
             },

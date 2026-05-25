@@ -7,6 +7,7 @@
 //! a broad "match everything" query.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -595,6 +596,9 @@ struct Extractor<'src> {
     nodes: Vec<Node>,
     refs: Vec<Ref>,
     diagnostics: Vec<Diagnostic>,
+    import_aliases: HashMap<String, String>,
+    property_types: HashMap<(LocalNodeId, String), String>,
+    variable_types: HashMap<(LocalNodeId, String), String>,
     /// Maps a tree-sitter node id to the local id of the definition produced
     /// for it. Used so a ref capture or call site can attribute itself to the
     /// enclosing class/function.
@@ -619,6 +623,9 @@ impl<'src> Extractor<'src> {
             nodes: Vec::new(),
             refs: Vec::new(),
             diagnostics: Vec::new(),
+            import_aliases: HashMap::new(),
+            property_types: HashMap::new(),
+            variable_types: HashMap::new(),
             container_index: std::collections::HashMap::new(),
             container_ranges: Vec::new(),
             namespace_scopes: Vec::new(),
@@ -639,6 +646,7 @@ impl<'src> Extractor<'src> {
         self.collect_namespace_scopes(root);
         self.collect_definitions(root);
         self.collect_imports(root);
+        self.collect_type_hints(root);
         self.collect_calls(root);
         self.collect_syntax_diagnostics(root);
     }
@@ -891,6 +899,8 @@ impl<'src> Extractor<'src> {
         let display_name = alias
             .clone()
             .unwrap_or_else(|| last_segment(&qname).to_string());
+        self.import_aliases
+            .insert(display_name.clone(), qname.clone());
 
         let container = enclosing_definition_local_id_v2(
             &self.container_ranges,
@@ -910,6 +920,104 @@ impl<'src> Extractor<'src> {
         });
     }
 
+    fn collect_type_hints(&mut self, root: TsNode<'_>) {
+        let mut cursor = root.walk();
+        self.walk_type_hints(&mut cursor);
+    }
+
+    fn walk_type_hints(&mut self, cursor: &mut TreeCursor<'_>) {
+        let node = cursor.node();
+        match node.kind() {
+            "property_declaration" => self.collect_property_declaration_types(node),
+            "property_promotion_parameter" => self.collect_promoted_property_type(node),
+            "simple_parameter" | "variadic_parameter" => self.collect_parameter_type(node),
+            _ => {}
+        }
+
+        if cursor.goto_first_child() {
+            loop {
+                self.walk_type_hints(cursor);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+            cursor.goto_parent();
+        }
+    }
+
+    fn collect_property_declaration_types(&mut self, node: TsNode<'_>) {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        let Some(type_qname) = self.qualify_type_node(type_node) else {
+            return;
+        };
+        let Some(class_id) = self.enclosing_class_for_range(node.start_byte(), node.end_byte())
+        else {
+            return;
+        };
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "property_element" {
+                continue;
+            }
+            if let Some(name_node) = child.child_by_field_name("name")
+                && let Some(name) = variable_name_key(name_node, self.source)
+            {
+                self.property_types
+                    .insert((class_id, name), type_qname.clone());
+            }
+        }
+    }
+
+    fn collect_promoted_property_type(&mut self, node: TsNode<'_>) {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let Some(name) = variable_name_key(name_node, self.source) else {
+            return;
+        };
+        let Some(type_qname) = self.qualify_type_node(type_node) else {
+            return;
+        };
+        let container = enclosing_definition_local_id_v2(
+            &self.container_ranges,
+            node.start_byte(),
+            node.end_byte(),
+        );
+        let Some(class_id) = self.enclosing_class_for_container(container) else {
+            return;
+        };
+        self.property_types.insert((class_id, name), type_qname);
+    }
+
+    fn collect_parameter_type(&mut self, node: TsNode<'_>) {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let Some(name) = variable_name_key(name_node, self.source) else {
+            return;
+        };
+        let Some(type_qname) = self.qualify_type_node(type_node) else {
+            return;
+        };
+        let Some(container) = enclosing_definition_local_id_v2(
+            &self.container_ranges,
+            node.start_byte(),
+            node.end_byte(),
+        ) else {
+            return;
+        };
+        self.variable_types.insert((container, name), type_qname);
+    }
+
     fn collect_calls(&mut self, root: TsNode<'_>) {
         let mut cursor = root.walk();
         self.walk_calls(&mut cursor);
@@ -922,28 +1030,32 @@ impl<'src> Extractor<'src> {
                 if let Some(function) = node.child_by_field_name("function")
                     && let Some((name, name_node)) = callee_name(function, self.source)
                 {
-                    self.emit_call(node, name_node, name, "call");
+                    let qname = Some(normalize_qualified_name(&name));
+                    self.emit_call(node, name_node, name, qname, "call");
                 }
             }
             "member_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, "method_call");
+                    let qname = self.member_call_qname(node, &name);
+                    self.emit_call(node, name_node, name, qname, "method_call");
                 }
             }
             "nullsafe_member_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, "nullsafe_method_call");
+                    let qname = self.member_call_qname(node, &name);
+                    self.emit_call(node, name_node, name, qname, "nullsafe_method_call");
                 }
             }
             "scoped_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, "static_call");
+                    let qname = self.static_call_qname(node, &name);
+                    self.emit_call(node, name_node, name, qname, "static_call");
                 }
             }
             _ => {}
@@ -965,6 +1077,7 @@ impl<'src> Extractor<'src> {
         call: TsNode<'_>,
         _name_node: TsNode<'_>,
         name: String,
+        qname: Option<String>,
         kind: &'static str,
     ) {
         let container = enclosing_definition_local_id_v2(
@@ -976,12 +1089,144 @@ impl<'src> Extractor<'src> {
         self.refs.push(Ref {
             id,
             kind: kind.to_string(),
-            qname: Some(normalize_qualified_name(&name)),
+            qname,
             name,
             alias: None,
             span: span_from_node(call),
             container,
         });
+    }
+
+    fn member_call_qname(&self, call: TsNode<'_>, method_name: &str) -> Option<String> {
+        if method_name.starts_with('$') {
+            return None;
+        }
+        let object = call.child_by_field_name("object")?;
+        let container = enclosing_definition_local_id_v2(
+            &self.container_ranges,
+            call.start_byte(),
+            call.end_byte(),
+        );
+        let receiver = self.receiver_type_qname(object, container)?;
+        Some(format!("{receiver}::{method_name}"))
+    }
+
+    fn static_call_qname(&self, call: TsNode<'_>, method_name: &str) -> Option<String> {
+        if method_name.starts_with('$') {
+            return None;
+        }
+        let scope = call.child_by_field_name("scope")?;
+        let raw_scope = self.slice_text(scope);
+        let class_qname = match raw_scope {
+            "self" | "static" => {
+                let container = enclosing_definition_local_id_v2(
+                    &self.container_ranges,
+                    call.start_byte(),
+                    call.end_byte(),
+                );
+                self.enclosing_class_for_container(container)
+                    .and_then(|id| self.nodes.get(id as usize))
+                    .map(|n| n.qname.clone())?
+            }
+            "parent" => return None,
+            _ => self.qualify_type_name(raw_scope, scope.start_byte())?,
+        };
+        Some(format!("{class_qname}::{method_name}"))
+    }
+
+    fn receiver_type_qname(
+        &self,
+        object: TsNode<'_>,
+        container: Option<LocalNodeId>,
+    ) -> Option<String> {
+        match object.kind() {
+            "variable_name" => {
+                let name = variable_name_key(object, self.source)?;
+                if name == "this" {
+                    return self
+                        .enclosing_class_for_container(container)
+                        .and_then(|id| self.nodes.get(id as usize))
+                        .map(|n| n.qname.clone());
+                }
+                container.and_then(|id| self.variable_types.get(&(id, name)).cloned())
+            }
+            "member_access_expression" | "nullsafe_member_access_expression" => {
+                let receiver = object.child_by_field_name("object")?;
+                let receiver_name = variable_name_key(receiver, self.source)?;
+                if receiver_name != "this" {
+                    return None;
+                }
+                let class_id = self.enclosing_class_for_container(container)?;
+                let property_name =
+                    member_name_key(object.child_by_field_name("name")?, self.source)?;
+                self.property_types.get(&(class_id, property_name)).cloned()
+            }
+            "object_creation_expression" => class_name_from_object_creation(object, self.source)
+                .and_then(|name| self.qualify_type_name(&name, object.start_byte())),
+            "parenthesized_expression" => first_named_child(object)
+                .and_then(|inner| self.receiver_type_qname(inner, container)),
+            _ => None,
+        }
+    }
+
+    fn qualify_type_node(&self, type_node: TsNode<'_>) -> Option<String> {
+        self.qualify_type_name(self.slice_text(type_node), type_node.start_byte())
+    }
+
+    fn qualify_type_name(&self, raw: &str, byte: usize) -> Option<String> {
+        let normalized = normalize_type_name(raw)?;
+        if is_builtin_php_type(&normalized) {
+            return None;
+        }
+        if let Some(stripped) = normalized.strip_prefix('\\') {
+            return Some(stripped.to_string());
+        }
+        let mut parts = normalized.splitn(2, '\\');
+        let head = parts.next().unwrap_or_default();
+        let tail = parts.next();
+        if let Some(imported) = self.import_aliases.get(head) {
+            return match tail {
+                Some(tail) if !tail.is_empty() => Some(format!("{imported}\\{tail}")),
+                _ => Some(imported.clone()),
+            };
+        }
+        if let Some(ns) = enclosing_namespace_v2(&self.namespace_scopes, byte)
+            && !ns.is_empty()
+        {
+            return Some(format!("{}\\{}", ns.trim_start_matches('\\'), normalized));
+        }
+        Some(normalized)
+    }
+
+    fn enclosing_class_for_range(&self, start: usize, end: usize) -> Option<LocalNodeId> {
+        let mut best: Option<(usize, LocalNodeId)> = None;
+        for &(c_start, c_end, id) in &self.container_ranges {
+            if c_start <= start
+                && c_end >= end
+                && (c_start < start || c_end > end)
+                && self
+                    .nodes
+                    .get(id as usize)
+                    .is_some_and(|node| is_class_like_kind(&node.kind))
+            {
+                let span = c_end - c_start;
+                if best.as_ref().is_none_or(|(s, _)| span < *s) {
+                    best = Some((span, id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    fn enclosing_class_for_container(&self, container: Option<LocalNodeId>) -> Option<LocalNodeId> {
+        let mut current = container?;
+        loop {
+            let node = self.nodes.get(current as usize)?;
+            if is_class_like_kind(&node.kind) {
+                return Some(current);
+            }
+            current = node.parent?;
+        }
     }
 
     fn collect_syntax_diagnostics(&mut self, root: TsNode<'_>) {
@@ -1056,6 +1301,95 @@ fn simple_identifier(node: TsNode<'_>, source: &[u8]) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn variable_name_key(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() != "variable_name" {
+        return None;
+    }
+    let inner = node
+        .child_by_field_name("name")
+        .or_else(|| first_named_child(node))?;
+    std::str::from_utf8(&source[inner.byte_range()])
+        .ok()
+        .map(str::to_string)
+}
+
+fn member_name_key(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "name" => std::str::from_utf8(&source[node.byte_range()])
+            .ok()
+            .map(str::to_string),
+        "variable_name" => variable_name_key(node, source),
+        _ => None,
+    }
+}
+
+fn class_name_from_object_creation(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "name" | "qualified_name" | "relative_name") {
+            return std::str::from_utf8(&source[child.byte_range()])
+                .ok()
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+fn first_named_child(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn normalize_type_name(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches('?')
+        .trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut class_like = trimmed
+        .split(['|', '&'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter(|part| !is_builtin_php_type(part));
+    let first = class_like.next()?;
+    if class_like.next().is_some() {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+fn is_builtin_php_type(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "array"
+            | "bool"
+            | "boolean"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "integer"
+            | "iterable"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "self"
+            | "static"
+            | "string"
+            | "true"
+            | "void"
+    )
+}
+
+fn is_class_like_kind(kind: &str) -> bool {
+    matches!(kind, "class" | "interface" | "trait" | "enum")
 }
 
 /// O(N_scopes) namespace lookup over a precomputed scope table. The smallest
@@ -1274,6 +1608,14 @@ mod tests {
             .collect()
     }
 
+    fn call_qnames(file: &ExtractedFile, name: &str) -> Vec<Option<String>> {
+        file.refs
+            .iter()
+            .filter(|r| r.name == name)
+            .map(|r| r.qname.clone())
+            .collect()
+    }
+
     #[test]
     fn extracts_namespace_class_inheritance_and_members() {
         let source = include_str!("../../tests/fixtures/php/class_with_members.php");
@@ -1391,6 +1733,61 @@ mod tests {
             .find(|r| r.kind == "call" && r.name == "sprintf")
             .expect("sprintf call ref");
         assert_eq!(sprintf_call.container, Some(dispatch_id));
+    }
+
+    #[test]
+    fn qualifies_php_method_calls_when_receiver_type_is_known() {
+        let source = r#"<?php
+
+namespace App\Services;
+
+use App\Contracts\Notifier as Alert;
+
+class Handler
+{
+    public function __construct(
+        private NavResolver $navResolver,
+        private Alert $alert,
+    ) {}
+
+    public function run(Organization $org): void
+    {
+        $this->navResolver->resolve();
+        $this->alert->send();
+        $this->own();
+        $org->enabledCapabilityKeys();
+        $unknown->values();
+        Unknown::go();
+    }
+
+    private function own(): void {}
+}
+"#;
+        let extracted = extract(source);
+
+        assert_eq!(
+            call_qnames(&extracted, "resolve"),
+            vec![Some("App\\Services\\NavResolver::resolve".to_string())]
+        );
+        assert_eq!(
+            call_qnames(&extracted, "send"),
+            vec![Some("App\\Contracts\\Notifier::send".to_string())]
+        );
+        assert_eq!(
+            call_qnames(&extracted, "own"),
+            vec![Some("App\\Services\\Handler::own".to_string())]
+        );
+        assert_eq!(
+            call_qnames(&extracted, "enabledCapabilityKeys"),
+            vec![Some(
+                "App\\Services\\Organization::enabledCapabilityKeys".to_string()
+            )]
+        );
+        assert_eq!(
+            call_qnames(&extracted, "go"),
+            vec![Some("App\\Services\\Unknown::go".to_string())]
+        );
+        assert_eq!(call_qnames(&extracted, "values"), vec![None]);
     }
 
     #[test]

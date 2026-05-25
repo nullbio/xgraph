@@ -109,9 +109,9 @@ xgraph search Controller --mode contains --path-prefix app/Http
 xgraph callers <node-id>
 xgraph callees <node-id>
 xgraph impact <node-id> --max-depth 3
-xgraph context UserService
+xgraph context UserService --path-prefix app/Services
 xgraph trace <from-id> <to-id>
-xgraph files
+xgraph files --prefix app/Services --limit 50
 ```
 
 Query subcommands: thin clients that send a JSON-RPC request to the daemon socket and pretty-print the response. The daemon is the source of truth — these commands do no extraction or graph work themselves. They mirror the MCP tools an agent would invoke.
@@ -315,6 +315,11 @@ Laravel-specific resolution should model:
 
 Tree-sitter gets syntax nodes. Laravel meaning comes from a framework resolver pass. Framework-derived edges must carry explicit provenance and confidence.
 
+Generic PHP method-call edges favor precision over guesses. Calls with a known
+receiver type, such as `$this->service->run()`, `$this->ownMethod()`, typed
+parameters, and `ClassName::method()`, resolve to `ClassName::method`. Untyped
+member calls do not fall back to every method with the same bare name.
+
 Framework-edge node IDs use the synthetic `lh:` prefix (e.g. `lh:route:get /users`, `lh:UserController::index`, `lh:react.component`, `lh:react.hook.useState`) so they cannot collide with parser-extracted IDs (which always start with a 64-character content hash). MCP clients reading framework edges via `callers_of`/`callees_of` should treat `lh:*` IDs as synthesis points: they do not appear in `active_node` and are not directly queryable by `nodes_in_file`. Edge provenance is `"laravel_heuristic"` and confidence ranges 40 (low) — 70 (medium) — 90 (high) depending on the pattern.
 
 The same resolver path serves the React resolver (`src/react.rs`): JSX-producing PascalCase functions and class components are tagged `lh:react.component`; functions matching `use[A-Z]...` are tagged `lh:react.hook`; calls to React's built-in hooks (the 18 hooks shipped with React 19) from inside a component or hook produce `react_uses_hook` edges to `lh:react.hook.<name>`.
@@ -413,10 +418,10 @@ Use in-memory indexes for hot MCP calls:
 - `node` — single record + bounded source snippet.
 - `nodes_in_file` — file scope.
 - `callers_of` / `callees_of` — call graph by node id.
-- `context` — composes `find_symbol` + `node` + callers + callees in one call.
+- `context` — composes symbol lookup, source, caller/callee IDs, and caller/callee node summaries; supports `path_prefix`, result limits, and related-node limits.
 - `explore` — multi-node source browsing with a shared byte budget.
 - `trace` — shortest call path via bidirectional BFS over the in-memory call graph.
-- `files` — list of indexed paths.
+- `files` — sorted indexed paths with optional prefix filtering and pagination.
 - `status` — file / node / symbol / call-edge counts + RSS + reconcile state.
 
 Use Cozo Datalog for complex graph queries:
@@ -457,8 +462,8 @@ TypeScript / JavaScript / TSX / Python.
 **What works:**
 
 - `xgraph init` indexes a worktree into Cozo, prints a colored
-  shimmer-bar progress UX, and reports a `{files_indexed, nodes_created,
-  edges_created}` summary.
+  shimmer-bar progress UX, and reports both changed-file work and current
+  graph totals.
 - `xgraph daemon start` opens a Unix socket and serves the 12 MCP tools
   out of in-memory hot indexes loaded from the persistent graph.
 - `xgraph mcp` lazy-spawns the daemon and proxies MCP-style JSON-RPC.

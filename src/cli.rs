@@ -80,6 +80,10 @@ pub enum Command {
         name: String,
         #[arg(long)]
         kind: Option<String>,
+        #[arg(long)]
+        path_prefix: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         #[arg(long, default_value_t = 20)]
         related_limit: usize,
     },
@@ -90,8 +94,15 @@ pub enum Command {
         #[arg(long, default_value_t = 12)]
         max_depth: usize,
     },
-    /// List all indexed files.
-    Files,
+    /// List indexed files.
+    Files {
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -235,12 +246,16 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Context {
             name,
             kind,
+            path_prefix,
+            limit,
             related_limit,
         } => cmd_send_query(
             "context",
             serde_json::json!({
                 "name": name,
                 "kind": kind,
+                "path_prefix": path_prefix,
+                "limit": limit,
                 "related_limit": related_limit,
             }),
         ),
@@ -256,7 +271,18 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
                 "max_depth": max_depth,
             }),
         ),
-        Command::Files => cmd_send_query("files", serde_json::json!({})),
+        Command::Files {
+            prefix,
+            limit,
+            offset,
+        } => cmd_send_query(
+            "files",
+            serde_json::json!({
+                "prefix": prefix,
+                "limit": limit,
+                "offset": offset,
+            }),
+        ),
     }
 }
 
@@ -275,7 +301,7 @@ fn cmd_init_at(start: &Path) -> Result<ExitCode, CliError> {
             return Ok(ExitCode::FAILURE);
         }
         let result = response.get("result").unwrap_or(&response);
-        print_index_summary(result, persistent.root_dir());
+        print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
         maybe_prompt_mcp_install();
         return Ok(ExitCode::SUCCESS);
     }
@@ -312,6 +338,7 @@ fn init_at_locked(
         &persistent.cozo_db_path(),
         std::time::Duration::from_secs(60),
     )?;
+    let store_for_counts = store.clone();
     let matcher = IgnoreMatcher::new(worktree.as_path())?;
     let registry = LanguageRegistry::with_all();
     let indexes = Arc::new(crate::indexes::HotIndexes::new());
@@ -332,13 +359,16 @@ fn init_at_locked(
     if let Some(first) = errors.into_iter().next() {
         return Err(CliError::Writer(first));
     }
-
-    println!(
-        "indexed {files} files: {nodes} nodes, {edges} edges into {dir}",
-        files = summary.files_indexed,
-        nodes = summary.nodes_created,
-        edges = summary.edges_created,
-        dir = persistent.root_dir().display(),
+    let graph_counts = GraphCounts::from_indexes(&crate::indexes::HotIndexes::load_from_cozo(
+        &store_for_counts,
+    )?);
+    print_index_summary_parts(
+        summary.files_scanned as u64,
+        summary.files_indexed as u64,
+        summary.nodes_created,
+        summary.edges_created,
+        Some(graph_counts),
+        persistent.root_dir(),
     );
 
     maybe_prompt_mcp_install();
@@ -440,12 +470,17 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     let maintenance_gate = Arc::new(parking_lot::RwLock::new(()));
 
     let summary = owner.index_all()?;
+    print_index_summary_parts(
+        summary.files_scanned as u64,
+        summary.files_indexed as u64,
+        summary.nodes_created,
+        summary.edges_created,
+        Some(GraphCounts::from_indexes(&indexes)),
+        persistent.root_dir(),
+    );
     println!(
-        "indexed {files} files ({nodes} nodes, {edges} edges); opening daemon socket at {sock}",
-        files = summary.files_indexed,
-        nodes = summary.nodes_created,
-        edges = summary.edges_created,
-        sock = runtime.socket_path().display(),
+        "opening daemon socket at {}",
+        runtime.socket_path().display()
     );
 
     // Start the watcher and hand its batches to an OS thread that owns the
@@ -747,7 +782,7 @@ fn cmd_sync() -> Result<ExitCode, CliError> {
             return Ok(ExitCode::FAILURE);
         }
         let result = response.get("result").unwrap_or(&response);
-        print_index_summary(result, persistent.root_dir());
+        print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
         return Ok(ExitCode::SUCCESS);
     }
     init_at(&cwd)
@@ -765,7 +800,7 @@ fn cmd_reindex() -> Result<ExitCode, CliError> {
             return Ok(ExitCode::FAILURE);
         }
         let result = response.get("result").unwrap_or(&response);
-        print_index_summary(result, persistent.root_dir());
+        print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1021,20 +1056,114 @@ fn print_daemon_error_if_any(response: &serde_json::Value) -> bool {
     true
 }
 
-fn print_index_summary(result: &serde_json::Value, dir: &Path) {
+fn print_daemon_index_summary(
+    worktree: &WorktreeRoot,
+    result: &serde_json::Value,
+    dir: &Path,
+) -> Result<(), CliError> {
+    let graph = match GraphCounts::from_json(result) {
+        Some(graph) => Some(graph),
+        None => daemon_graph_counts(worktree)?,
+    };
+    print_index_summary(result, graph, dir);
+    Ok(())
+}
+
+fn daemon_graph_counts(worktree: &WorktreeRoot) -> Result<Option<GraphCounts>, CliError> {
+    let Some(response) =
+        send_daemon_request_if_reachable(worktree, "status", serde_json::json!({}))?
+    else {
+        return Ok(None);
+    };
+    if response.get("error").is_some() {
+        return Ok(None);
+    }
+    let result = response.get("result").unwrap_or(&response);
+    Ok(GraphCounts::from_status_json(result))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GraphCounts {
+    files: usize,
+    nodes: usize,
+    symbols: usize,
+    call_edges: usize,
+}
+
+impl GraphCounts {
+    fn from_indexes(indexes: &crate::indexes::HotIndexes) -> Self {
+        Self {
+            files: indexes.file_count(),
+            nodes: indexes.node_count(),
+            symbols: indexes.symbol_count(),
+            call_edges: indexes.call_edge_count(),
+        }
+    }
+
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let graph = value.get("graph")?;
+        Self::from_graph_object(graph)
+    }
+
+    fn from_status_json(value: &serde_json::Value) -> Option<Self> {
+        Self::from_graph_object(value)
+    }
+
+    fn from_graph_object(graph: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            files: graph.get("files")?.as_u64()?.try_into().ok()?,
+            nodes: graph.get("nodes")?.as_u64()?.try_into().ok()?,
+            symbols: graph.get("symbols")?.as_u64()?.try_into().ok()?,
+            call_edges: graph.get("call_edges")?.as_u64()?.try_into().ok()?,
+        })
+    }
+}
+
+fn print_index_summary(result: &serde_json::Value, graph: Option<GraphCounts>, dir: &Path) {
+    let scanned = result.get("files_scanned").and_then(|v| v.as_u64());
     let files = result.get("files_indexed").and_then(|v| v.as_u64());
     let nodes = result.get("nodes_created").and_then(|v| v.as_u64());
     let edges = result.get("edges_created").and_then(|v| v.as_u64());
     match (files, nodes, edges) {
-        (Some(files), Some(nodes), Some(edges)) => println!(
-            "indexed {files} files: {nodes} nodes, {edges} edges into {dir}",
-            dir = dir.display(),
-        ),
+        (Some(files), Some(nodes), Some(edges)) => {
+            print_index_summary_parts(scanned.unwrap_or(files), files, nodes, edges, graph, dir);
+        }
         _ => println!(
             "{}",
             serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())
         ),
     }
+}
+
+fn print_index_summary_parts(
+    scanned: u64,
+    changed: u64,
+    nodes: u64,
+    edges: u64,
+    graph: Option<GraphCounts>,
+    dir: &Path,
+) {
+    if scanned > changed {
+        print!("checked {scanned} files: indexed {changed} changed files");
+    } else {
+        print!("indexed {changed} files");
+    }
+
+    if changed > 0 || graph.is_none() {
+        print!(": {nodes} nodes, {edges} edges");
+    }
+
+    if let Some(graph) = graph {
+        print!(
+            "; graph has {files} files, {nodes} nodes, {symbols} symbols, {call_edges} call edges",
+            files = graph.files,
+            nodes = graph.nodes,
+            symbols = graph.symbols,
+            call_edges = graph.call_edges,
+        );
+    }
+
+    println!(" in {dir}", dir = dir.display());
 }
 
 #[cfg(test)]
@@ -1201,8 +1330,25 @@ mod tests {
 
     #[test]
     fn parses_files_command() {
-        let cli = parse(["xgraph", "files"]).expect("parses");
-        assert_eq!(cli.command, Command::Files);
+        let cli = parse([
+            "xgraph",
+            "files",
+            "--prefix",
+            "app/Services",
+            "--limit",
+            "10",
+            "--offset",
+            "20",
+        ])
+        .expect("parses");
+        assert_eq!(
+            cli.command,
+            Command::Files {
+                prefix: Some("app/Services".to_string()),
+                limit: Some(10),
+                offset: 20,
+            }
+        );
     }
 
     #[test]

@@ -238,14 +238,39 @@ impl WorktreeHandler {
                 ))
             }
             "files" => {
-                let paths: Vec<Value> = self
+                let params: FilesParams = parse_params(request)?;
+                let all_paths = self
                     .indexes
                     .list_files()
                     .into_iter()
-                    .map(|p| Value::String(p.to_string_lossy().into_owned()))
-                    .collect();
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|p| {
+                        params
+                            .prefix
+                            .as_deref()
+                            .is_none_or(|prefix| p.starts_with(prefix))
+                    })
+                    .collect::<Vec<_>>();
+                let total = all_paths.len();
+                let offset = params.offset.unwrap_or(0).min(total);
+                let default_limit = total.saturating_sub(offset);
+                let limit = params.limit.unwrap_or(default_limit).min(10_000);
+                let returned = all_paths
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                let paths: Vec<Value> = returned.into_iter().map(Value::String).collect();
                 let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-                Ok((json!({ "files": paths }), catching_up))
+                Ok((
+                    json!({
+                        "files": paths,
+                        "total": total,
+                        "offset": offset,
+                        "limit": limit,
+                    }),
+                    catching_up,
+                ))
             }
             "status" => {
                 let catching_up = !self.status.is_reconcile_done();
@@ -343,12 +368,37 @@ impl WorktreeHandler {
             message: "maintenance worker stopped before replying".to_string(),
         })?;
         match summary {
-            Ok(summary) => Ok((maintenance_summary_json(op, summary), false)),
+            Ok(summary) => Ok((self.maintenance_summary_json(op, summary), false)),
             Err(err) => Err(RpcError {
                 code: -32000,
                 message: err.to_string(),
             }),
         }
+    }
+
+    fn maintenance_summary_json(&self, op: MaintenanceOp, summary: IndexSummary) -> Value {
+        json!({
+            "operation": match op {
+                MaintenanceOp::Sync => "sync",
+                MaintenanceOp::Reindex => "reindex",
+            },
+            "files_scanned": summary.files_scanned,
+            "files_indexed": summary.files_indexed,
+            "nodes_created": summary.nodes_created,
+            "edges_created": summary.edges_created,
+            "graph": {
+                "files": self.indexes.file_count(),
+                "nodes": self.indexes.node_count(),
+                "symbols": self.indexes.symbol_count(),
+                "call_edges": self.indexes.call_edge_count(),
+            },
+            "timings": {
+                "scan_us": summary.timings.scan_us,
+                "parse_us": summary.timings.parse_us,
+                "resolve_us": summary.timings.resolve_us,
+                "store_us": summary.timings.store_us,
+            },
+        })
     }
 
     /// Compose `find_symbol` + `node` + `callers_of` + `callees_of` into
@@ -357,6 +407,7 @@ impl WorktreeHandler {
     fn build_context(&self, params: ContextParams) -> (Value, bool) {
         let related_limit = params.related_limit.unwrap_or(20).min(200);
         let snippet_bytes = params.snippet_bytes.unwrap_or(2048).min(8192);
+        let match_limit = params.limit.unwrap_or(20).min(200);
 
         let ids = match &params.kind {
             Some(k) => self.indexes.lookup_symbol(&SymbolKey {
@@ -366,25 +417,53 @@ impl WorktreeHandler {
             None => self.indexes.lookup_symbol_by_name(&params.name),
         };
 
-        let mut matches: Vec<Value> = Vec::with_capacity(ids.len());
+        let mut matches: Vec<Value> = Vec::with_capacity(ids.len().min(match_limit));
+        let mut total_matches = 0usize;
         for id in &ids {
             let Some(record) = self.indexes.get_node(id) else {
                 continue;
             };
+            if params
+                .path_prefix
+                .as_deref()
+                .is_some_and(|prefix| !record.path.to_string_lossy().starts_with(prefix))
+            {
+                continue;
+            }
+            total_matches += 1;
+            if matches.len() >= match_limit {
+                continue;
+            }
             let (span, source) = self.lookup_span_and_snippet(id, &record.path, snippet_bytes);
-            let callers: Vec<String> = self
+            let caller_nodes: Vec<Value> = self
                 .indexes
                 .callers_of(id)
                 .into_iter()
                 .take(related_limit)
-                .map(|c| c.as_str().to_owned())
+                .map(|c| self.summarize_node(&c))
                 .collect();
-            let callees: Vec<String> = self
+            let callee_nodes: Vec<Value> = self
                 .indexes
                 .callees_of(id)
                 .into_iter()
                 .take(related_limit)
-                .map(|c| c.as_str().to_owned())
+                .map(|c| self.summarize_node(&c))
+                .collect();
+            let callers: Vec<String> = caller_nodes
+                .iter()
+                .filter_map(|node| {
+                    node.get("node_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .collect();
+            let callees: Vec<String> = callee_nodes
+                .iter()
+                .filter_map(|node| {
+                    node.get("node_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
                 .collect();
             matches.push(json!({
                 "node_id": id.as_str(),
@@ -396,11 +475,16 @@ impl WorktreeHandler {
                 "source": source,
                 "callers": callers,
                 "callees": callees,
+                "caller_nodes": caller_nodes,
+                "callee_nodes": callee_nodes,
             }));
         }
 
         let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-        (json!({ "matches": matches }), catching_up)
+        (
+            json!({ "matches": matches, "total_matches": total_matches, "limit": match_limit }),
+            catching_up,
+        )
     }
 
     /// Read source snippets for a batch of node ids, capped to a total
@@ -635,24 +719,6 @@ enum MaintenanceOp {
     Reindex,
 }
 
-fn maintenance_summary_json(op: MaintenanceOp, summary: IndexSummary) -> Value {
-    json!({
-        "operation": match op {
-            MaintenanceOp::Sync => "sync",
-            MaintenanceOp::Reindex => "reindex",
-        },
-        "files_indexed": summary.files_indexed,
-        "nodes_created": summary.nodes_created,
-        "edges_created": summary.edges_created,
-        "timings": {
-            "scan_us": summary.timings.scan_us,
-            "parse_us": summary.timings.parse_us,
-            "resolve_us": summary.timings.resolve_us,
-            "store_us": summary.timings.store_us,
-        },
-    })
-}
-
 async fn serve_connection(handler: &WorktreeHandler, conn: UnixStream) -> std::io::Result<()> {
     let (read_half, mut write_half) = conn.into_split();
     let mut reader = BufReader::new(read_half);
@@ -725,6 +791,16 @@ struct NodesInFileParams {
     path: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct FilesParams {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ImpactParams {
     node_id: String,
@@ -755,6 +831,10 @@ struct ContextParams {
     name: String,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
     /// How many caller / callee ids to include per direction.
     #[serde(default)]
     related_limit: Option<usize>,
@@ -1166,9 +1246,34 @@ mod tests {
         .await;
         let files = resp["result"]["files"].as_array().unwrap();
         assert_eq!(files.len(), 2);
+        assert_eq!(resp["result"]["total"], 2);
+        assert_eq!(resp["result"]["offset"], 0);
         // List is sorted for determinism.
         assert_eq!(files[0], "src/a.rs");
         assert_eq!(files[1], "src/b.rs");
+    }
+
+    #[tokio::test]
+    async fn files_tool_filters_and_pages_paths() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        indexes.insert_file(PathBuf::from("app/Actions/A.php"), vec![]);
+        indexes.insert_file(PathBuf::from("app/Services/A.php"), vec![]);
+        indexes.insert_file(PathBuf::from("app/Services/B.php"), vec![]);
+        indexes.insert_file(PathBuf::from("tests/Feature/A.php"), vec![]);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":12,"method":"files","params":{"prefix":"app/Services","offset":1,"limit":1}}"#,
+        )
+        .await;
+        let files = resp["result"]["files"].as_array().unwrap();
+        assert_eq!(resp["result"]["total"], 2);
+        assert_eq!(resp["result"]["offset"], 1);
+        assert_eq!(resp["result"]["limit"], 1);
+        assert_eq!(files, &vec![serde_json::json!("app/Services/B.php")]);
     }
 
     #[tokio::test]
@@ -1359,6 +1464,29 @@ mod tests {
         let callers = matches[0]["callers"].as_array().unwrap();
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0], "h:UserController");
+        let caller_nodes = matches[0]["caller_nodes"].as_array().unwrap();
+        assert_eq!(caller_nodes[0]["qname"], "UserController");
+        assert_eq!(resp["result"]["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn context_tool_filters_by_path_prefix_and_limits_matches() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":29,"method":"context","params":{"name":"UserService","path_prefix":"app/Services","limit":1}}"#,
+        )
+        .await;
+        let matches = resp["result"]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["path"], "app/Services/UserService.rs");
+        assert_eq!(resp["result"]["total_matches"], 1);
+        assert_eq!(resp["result"]["limit"], 1);
     }
 
     #[tokio::test]

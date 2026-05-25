@@ -309,6 +309,92 @@ fn controller_to_model_static_call_emits_uses_model_edge() {
     );
 }
 
+#[test]
+fn php_method_calls_use_receiver_types_instead_of_bare_method_fanout() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    let services = tmp.path().join("app").join("Services");
+    fs::create_dir_all(&services).unwrap();
+    fs::write(
+        services.join("NavResolver.php"),
+        "<?php\nnamespace App\\Services;\nclass NavResolver { public function resolve(): array { return []; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        services.join("OtherResolver.php"),
+        "<?php\nnamespace App\\Services;\nclass OtherResolver { public function resolve(): array { return []; } public function values(): array { return []; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        services.join("SharedPageDataService.php"),
+        "<?php\nnamespace App\\Services;\nclass SharedPageDataService {\n    public function __construct(private NavResolver $navResolver) {}\n    public function resolveNavigation(): array {\n        $navigation = $this->navResolver->resolve();\n        $unknown->values();\n        collect($navigation)->values();\n        return $navigation;\n    }\n}\n",
+    )
+    .unwrap();
+
+    init_at(tmp.path()).expect("init");
+
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    let store = CozoStore::open(&cozo_path).expect("reopen");
+    let rows = store
+        .run_read(
+            "?[id, qname] := *active_node[id, _path, _hash, _lid, _kind, _name, qname, _span]",
+            std::collections::BTreeMap::new(),
+        )
+        .expect("read nodes");
+    let mut ids = std::collections::HashMap::new();
+    for row in rows.rows {
+        let mut it = row.into_iter();
+        let Some(cozo::DataValue::Str(id)) = it.next() else {
+            continue;
+        };
+        let Some(cozo::DataValue::Str(qname)) = it.next() else {
+            continue;
+        };
+        ids.insert(qname.to_string(), id.to_string());
+    }
+
+    let source = ids
+        .get("App\\Services\\SharedPageDataService::resolveNavigation")
+        .expect("source method id");
+    let nav_resolve = ids
+        .get("App\\Services\\NavResolver::resolve")
+        .expect("nav resolver method id");
+    let other_resolve = ids
+        .get("App\\Services\\OtherResolver::resolve")
+        .expect("other resolver method id");
+    let other_values = ids
+        .get("App\\Services\\OtherResolver::values")
+        .expect("other values method id");
+
+    let rows = store
+        .run_read(
+            "?[target] := *edge[$source, 'calls', target, _p, _c]",
+            [("source".to_string(), cozo::DataValue::from(source.as_str()))].into(),
+        )
+        .expect("read call edges");
+    let targets: Vec<String> = rows
+        .rows
+        .into_iter()
+        .filter_map(|row| match row.into_iter().next()? {
+            cozo::DataValue::Str(target) => Some(target.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        targets.contains(nav_resolve),
+        "expected typed call to NavResolver::resolve, got {targets:?}"
+    );
+    assert!(
+        !targets.contains(other_resolve),
+        "bare resolve() fanout should not target OtherResolver::resolve"
+    );
+    assert!(
+        !targets.contains(other_values),
+        "unknown collection-style values() calls should not target unrelated values methods"
+    );
+}
+
 /// Blade templates that `@extends` and `@include` other views must emit
 /// `extends_view` and `includes_view` framework edges through the full
 /// pipeline (Blade extractor → Laravel resolver → Cozo edge rows).

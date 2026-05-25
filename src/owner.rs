@@ -33,6 +33,7 @@ pub const PARSER_VERSION: u32 = 1;
 /// the benchmarks read to identify which phase dominates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexSummary {
+    pub files_scanned: usize,
     pub files_indexed: usize,
     pub nodes_created: u64,
     pub edges_created: u64,
@@ -139,8 +140,9 @@ impl WorktreeOwner {
         progress.phase(Phase::Scanning, None);
         let t_scan_start = Instant::now();
         let scanned = scan(&self.worktree_root, &self.matcher)?;
+        let files_scanned = scanned.len();
         let scan_us = t_scan_start.elapsed().as_micros() as u64;
-        progress.tick(scanned.len() as u64);
+        progress.tick(files_scanned as u64);
         progress.finish_phase();
 
         // Project-scoped import resolvers, built once per pass.
@@ -218,6 +220,7 @@ impl WorktreeOwner {
         // tracked per-path via DaemonStatus::pending_paths.
         self.status.mark_reconcile_done();
         Ok(IndexSummary {
+            files_scanned,
             files_indexed,
             nodes_created,
             edges_created,
@@ -621,7 +624,7 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
             let node_id = active_node_id(&cozo_hash, node.id);
             table.register(family, &node.qname, node_id.clone());
             // Also index by bare name when it differs, so unqualified callers can resolve.
-            if node.name != node.qname {
+            if node.name != node.qname && should_register_bare_name(family, &node.kind) {
                 table.register(family, &node.name, node_id.clone());
             }
 
@@ -699,6 +702,14 @@ fn resolve_edges(
     let mut edges = Vec::new();
     for r in &extracted.refs {
         let lookup_key = r.qname.as_deref().unwrap_or(r.name.as_str());
+        if family == LanguageFamily::PhpBlade && is_php_member_call_ref(&r.kind) {
+            let Some(qname) = r.qname.as_deref() else {
+                continue;
+            };
+            if !qname.contains("::") {
+                continue;
+            }
+        }
         let targets = symbols.lookup(family, lookup_key);
         if targets.is_empty() {
             continue;
@@ -731,6 +742,20 @@ fn resolve_edges(
         }
     }
     edges
+}
+
+fn should_register_bare_name(family: LanguageFamily, node_kind: &str) -> bool {
+    if family != LanguageFamily::PhpBlade {
+        return true;
+    }
+    matches!(
+        node_kind,
+        "class" | "interface" | "trait" | "enum" | "function"
+    )
+}
+
+fn is_php_member_call_ref(kind: &str) -> bool {
+    matches!(kind, "method_call" | "static_call" | "nullsafe_method_call")
 }
 
 /// File-level synthesized node ID. The `file:` prefix avoids any collision
