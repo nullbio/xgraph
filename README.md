@@ -449,10 +449,14 @@ TypeScript / JavaScript / TSX / Python.
   hook calls, `memo`/`forwardRef` wrappers, class components).
 - Filesystem watcher with debounce + incremental processing, including
   reconciliation when an ignore file changes.
-- Thread-local parser caches, hot-index integration, content-hash skip
-  cache, rayon-backed scanner, FTS trigram index for sub-µs contains
-  search at 50k symbols.
+- Thread-local parser caches, rayon-parallelized scanner *and* parse
+  phase (`prepare_file` runs concurrently per file), content-hash skip
+  cache, FTS trigram index for sub-µs contains search at 50k symbols,
+  batched-and-indexed Cozo transactions (up to 64 files per commit, via
+  secondary indexes on `active_node.path` and `symbol.path`).
 - Criterion benchmark harness with per-phase timing (`bench_index_phases`).
+  500-file initial index ≈ 116 ms wall time on a recent laptop; the
+  store phase is the only one over 10 ms.
 
 **Deferred:**
 

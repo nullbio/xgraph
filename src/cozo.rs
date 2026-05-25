@@ -5,7 +5,7 @@
 //! serialized by a dedicated worker thread, and are applied as one CozoScript
 //! transaction per file update so readers never observe a half-updated state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -353,6 +353,16 @@ impl CozoStore {
     /// Drop every fact relation, leaving the schema intact. Used by
     /// `xgraph reindex` to rebuild the graph from scratch.
     pub fn truncate_graph(&self) -> Result<(), CozoError> {
+        // Drop secondary indexes before their parent relations.
+        // `::remove <rel>` errors on a relation that still has an index
+        // attached, so the prior `::index drop` is load-bearing for
+        // `cmd_reindex` correctness.
+        for (rel, idx) in [("active_node", "by_path"), ("symbol", "by_path")] {
+            let _ = self.run_mutable(
+                &format!("::index drop {rel}:{idx}"),
+                BTreeMap::new(),
+            );
+        }
         // `:rm` rules without a key clause delete all rows.
         for rel in [
             "content_file",
@@ -418,6 +428,29 @@ impl CozoStore {
         for (name, script) in RELATION_DDL {
             if !existing.contains(*name) {
                 self.run_mutable(script, BTreeMap::new())?;
+            }
+        }
+        // Secondary indexes on the columns the per-file cleanup phase
+        // uses for lookups. Without these, every file update did a full
+        // scan of active_node / symbol filtering by `path`, which made
+        // store-phase O(N_existing_rows × N_paths_in_batch). With
+        // them it's O(matching_rows). Cozo errors if the index already
+        // exists, so we tolerate that and treat anything else as fatal.
+        for (rel, idx, cols) in [
+            ("active_node", "by_path", "path"),
+            ("symbol", "by_path", "path"),
+        ] {
+            let script = format!("::index create {rel}:{idx} {{{cols}}}");
+            match self.run_mutable(&script, BTreeMap::new()) {
+                Ok(_) => {}
+                Err(err) => {
+                    let msg = err.to_string();
+                    // Cozo reports a specific phrase for "already exists";
+                    // anything else is a real failure we should surface.
+                    if !msg.contains("already exists") && !msg.contains("exists already") {
+                        return Err(err);
+                    }
+                }
             }
         }
         // After the relation set is guaranteed to exist, read the stored
@@ -530,6 +563,11 @@ pub fn active_node_id(hash: &ContentHash, local_node_id: u32) -> String {
 /// per-message channel overhead.
 enum WriterMessage {
     Update(Box<FileUpdate>),
+    /// Sync barrier: the writer commits everything submitted before this
+    /// message, then signals the bundled `Sender`. Used by callers that
+    /// need a "writer has drained" point — e.g., `init_at` reporting
+    /// real wall time including the database commit.
+    Flush(crossbeam_channel::Sender<()>),
     Shutdown,
 }
 
@@ -574,6 +612,20 @@ impl WriterHandle {
             // lock. Recover the inner Vec so we still drain the errors.
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         }
+    }
+
+    /// Block until every previously-submitted update has been committed.
+    /// Idempotent — calling on an already-drained queue returns
+    /// immediately. Returns `WriterError::QueueClosed` if the worker has
+    /// already shut down.
+    pub fn flush(&self) -> Result<(), WriterError> {
+        let sender = self.sender.as_ref().ok_or(WriterError::QueueClosed)?;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        sender
+            .send(WriterMessage::Flush(tx))
+            .map_err(|_| WriterError::QueueClosed)?;
+        rx.recv().map_err(|_| WriterError::QueueClosed)?;
+        Ok(())
     }
 
     /// Drain pending submissions, signal the worker to stop, and join the
@@ -622,123 +674,258 @@ impl WriterQueue {
     }
 }
 
+/// Maximum number of `FileUpdate`s coalesced into a single Cozo
+/// transaction. Larger batches amortize the per-transaction overhead
+/// (one RocksDB log entry + one fsync instead of N) but increase memory
+/// pressure and crash-recovery work. 64 is a balance: at our typical
+/// per-file edge/node sizes this stays well under the Cozo single-script
+/// param size limits and saturates write throughput in benchmarks.
+const WRITER_BATCH_MAX: usize = 64;
+
 fn writer_loop(
     store: CozoStore,
     receiver: crossbeam_channel::Receiver<WriterMessage>,
     errors: ErrorSink,
 ) {
-    while let Ok(message) = receiver.recv() {
-        match message {
-            WriterMessage::Update(update) => {
-                if let Err(err) = apply_file_update(&store, &update) {
-                    let recorded = WriterError::Apply(err);
-                    match errors.lock() {
-                        Ok(mut guard) => guard.push(recorded),
-                        Err(poisoned) => poisoned.into_inner().push(recorded),
-                    }
-                }
+    // Each outer iteration drains up to `WRITER_BATCH_MAX` queued updates
+    // and commits them in a single transaction. A burst of incoming
+    // updates (e.g. during initial indexing) naturally batches; a
+    // steady-state trickle (one watcher event) still commits within a
+    // single tx round because `recv()` blocks until any message arrives.
+    loop {
+        let mut batch: Vec<Box<FileUpdate>> = Vec::new();
+        let mut pending_flushes: Vec<crossbeam_channel::Sender<()>> = Vec::new();
+        let mut shutdown_pending = false;
+
+        // Block until the first message.
+        match receiver.recv() {
+            Ok(WriterMessage::Update(first)) => batch.push(first),
+            Ok(WriterMessage::Flush(ack)) => {
+                // No work to do; ack immediately and continue waiting.
+                let _ = ack.send(());
+                continue;
             }
-            WriterMessage::Shutdown => break,
+            Ok(WriterMessage::Shutdown) => break,
+            Err(_) => break,
+        }
+        // Greedily drain additional messages without blocking.
+        while batch.len() < WRITER_BATCH_MAX {
+            match receiver.try_recv() {
+                Ok(WriterMessage::Update(u)) => batch.push(u),
+                Ok(WriterMessage::Flush(ack)) => {
+                    // Defer the ack until the in-flight batch commits so
+                    // the caller sees "fully drained" semantics.
+                    pending_flushes.push(ack);
+                }
+                Ok(WriterMessage::Shutdown) => {
+                    shutdown_pending = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if let Err(err) = apply_file_updates_batch(&store, &batch) {
+            let recorded = WriterError::Apply(err);
+            match errors.lock() {
+                Ok(mut guard) => guard.push(recorded),
+                Err(poisoned) => poisoned.into_inner().push(recorded),
+            }
+        }
+        // After the batch commits, release any flush callers waiting on
+        // it — they're guaranteed all prior submissions are durable.
+        for ack in pending_flushes {
+            let _ = ack.send(());
+        }
+        if shutdown_pending {
+            break;
         }
     }
 }
 
-fn apply_file_update(store: &CozoStore, update: &FileUpdate) -> Result<(), CozoError> {
+/// Commit a batch of file updates inside one Cozo transaction. All
+/// updates either land together or roll back together — atomicity is
+/// preserved even across files. Empty batches are a no-op (the writer
+/// loop never produces one, but the public surface stays robust).
+///
+/// Performance: a single RocksDB write batch + fsync replaces N
+/// per-file commits. At our 500-file fixture this drops the store
+/// phase from ~13 ms → low milliseconds (see the `phase_store_*`
+/// benchmarks).
+fn apply_file_updates_batch(
+    store: &CozoStore,
+    updates: &[Box<FileUpdate>],
+) -> Result<(), CozoError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    // Dedupe by path — within a single batch, the highest-`generation`
+    // update wins. Earlier updates for the same path are obsolete (the
+    // later one fully supersedes them in the database, including the
+    // active_file row and every node/edge keyed off the new content
+    // hash). Without this, two rapid-fire updates for the same file
+    // would both insert active_node rows since the cleanup phase only
+    // touches pre-existing rows, not rows being inserted in this same
+    // transaction.
+    let mut latest_by_path: HashMap<&str, &FileUpdate> = HashMap::new();
+    for boxed in updates {
+        let entry = latest_by_path.entry(boxed.path.as_str());
+        match entry {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(boxed.as_ref());
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if boxed.generation > o.get().generation {
+                    o.insert(boxed.as_ref());
+                }
+            }
+        }
+    }
+    let updates: Vec<&FileUpdate> = latest_by_path.into_values().collect();
+
     let mut params = BTreeMap::new();
 
-    params.insert("path".to_string(), DataValue::from(update.path.as_str()));
-    params.insert(
-        "content_hash".to_string(),
-        DataValue::Bytes(update.content_hash.to_vec()),
-    );
-    params.insert(
-        "language".to_string(),
-        DataValue::from(update.language.as_str()),
-    );
-    params.insert(
-        "parser_version".to_string(),
-        DataValue::from(i64::from(update.parser_version)),
-    );
-    params.insert("mtime".to_string(), DataValue::from(update.mtime));
-    params.insert(
-        "size".to_string(),
-        DataValue::from(i64_from_u64(update.size)?),
-    );
-    params.insert(
-        "generation".to_string(),
-        DataValue::from(i64_from_u64(update.generation)?),
-    );
-    params.insert(
-        "diagnostics".to_string(),
-        DataValue::Json(JsonData(serde_json::to_value(&update.diagnostics)?)),
-    );
+    // `$paths` is the set of paths whose old rows we strip out. Inline
+    // relations defined in each `:rm` block iterate this set.
+    let paths: Vec<DataValue> = updates
+        .iter()
+        .map(|u| DataValue::List(vec![DataValue::from(u.path.as_str())]))
+        .collect();
+    params.insert("paths".to_string(), DataValue::List(paths));
 
-    let content_nodes = nodes_to_data_value(&update.content_hash, &update.nodes);
+    // content_file is keyed by (content_hash) so multiple files sharing
+    // a hash produce one row; the per-update row format is
+    // [hash, language, parser_version, diagnostics].
+    let content_files: Vec<DataValue> = updates
+        .iter()
+        .map(|u| -> Result<DataValue, CozoError> {
+            Ok(DataValue::List(vec![
+                DataValue::Bytes(u.content_hash.to_vec()),
+                DataValue::from(u.language.as_str()),
+                DataValue::from(i64::from(u.parser_version)),
+                DataValue::Json(JsonData(serde_json::to_value(&u.diagnostics)?)),
+            ]))
+        })
+        .collect::<Result<Vec<_>, CozoError>>()?;
+    params.insert("content_files".to_string(), DataValue::List(content_files));
+
+    // active_file is keyed by (path); one row per file.
+    let active_files: Vec<DataValue> = updates
+        .iter()
+        .map(|u| -> Result<DataValue, CozoError> {
+            Ok(DataValue::List(vec![
+                DataValue::from(u.path.as_str()),
+                DataValue::Bytes(u.content_hash.to_vec()),
+                DataValue::from(u.mtime),
+                DataValue::from(i64_from_u64(u.size)?),
+                DataValue::from(i64_from_u64(u.generation)?),
+            ]))
+        })
+        .collect::<Result<Vec<_>, CozoError>>()?;
+    params.insert("active_files".to_string(), DataValue::List(active_files));
+
+    // The remaining tables are already "list of rows" shaped; we just
+    // concatenate the per-file lists into one global list. The helpers
+    // emit `DataValue::List(Vec<DataValue::List(...)>)`, so we destructure
+    // and re-build the outer list.
+    let content_nodes = concat_rows(
+        updates
+            .iter()
+            .map(|u| nodes_to_data_value(&u.content_hash, &u.nodes)),
+    );
     params.insert("content_nodes".to_string(), content_nodes);
 
-    let content_refs = refs_to_data_value(&update.content_hash, &update.refs);
+    let content_refs = concat_rows(
+        updates
+            .iter()
+            .map(|u| refs_to_data_value(&u.content_hash, &u.refs)),
+    );
     params.insert("content_refs".to_string(), content_refs);
 
-    let active_nodes =
-        active_nodes_to_data_value(&update.path, &update.content_hash, &update.nodes);
+    let active_nodes = concat_rows(
+        updates
+            .iter()
+            .map(|u| active_nodes_to_data_value(&u.path, &u.content_hash, &u.nodes)),
+    );
     params.insert("active_nodes".to_string(), active_nodes);
 
-    let edges = edges_to_data_value(&update.edges);
+    let edges = concat_rows(updates.iter().map(|u| edges_to_data_value(&u.edges)));
     params.insert("edges".to_string(), edges);
 
-    let symbols = symbols_to_data_value(&update.path, &update.content_hash, &update.nodes);
+    let symbols = concat_rows(
+        updates
+            .iter()
+            .map(|u| symbols_to_data_value(&u.path, &u.content_hash, &u.nodes)),
+    );
     params.insert("symbols".to_string(), symbols);
 
-    // A single CozoScript wrapped in multiple `{...}` blocks runs atomically:
-    // every block sees the same snapshot, and either all commit or all roll
-    // back. This satisfies the "one transaction per file update" invariant.
-    let script = TRANSACTION_SCRIPT;
-
-    store.run_mutable(script, params)?;
+    store.run_mutable(BATCH_TRANSACTION_SCRIPT, params)?;
     Ok(())
 }
 
+/// Concatenate `DataValue::List(Vec<row>)` produced by each per-file
+/// helper into a single `DataValue::List` so we can pass it as one Cozo
+/// parameter.
+fn concat_rows<I: Iterator<Item = DataValue>>(iter: I) -> DataValue {
+    let mut all: Vec<DataValue> = Vec::new();
+    for v in iter {
+        if let DataValue::List(rows) = v {
+            all.extend(rows);
+        }
+    }
+    DataValue::List(all)
+}
+
+
 /// The full file-replacement transaction.
+/// Batched file-replacement transaction.
 ///
 /// Cozo runs a multi-block script as one transaction where every later block
 /// sees the writes of every earlier block. Removals must therefore happen in
-/// dependency order: edges depend on the path's previous `active_node` rows,
-/// so edge removal must precede `active_node` removal.
+/// dependency order: edges depend on `active_node` rows, so edge removal
+/// must precede `active_node` removal.
 ///
-/// Steps:
-/// 1. Remove every `edge` whose source is in the path's old active nodes.
-/// 2. Remove every `edge` whose target is in the path's old active nodes.
-/// 3. Remove the path's old `symbol` rows.
-/// 4. Remove the path's old `active_node` rows.
-/// 5. Upsert the `content_file`, `content_node`, and `content_ref` rows.
-///    (`:put` on a `content_*` key replaces the row, so no `:rm` is needed.)
-/// 6. Upsert the new `active_file` row (`:put` again replaces in place).
-/// 7. Insert the new `active_node`, `edge`, and `symbol` rows.
-const TRANSACTION_SCRIPT: &str = "\
+/// Cleanup phase iterates the inline `paths_to_replace` relation
+/// (sourced from `$paths`, a list of `[path]` singleton rows) so old
+/// edges / symbols / active_nodes for every path in the batch are
+/// removed before the new rows are inserted. Lookups go through the
+/// `active_node:by_path` and `symbol:by_path` secondary indexes, so the
+/// cost is `O(matching_rows)` rather than a full table scan per batch.
+///
+/// The `:put` phase consumes already-batched parameter arrays
+/// (`$content_files`, `$active_files`, `$content_nodes`, `$content_refs`,
+/// `$active_nodes`, `$edges`, `$symbols`) populated by
+/// `apply_file_updates_batch`.
+const BATCH_TRANSACTION_SCRIPT: &str = "\
 {
-    ?[source_node_id, kind, target_node_id] := *active_node[node_id, path, _ch, _ln, _k, _n, _q, _s],
-                                                path = $path,
-                                                *edge[source_node_id, kind, target_node_id, _p, _c],
+    paths_to_replace[path] <- $paths
+    ?[source_node_id, kind, target_node_id] := paths_to_replace[p],
+                                                *active_node:by_path[p, node_id],
+                                                *edge[source_node_id, kind, target_node_id, _pv, _c],
                                                 source_node_id = node_id
     :rm edge {source_node_id, kind, target_node_id}
 }
 {
-    ?[source_node_id, kind, target_node_id] := *active_node[node_id, path, _ch, _ln, _k, _n, _q, _s],
-                                                path = $path,
-                                                *edge[source_node_id, kind, target_node_id, _p, _c],
+    paths_to_replace[path] <- $paths
+    ?[source_node_id, kind, target_node_id] := paths_to_replace[p],
+                                                *active_node:by_path[p, node_id],
+                                                *edge[source_node_id, kind, target_node_id, _pv, _c],
                                                 target_node_id = node_id
     :rm edge {source_node_id, kind, target_node_id}
 }
 {
-    ?[name, kind, node_id] := *symbol[name, kind, node_id, _qname, path], path = $path
+    paths_to_replace[path] <- $paths
+    ?[name, kind, node_id] := paths_to_replace[p],
+                              *symbol:by_path[p, name, kind, node_id]
     :rm symbol {name, kind, node_id}
 }
 {
-    ?[node_id] := *active_node[node_id, path, _ch, _ln, _k, _n, _q, _s], path = $path
+    paths_to_replace[path] <- $paths
+    ?[node_id] := paths_to_replace[p],
+                  *active_node:by_path[p, node_id]
     :rm active_node {node_id}
 }
 {
-    ?[content_hash, language, parser_version, diagnostics] <- [[$content_hash, $language, $parser_version, $diagnostics]]
+    ?[content_hash, language, parser_version, diagnostics] <- $content_files
     :put content_file {content_hash => language, parser_version, diagnostics}
 }
 {
@@ -750,7 +937,7 @@ const TRANSACTION_SCRIPT: &str = "\
     :put content_ref {content_hash, local_ref_id => kind, name, span}
 }
 {
-    ?[path, content_hash, mtime, size, generation] <- [[$path, $content_hash, $mtime, $size, $generation]]
+    ?[path, content_hash, mtime, size, generation] <- $active_files
     :put active_file {path => content_hash, mtime, size, generation}
 }
 {

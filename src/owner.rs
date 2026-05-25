@@ -22,6 +22,7 @@ use crate::import_resolver::{PythonImportResolver, TsAliasResolver};
 use crate::indexes::HotIndexes;
 use crate::language::LanguageRegistry;
 use crate::scanner::{DetectedLanguage, ScanError, scan};
+use rayon::prelude::*;
 
 pub const PARSER_VERSION: u32 = 1;
 
@@ -121,22 +122,42 @@ impl WorktreeOwner {
 
         progress.phase(Phase::Parsing, Some(scanned.len() as u64));
         let t_parse_start = Instant::now();
-        let mut prepared: Vec<PreparedFile> = Vec::with_capacity(scanned.len());
-        for (i, file) in scanned.into_iter().enumerate() {
-            progress.tick(i as u64 + 1);
-            let Some(lang) = file.language else { continue };
-            if let Some(mut p) = self.prepare_file(file.path, file.mtime, file.size, lang)? {
+        // Rayon-parallelize file extraction. Each worker thread owns its
+        // own tree-sitter `Parser` and `QueryCursor` via the language
+        // modules' `thread_local!` slots, so there's no cross-thread
+        // parser contention. `prepare_file` takes `&self` and only
+        // touches `Sync` fields (registry, store, worktree_root), so
+        // concurrent calls are safe.
+        let progress_tick = std::sync::atomic::AtomicU64::new(0);
+        let prepared: Vec<PreparedFile> = scanned
+            .into_par_iter()
+            .map(|file| -> Result<Option<PreparedFile>, OwnerError> {
+                // Tick on entry so the bar reflects work started, not
+                // work finished; the difference is invisible for fast
+                // files but matters when a single file stalls on I/O.
+                let i = progress_tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                progress.tick(i);
+                let Some(lang) = file.language else {
+                    return Ok(None);
+                };
+                let Some(mut prep) = self.prepare_file(file.path, file.mtime, file.size, lang)?
+                else {
+                    return Ok(None);
+                };
                 rewrite_imports(
-                    &mut p.extracted,
-                    &p.relative,
+                    &mut prep.extracted,
+                    &prep.relative,
                     lang,
                     &ts_resolver,
                     &py_resolver,
                     &self.worktree_root,
                 );
-                prepared.push(p);
-            }
-        }
+                Ok(Some(prep))
+            })
+            .collect::<Result<Vec<Option<PreparedFile>>, OwnerError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         let parse_us = t_parse_start.elapsed().as_micros() as u64;
         progress.finish_phase();
 
@@ -158,6 +179,11 @@ impl WorktreeOwner {
             edges_created += edge_count as u64;
             progress.tick(i as u64 + 1);
         }
+        // Block until the writer thread commits every batch we just
+        // submitted. Without this, `store_us` would only measure the
+        // (very fast) channel-send time and miss the actual Cozo
+        // transaction work that runs asynchronously.
+        self.writer.flush()?;
         let store_us = t_store_start.elapsed().as_micros() as u64;
         progress.finish_phase();
         // After the initial walk completes, MCP queries no longer need the
