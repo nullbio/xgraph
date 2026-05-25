@@ -278,6 +278,8 @@ Laravel-specific resolution should model:
 
 Tree-sitter gets syntax nodes. Laravel meaning comes from a framework resolver pass. Framework-derived edges must carry explicit provenance and confidence.
 
+Framework-edge node IDs use the synthetic `lh:` prefix (e.g. `lh:route:get /users`, `lh:UserController::index`) so they cannot collide with parser-extracted IDs (which always start with a 64-character content hash). MCP clients reading framework edges via `callers_of`/`callees_of` should treat `lh:*` IDs as synthesis points: they do not appear in `active_node` and are not directly queryable by `nodes_in_file`. Edge provenance is `"laravel_heuristic"` and confidence ranges 40 (low) — 70 (medium) — 90 (high) depending on the pattern.
+
 ## Language growth
 
 Core languages should be native/static and reproducible. Add long-tail languages later behind feature-gated grammar crates or language packs only after the initial languages work well.

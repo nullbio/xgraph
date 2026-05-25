@@ -54,98 +54,35 @@ pub enum DaemonAction {
     Stop,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    #[error("failed to read current directory: {0}")]
     Cwd(std::io::Error),
-    GitDiscovery(GitDiscoveryError),
-    PersistentPaths(PersistentPathsError),
-    Cozo(crate::cozo::CozoError),
-    Ignore(IgnoreError),
-    Scan(ScanError),
+    #[error(transparent)]
+    GitDiscovery(#[from] GitDiscoveryError),
+    #[error(transparent)]
+    PersistentPaths(#[from] PersistentPathsError),
+    #[error(transparent)]
+    Cozo(#[from] crate::cozo::CozoError),
+    #[error(transparent)]
+    Ignore(#[from] IgnoreError),
+    #[error(transparent)]
+    Scan(#[from] ScanError),
+    #[error("io error on {}: {source}", path.display())]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    Writer(crate::cozo::WriterError),
-    Runtime(RuntimeError),
-    Daemon(DaemonError),
-    Owner(crate::owner::OwnerError),
-    Mcp(crate::mcp::McpError),
-}
-
-impl std::fmt::Display for CliError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CliError::Cwd(err) => write!(f, "failed to read current directory: {err}"),
-            CliError::GitDiscovery(err) => write!(f, "{err}"),
-            CliError::PersistentPaths(err) => write!(f, "{err}"),
-            CliError::Cozo(err) => write!(f, "{err}"),
-            CliError::Ignore(err) => write!(f, "{err}"),
-            CliError::Scan(err) => write!(f, "{err}"),
-            CliError::Io { path, source } => write!(f, "io error on {}: {source}", path.display()),
-            CliError::Writer(err) => write!(f, "{err}"),
-            CliError::Runtime(err) => write!(f, "{err}"),
-            CliError::Daemon(err) => write!(f, "{err}"),
-            CliError::Owner(err) => write!(f, "{err}"),
-            CliError::Mcp(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl From<RuntimeError> for CliError {
-    fn from(err: RuntimeError) -> Self {
-        CliError::Runtime(err)
-    }
-}
-
-impl From<DaemonError> for CliError {
-    fn from(err: DaemonError) -> Self {
-        CliError::Daemon(err)
-    }
-}
-
-impl From<crate::owner::OwnerError> for CliError {
-    fn from(err: crate::owner::OwnerError) -> Self {
-        CliError::Owner(err)
-    }
-}
-
-impl std::error::Error for CliError {}
-
-impl From<GitDiscoveryError> for CliError {
-    fn from(err: GitDiscoveryError) -> Self {
-        CliError::GitDiscovery(err)
-    }
-}
-
-impl From<PersistentPathsError> for CliError {
-    fn from(err: PersistentPathsError) -> Self {
-        CliError::PersistentPaths(err)
-    }
-}
-
-impl From<crate::cozo::CozoError> for CliError {
-    fn from(err: crate::cozo::CozoError) -> Self {
-        CliError::Cozo(err)
-    }
-}
-
-impl From<IgnoreError> for CliError {
-    fn from(err: IgnoreError) -> Self {
-        CliError::Ignore(err)
-    }
-}
-
-impl From<ScanError> for CliError {
-    fn from(err: ScanError) -> Self {
-        CliError::Scan(err)
-    }
-}
-
-impl From<crate::cozo::WriterError> for CliError {
-    fn from(err: crate::cozo::WriterError) -> Self {
-        CliError::Writer(err)
-    }
+    #[error(transparent)]
+    Writer(#[from] crate::cozo::WriterError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Daemon(#[from] DaemonError),
+    #[error(transparent)]
+    Owner(#[from] crate::owner::OwnerError),
+    #[error(transparent)]
+    Mcp(#[from] crate::mcp::McpError),
 }
 
 pub fn run<I, S>(args: I) -> ExitCode

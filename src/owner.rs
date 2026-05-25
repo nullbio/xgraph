@@ -314,48 +314,19 @@ impl WorktreeOwner {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OwnerError {
-    Scan(ScanError),
-    Cozo(crate::cozo::CozoError),
-    Writer(WriterError),
+    #[error(transparent)]
+    Scan(#[from] ScanError),
+    #[error(transparent)]
+    Cozo(#[from] crate::cozo::CozoError),
+    #[error(transparent)]
+    Writer(#[from] WriterError),
+    #[error("io error on {}: {source}", path.display())]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-}
-
-impl std::fmt::Display for OwnerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OwnerError::Scan(err) => write!(f, "{err}"),
-            OwnerError::Cozo(err) => write!(f, "{err}"),
-            OwnerError::Writer(err) => write!(f, "{err}"),
-            OwnerError::Io { path, source } => {
-                write!(f, "io error on {}: {source}", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for OwnerError {}
-
-impl From<ScanError> for OwnerError {
-    fn from(err: ScanError) -> Self {
-        OwnerError::Scan(err)
-    }
-}
-
-impl From<crate::cozo::CozoError> for OwnerError {
-    fn from(err: crate::cozo::CozoError) -> Self {
-        OwnerError::Cozo(err)
-    }
-}
-
-impl From<WriterError> for OwnerError {
-    fn from(err: WriterError) -> Self {
-        OwnerError::Writer(err)
-    }
 }
 
 struct PreparedFile {
