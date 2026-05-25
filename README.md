@@ -78,7 +78,7 @@ CXXFLAGS="-include cstdint" cargo install --git https://github.com/nullbio/xgrap
 xgraph init
 ```
 
-Creates the Cozo schema, records project metadata, performs the initial scan/index, and writes config. It exits when initialization is complete.
+Creates the Cozo schema, records project metadata, performs the initial scan/index, and writes config. It exits when initialization is complete. If a daemon is already reachable, it asks that daemon to reconcile the graph instead of opening the store directly.
 
 ```bash
 xgraph mcp
@@ -100,7 +100,7 @@ xgraph reindex
 ```
 
 Operational commands for inspecting state, stopping the daemon, reconciling the manifest with disk, and rebuilding the graph.
-When a daemon is reachable, `sync` and `reindex` are sent to that daemon so connected MCP clients keep their socket transport. If no daemon is reachable, they fall back to direct store maintenance after clearing stale runtime state.
+When a daemon is reachable, `init`, `sync`, and `reindex` are sent to that daemon so connected MCP clients keep their socket transport. If no daemon is reachable, they fall back to direct store maintenance after clearing stale runtime state.
 
 ```bash
 xgraph find-symbol User --kind class
@@ -462,7 +462,7 @@ TypeScript / JavaScript / TSX / Python.
 - `xgraph daemon start` opens a Unix socket and serves the 12 MCP tools
   out of in-memory hot indexes loaded from the persistent graph.
 - `xgraph mcp` lazy-spawns the daemon and proxies MCP-style JSON-RPC.
-- `xgraph sync` and `xgraph reindex` use the live daemon when available,
+- `xgraph init`, `xgraph sync`, and `xgraph reindex` use the live daemon when available,
   so terminal maintenance does not drop connected agent transports.
 - Per-binding TS/JS/Python import refs + container tracking + composite
   path-scoped symbol-table keys: `import { helper } from './b'` in file

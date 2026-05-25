@@ -16,7 +16,10 @@ use crate::handlers::WorktreeHandler;
 use crate::ignore::{IgnoreError, IgnoreMatcher};
 use crate::language::LanguageRegistry;
 use crate::owner::WorktreeOwner;
-use crate::runtime::{RuntimeError, ensure_runtime_dir, runtime_dir};
+use crate::runtime::{
+    RuntimeDir, RuntimeError, StartupLockGuard, acquire_startup_lock, ensure_runtime_dir,
+    runtime_dir,
+};
 use crate::scanner::ScanError;
 use crate::storage::{PersistentPaths, PersistentPathsError};
 
@@ -259,18 +262,50 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
 
 fn cmd_init() -> Result<ExitCode, CliError> {
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    init_at(&cwd)
+    cmd_init_at(&cwd)
+}
+
+fn cmd_init_at(start: &Path) -> Result<ExitCode, CliError> {
+    let worktree = WorktreeRoot::discover(start)?;
+    let persistent = PersistentPaths::for_worktree(&worktree)?;
+    if let Some(response) =
+        send_daemon_request_if_reachable(&worktree, "sync", serde_json::json!({}))?
+    {
+        if print_daemon_error_if_any(&response) {
+            return Ok(ExitCode::FAILURE);
+        }
+        let result = response.get("result").unwrap_or(&response);
+        print_index_summary(result, persistent.root_dir());
+        maybe_prompt_mcp_install();
+        return Ok(ExitCode::SUCCESS);
+    }
+    init_at_worktree(&worktree, &persistent)
 }
 
 pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
     let worktree = WorktreeRoot::discover(start)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
-    persistent.ensure_created()?;
+    init_at_worktree(&worktree, &persistent)
+}
 
-    // RocksDB is single-writer. If a daemon is alive for this worktree
-    // it holds an exclusive lock on the Cozo store. Stop it first;
-    // the next MCP request will lazy-spawn a fresh one against the
-    // updated graph.
+fn init_at_worktree(
+    worktree: &WorktreeRoot,
+    persistent: &PersistentPaths,
+) -> Result<ExitCode, CliError> {
+    persistent.ensure_created()?;
+    let runtime = ensure_runtime_dir(worktree.as_path())?;
+    let _startup_guard =
+        acquire_startup_lock_with_retry(&runtime, std::time::Duration::from_secs(60))?;
+    init_at_locked(worktree, persistent)
+}
+
+fn init_at_locked(
+    worktree: &WorktreeRoot,
+    persistent: &PersistentPaths,
+) -> Result<ExitCode, CliError> {
+    // Direct maintenance owns startup.lock while the daemon is stopped so MCP
+    // proxies cannot lazy-spawn a replacement daemon that races us for the
+    // Cozo store lock.
     ensure_no_running_daemon(worktree.as_path())?;
 
     let store = open_store_with_lock_retry(
@@ -306,17 +341,17 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
         dir = persistent.root_dir().display(),
     );
 
-    // If Claude / Codex are installed but xgraph isn't registered as an
-    // MCP server with them, offer to add it. The check is silent when
-    // both clients are absent or already configured. Non-interactive
-    // sessions (CI, piped stdin) print a hint instead of prompting.
+    maybe_prompt_mcp_install();
+    Ok(ExitCode::SUCCESS)
+}
+
+fn maybe_prompt_mcp_install() {
     let candidates = crate::mcp_install::clients_needing_install();
     if !candidates.is_empty()
         && let Err(err) = crate::mcp_install::prompt_and_install(&candidates)
     {
         eprintln!("xgraph: MCP install skipped: {err}");
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_mcp() -> Result<ExitCode, CliError> {
@@ -352,7 +387,7 @@ impl crate::mcp::DaemonLauncher for SubprocessLauncher {
         let cwd = self.worktree_root.clone();
         Box::pin(async move {
             let exe_path = exe.map_err(crate::mcp::McpError::Io)?;
-            let _ = std::process::Command::new(exe_path)
+            let mut child = std::process::Command::new(exe_path)
                 .arg("daemon")
                 .arg("start")
                 .current_dir(&cwd)
@@ -361,6 +396,11 @@ impl crate::mcp::DaemonLauncher for SubprocessLauncher {
                 .stdin(std::process::Stdio::null())
                 .spawn()
                 .map_err(crate::mcp::McpError::Io)?;
+            let _ = std::thread::Builder::new()
+                .name("xgraph-daemon-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
             Ok(())
         })
     }
@@ -729,12 +769,15 @@ fn cmd_reindex() -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    ensure_no_running_daemon(worktree.as_path())?;
     persistent.ensure_created()?;
+    let runtime = ensure_runtime_dir(worktree.as_path())?;
+    let _startup_guard =
+        acquire_startup_lock_with_retry(&runtime, std::time::Duration::from_secs(60))?;
+    ensure_no_running_daemon(worktree.as_path())?;
     let store = CozoStore::open(&persistent.cozo_db_path())?;
     store.truncate_graph()?;
     drop(store);
-    init_at(&cwd)
+    init_at_locked(&worktree, &persistent)
 }
 
 /// Stop any daemon running for this worktree and wait for the process
@@ -786,6 +829,41 @@ fn process_alive(pid: i32) -> bool {
         return false;
     }
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn acquire_startup_lock_with_retry(
+    runtime: &RuntimeDir,
+    total_budget: std::time::Duration,
+) -> Result<StartupLockGuard, CliError> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + total_budget;
+    let mut delay = Duration::from_millis(50);
+    let mut announced = false;
+    loop {
+        match acquire_startup_lock(runtime) {
+            Ok(guard) => return Ok(guard),
+            Err(RuntimeError::StartupLockHeld { .. }) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(RuntimeError::StartupLockHeld {
+                        path: runtime.startup_lock_path(),
+                    }
+                    .into());
+                }
+                if !announced {
+                    eprintln!(
+                        "xgraph: startup lock is held by another process; waiting up to {}s",
+                        total_budget.as_secs()
+                    );
+                    announced = true;
+                }
+                std::thread::sleep(delay.min(deadline.saturating_duration_since(now)));
+                delay = (delay * 2).min(Duration::from_millis(500));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 fn open_store_with_lock_retry(
@@ -1171,6 +1249,48 @@ mod tests {
         assert_eq!(response["result"]["files_indexed"], 1);
         assert_eq!(response["result"]["nodes_created"], 2);
         assert_eq!(response["result"]["edges_created"], 3);
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn init_command_uses_live_daemon_as_sync() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Command as ProcessCommand;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .arg(tmp.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        let worktree = WorktreeRoot::discover(tmp.path()).expect("discover worktree");
+        let runtime = ensure_runtime_dir(worktree.as_path()).expect("runtime dir");
+        let socket_path = runtime.socket_path();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            conn.read_to_string(&mut request).expect("read request");
+            tx.send(request).expect("send request");
+            conn.write_all(
+                br#"{"jsonrpc":"2.0","id":1,"result":{"files_indexed":5,"nodes_created":8,"edges_created":13}}"#,
+            )
+            .expect("write response");
+            conn.write_all(b"\n").expect("write newline");
+        });
+
+        let exit = cmd_init_at(tmp.path()).expect("init command succeeds");
+        let request = rx.recv().expect("request captured");
+        server.join().expect("server joins");
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert!(request.contains(r#""method":"sync""#), "{request}");
         let _ = std::fs::remove_file(socket_path);
     }
 
