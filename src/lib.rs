@@ -4,6 +4,7 @@
 compile_error!("xgraph is Linux-only");
 
 pub mod cli;
+pub mod cozo;
 pub mod daemon;
 pub mod git;
 pub mod hash;

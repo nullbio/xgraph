@@ -10,6 +10,7 @@ description = "Linux-native code graph daemon for Git worktrees"
 blake3 = "1.8"
 cc = "1"
 clap = { version = "4", features = ["derive"] }
+cozo = { version = "0.7", default-features = false, features = ["rayon", "storage-rocksdb"] }
 crossbeam-channel = "0.5"
 dashmap = "6"
 fs2 = "0.4"
