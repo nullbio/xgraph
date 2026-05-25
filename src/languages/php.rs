@@ -5,251 +5,129 @@
 //! Tree-sitter queries; call-site discovery uses manual cursor traversal so
 //! we can attribute callees to their enclosing definition without paying for
 //! a broad "match everything" query.
-//!
-//! Types in this module are defined locally on purpose. The shared
-//! `LanguagePlugin` trait, `ExtractedFile`, `Node`, `Ref`, `Span`, and
-//! `Diagnostic` representations live in other units that have not landed
-//! yet; this module owns minimal local copies and the daemon's language
-//! registry will adapt them in a later phase.
 
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::OnceLock;
 
 use tree_sitter::{
     Language, Node as TsNode, Parser, Query, QueryCursor, StreamingIterator, Tree, TreeCursor,
 };
 
-const PHP_EXTRACTOR_VERSION: u32 = 1;
+use crate::extract::{
+    Diagnostic, ExtractedFile, LocalNodeId, LocalRefId, Node, Position, Ref, Severity, Span,
+};
+use crate::language::{LanguageId, LanguagePlugin, LanguageQueries};
 
 const DEFINITIONS_QUERY_SOURCE: &str = include_str!("php_queries/definitions.scm");
 const IMPORTS_QUERY_SOURCE: &str = include_str!("php_queries/imports.scm");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Position {
-    pub byte: usize,
-    pub row: usize,
-    pub column: usize,
-}
+static PHP_QUERIES: LanguageQueries = LanguageQueries {
+    definitions: DEFINITIONS_QUERY_SOURCE,
+    imports: IMPORTS_QUERY_SOURCE,
+    exports: "",
+    types: "",
+    routes: "",
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Span {
-    pub start: Position,
-    pub end: Position,
-}
-
-impl Span {
-    fn from_node(node: TsNode<'_>) -> Self {
-        let start_pos = node.start_position();
-        let end_pos = node.end_position();
-        let range = node.byte_range();
-        Self {
-            start: Position {
-                byte: range.start,
-                row: start_pos.row,
-                column: start_pos.column,
-            },
-            end: Position {
-                byte: range.end,
-                row: end_pos.row,
-                column: end_pos.column,
-            },
-        }
+fn span_from_node(node: TsNode<'_>) -> Span {
+    let start_pos = node.start_position();
+    let end_pos = node.end_position();
+    let range = node.byte_range();
+    Span {
+        start: Position {
+            byte: range.start,
+            row: start_pos.row,
+            column: start_pos.column,
+        },
+        end: Position {
+            byte: range.end,
+            row: end_pos.row,
+            column: end_pos.column,
+        },
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodeKind {
-    Namespace,
-    Class,
-    Interface,
-    Trait,
-    Enum,
-    EnumCase,
-    Function,
-    Method,
-    Property,
-    Constant,
-}
+pub struct PhpPlugin;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RefKind {
-    Extends,
-    Implements,
-    TraitUse,
-    Import,
-    Call,
-    MethodCall,
-    StaticCall,
-    NullsafeMethodCall,
-}
-
-pub type LocalNodeId = u32;
-pub type LocalRefId = u32;
-
-#[derive(Debug, Clone)]
-pub struct Node {
-    pub id: LocalNodeId,
-    pub kind: NodeKind,
-    pub name: String,
-    pub qname: String,
-    pub span: Span,
-    pub parent: Option<LocalNodeId>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Ref {
-    pub id: LocalRefId,
-    pub kind: RefKind,
-    pub name: String,
-    /// Best-effort fully qualified name. For imports this is the imported
-    /// symbol's source FQN; for `extends`/`implements`/`use trait` it is the
-    /// name as written, normalized to drop the leading backslash; for calls
-    /// it is the textual callee.
-    pub qname: String,
-    pub alias: Option<String>,
-    pub span: Span,
-    /// Local node id of the definition that lexically contains this ref,
-    /// when one exists (a top-level call has no container).
-    pub container: Option<LocalNodeId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Severity {
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    pub message: String,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LanguageId(pub &'static str);
-
-pub struct LanguageQueries {
-    pub definitions: Arc<Query>,
-    pub imports: Arc<Query>,
-}
-
-pub trait LanguagePlugin: Send + Sync {
-    fn id(&self) -> LanguageId;
-    fn extensions(&self) -> &[&'static str];
-    fn tree_sitter_language(&self) -> Language;
-    fn queries(&self) -> &'static LanguageQueries;
-    fn extract(&self, tree: &Tree, source: &[u8]) -> ExtractedFile;
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ExtractedFile {
-    pub language: &'static str,
-    pub extractor_version: u32,
-    pub nodes: Vec<Node>,
-    pub refs: Vec<Ref>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-pub struct PhpLanguage;
-
-impl PhpLanguage {
-    pub const ID: LanguageId = LanguageId("php");
+impl PhpPlugin {
     pub const EXTENSIONS: &'static [&'static str] = &["php"];
 
     pub fn new() -> Self {
         Self
     }
-
-    /// Parse `source` with the PHP grammar and run extraction in one call.
-    /// Returns the parsed tree alongside the extracted facts so callers that
-    /// want to keep the tree (e.g. incremental reparse) can do so.
-    pub fn parse_and_extract(&self, source: &[u8]) -> (Option<Tree>, ExtractedFile) {
-        let mut parser = Parser::new();
-        let language: Language = tree_sitter_php::LANGUAGE_PHP.into();
-        if parser.set_language(&language).is_err() {
-            return (
-                None,
-                file_with_diagnostic(Severity::Error, "failed to install PHP grammar on parser"),
-            );
-        }
-
-        let Some(tree) = parser.parse(source, None) else {
-            return (
-                None,
-                file_with_diagnostic(Severity::Error, "PHP parser returned no tree"),
-            );
-        };
-
-        let extracted = self.extract(&tree, source);
-        (Some(tree), extracted)
-    }
 }
 
-fn file_with_diagnostic(severity: Severity, message: &str) -> ExtractedFile {
-    let zero = Position {
-        byte: 0,
-        row: 0,
-        column: 0,
-    };
-    ExtractedFile {
-        language: "php",
-        extractor_version: PHP_EXTRACTOR_VERSION,
-        nodes: Vec::new(),
-        refs: Vec::new(),
-        diagnostics: vec![Diagnostic {
-            severity,
-            message: message.to_string(),
-            span: Span {
-                start: zero,
-                end: zero,
-            },
-        }],
-    }
-}
-
-impl Default for PhpLanguage {
+impl Default for PhpPlugin {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LanguagePlugin for PhpLanguage {
+impl LanguagePlugin for PhpPlugin {
     fn id(&self) -> LanguageId {
-        Self::ID
+        LanguageId::Php
     }
 
-    fn extensions(&self) -> &[&'static str] {
+    fn extensions(&self) -> &'static [&'static str] {
         Self::EXTENSIONS
+    }
+
+    fn queries(&self) -> &'static LanguageQueries {
+        &PHP_QUERIES
     }
 
     fn tree_sitter_language(&self) -> Language {
         tree_sitter_php::LANGUAGE_PHP.into()
     }
 
-    fn queries(&self) -> &'static LanguageQueries {
-        shared_queries()
-    }
+    fn extract(&self, source: &[u8], path: &Path) -> ExtractedFile {
+        let mut parser = Parser::new();
+        let language: Language = tree_sitter_php::LANGUAGE_PHP.into();
+        if parser.set_language(&language).is_err() {
+            return file_with_diagnostic(
+                path,
+                Severity::Error,
+                "failed to install PHP grammar on parser",
+            );
+        }
 
-    fn extract(&self, tree: &Tree, source: &[u8]) -> ExtractedFile {
+        let Some(tree) = parser.parse(source, None) else {
+            return file_with_diagnostic(path, Severity::Error, "PHP parser returned no tree");
+        };
+
         let mut extractor = Extractor::new(source);
-        extractor.run(tree);
-        extractor.into_file()
+        extractor.run(&tree);
+        extractor.into_file(path)
     }
 }
 
-fn shared_queries() -> &'static LanguageQueries {
-    static QUERIES: OnceLock<LanguageQueries> = OnceLock::new();
+fn file_with_diagnostic(path: &Path, severity: Severity, message: &str) -> ExtractedFile {
+    ExtractedFile {
+        path: path.to_path_buf(),
+        nodes: Vec::new(),
+        refs: Vec::new(),
+        diagnostics: vec![Diagnostic {
+            severity,
+            message: message.to_string(),
+            span: None,
+        }],
+    }
+}
+
+struct CompiledQueries {
+    definitions: Query,
+    imports: Query,
+}
+
+fn compiled_queries() -> &'static CompiledQueries {
+    static QUERIES: OnceLock<CompiledQueries> = OnceLock::new();
     QUERIES.get_or_init(|| {
         let language: Language = tree_sitter_php::LANGUAGE_PHP.into();
-        let definitions = Arc::new(
-            Query::new(&language, DEFINITIONS_QUERY_SOURCE)
-                .unwrap_or_else(|err| panic!("PHP definitions query failed to compile: {err}")),
-        );
-        let imports = Arc::new(
-            Query::new(&language, IMPORTS_QUERY_SOURCE)
-                .unwrap_or_else(|err| panic!("PHP imports query failed to compile: {err}")),
-        );
-        LanguageQueries {
+        let definitions = Query::new(&language, DEFINITIONS_QUERY_SOURCE)
+            .unwrap_or_else(|err| panic!("PHP definitions query failed to compile: {err}"));
+        let imports = Query::new(&language, IMPORTS_QUERY_SOURCE)
+            .unwrap_or_else(|err| panic!("PHP imports query failed to compile: {err}"));
+        CompiledQueries {
             definitions,
             imports,
         }
@@ -293,41 +171,41 @@ impl DefinitionCapture {
         }
     }
 
-    fn as_node_kind(self) -> Option<NodeKind> {
+    fn as_node_kind(self) -> Option<&'static str> {
         match self {
-            Self::Namespace => Some(NodeKind::Namespace),
-            Self::Class => Some(NodeKind::Class),
-            Self::Interface => Some(NodeKind::Interface),
-            Self::Trait => Some(NodeKind::Trait),
-            Self::Enum => Some(NodeKind::Enum),
-            Self::EnumCase => Some(NodeKind::EnumCase),
-            Self::Function => Some(NodeKind::Function),
-            Self::Method => Some(NodeKind::Method),
-            Self::Property => Some(NodeKind::Property),
-            Self::Constant => Some(NodeKind::Constant),
+            Self::Namespace => Some("namespace"),
+            Self::Class => Some("class"),
+            Self::Interface => Some("interface"),
+            Self::Trait => Some("trait"),
+            Self::Enum => Some("enum"),
+            Self::EnumCase => Some("enum_case"),
+            Self::Function => Some("function"),
+            Self::Method => Some("method"),
+            Self::Property => Some("property"),
+            Self::Constant => Some("constant"),
             Self::Extends | Self::Implements | Self::TraitUse => None,
         }
     }
 
-    fn as_ref_kind(self) -> Option<RefKind> {
+    fn as_ref_kind(self) -> Option<&'static str> {
         match self {
-            Self::Extends => Some(RefKind::Extends),
-            Self::Implements => Some(RefKind::Implements),
-            Self::TraitUse => Some(RefKind::TraitUse),
+            Self::Extends => Some("extends"),
+            Self::Implements => Some("implements"),
+            Self::TraitUse => Some("trait_use"),
             _ => None,
         }
     }
 }
 
 struct PendingDefinition {
-    kind: NodeKind,
+    kind: &'static str,
     name: String,
     container_node_id: usize,
     span: Span,
 }
 
 struct PendingClassRef {
-    kind: RefKind,
+    kind: &'static str,
     name: String,
     span: Span,
 }
@@ -354,10 +232,9 @@ impl<'src> Extractor<'src> {
         }
     }
 
-    fn into_file(self) -> ExtractedFile {
+    fn into_file(self, path: &Path) -> ExtractedFile {
         ExtractedFile {
-            language: "php",
-            extractor_version: PHP_EXTRACTOR_VERSION,
+            path: path.to_path_buf(),
             nodes: self.nodes,
             refs: self.refs,
             diagnostics: self.diagnostics,
@@ -373,8 +250,7 @@ impl<'src> Extractor<'src> {
     }
 
     fn collect_definitions(&mut self, root: TsNode<'_>) {
-        let queries = shared_queries();
-        let query = &queries.definitions;
+        let query = &compiled_queries().definitions;
 
         let name_capture_index = query.capture_index_for_name("name");
 
@@ -418,7 +294,7 @@ impl<'src> Extractor<'src> {
                         "PHP definition capture without name: kind={capture:?}, node={}",
                         node.kind()
                     ),
-                    span: Span::from_node(node),
+                    span: Some(span_from_node(node)),
                 });
                 continue;
             };
@@ -430,13 +306,13 @@ impl<'src> Extractor<'src> {
                     kind,
                     name,
                     container_node_id: node.id(),
-                    span: Span::from_node(node),
+                    span: span_from_node(node),
                 });
             } else if let Some(kind) = capture.as_ref_kind() {
                 pending_refs.push(PendingClassRef {
                     kind,
                     name,
-                    span: Span::from_node(node),
+                    span: span_from_node(node),
                 });
             }
         }
@@ -453,7 +329,7 @@ impl<'src> Extractor<'src> {
     }
 
     fn emit_definition(&mut self, pending: PendingDefinition, root: TsNode<'_>) {
-        let namespace = if pending.kind == NodeKind::Namespace {
+        let namespace = if pending.kind == "namespace" {
             None
         } else {
             enclosing_namespace(root, pending.span.start.byte, self.source)
@@ -475,7 +351,7 @@ impl<'src> Extractor<'src> {
         let local_id = self.nodes.len() as LocalNodeId;
         let node = Node {
             id: local_id,
-            kind: pending.kind,
+            kind: pending.kind.to_string(),
             name: pending.name,
             qname,
             span: pending.span,
@@ -498,8 +374,8 @@ impl<'src> Extractor<'src> {
         let id = self.refs.len() as LocalRefId;
         self.refs.push(Ref {
             id,
-            kind: pending.kind,
-            qname: normalize_qualified_name(&pending.name),
+            kind: pending.kind.to_string(),
+            qname: Some(normalize_qualified_name(&pending.name)),
             name: pending.name,
             alias: None,
             span: pending.span,
@@ -508,8 +384,7 @@ impl<'src> Extractor<'src> {
     }
 
     fn collect_imports(&mut self, root: TsNode<'_>) {
-        let queries = shared_queries();
-        let query = &queries.imports;
+        let query = &compiled_queries().imports;
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(query, root, self.source);
@@ -564,7 +439,7 @@ impl<'src> Extractor<'src> {
             self.diagnostics.push(Diagnostic {
                 severity: Severity::Warning,
                 message: "PHP use clause missing imported name".to_string(),
-                span: Span::from_node(clause),
+                span: Some(span_from_node(clause)),
             });
             return;
         };
@@ -595,11 +470,11 @@ impl<'src> Extractor<'src> {
         let id = self.refs.len() as LocalRefId;
         self.refs.push(Ref {
             id,
-            kind: RefKind::Import,
+            kind: "import".to_string(),
             name: display_name,
-            qname,
+            qname: Some(qname),
             alias,
-            span: Span::from_node(clause),
+            span: span_from_node(clause),
             container,
         });
     }
@@ -616,28 +491,28 @@ impl<'src> Extractor<'src> {
                 if let Some(function) = node.child_by_field_name("function")
                     && let Some((name, name_node)) = callee_name(function, self.source)
                 {
-                    self.emit_call(node, name_node, name, RefKind::Call, root);
+                    self.emit_call(node, name_node, name, "call", root);
                 }
             }
             "member_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, RefKind::MethodCall, root);
+                    self.emit_call(node, name_node, name, "method_call", root);
                 }
             }
             "nullsafe_member_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, RefKind::NullsafeMethodCall, root);
+                    self.emit_call(node, name_node, name, "nullsafe_method_call", root);
                 }
             }
             "scoped_call_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && let Some(name) = simple_identifier(name_node, self.source)
                 {
-                    self.emit_call(node, name_node, name, RefKind::StaticCall, root);
+                    self.emit_call(node, name_node, name, "static_call", root);
                 }
             }
             _ => {}
@@ -659,7 +534,7 @@ impl<'src> Extractor<'src> {
         call: TsNode<'_>,
         _name_node: TsNode<'_>,
         name: String,
-        kind: RefKind,
+        kind: &'static str,
         root: TsNode<'_>,
     ) {
         let container = enclosing_definition_local_id(
@@ -671,11 +546,11 @@ impl<'src> Extractor<'src> {
         let id = self.refs.len() as LocalRefId;
         self.refs.push(Ref {
             id,
-            kind,
-            qname: normalize_qualified_name(&name),
+            kind: kind.to_string(),
+            qname: Some(normalize_qualified_name(&name)),
             name,
             alias: None,
-            span: Span::from_node(call),
+            span: span_from_node(call),
             container,
         });
     }
@@ -694,13 +569,13 @@ impl<'src> Extractor<'src> {
             self.diagnostics.push(Diagnostic {
                 severity: Severity::Error,
                 message: format!("missing `{}` token", node.kind()),
-                span: Span::from_node(node),
+                span: Some(span_from_node(node)),
             });
         } else if node.is_error() {
             self.diagnostics.push(Diagnostic {
                 severity: Severity::Error,
                 message: "syntax error".to_string(),
-                span: Span::from_node(node),
+                span: Some(span_from_node(node)),
             });
         }
 
@@ -888,11 +763,11 @@ fn build_qname(
     namespace: Option<&str>,
     parent_qname: Option<&str>,
     name: &str,
-    kind: NodeKind,
+    kind: &str,
 ) -> String {
     if let Some(parent) = parent_qname {
         return match kind {
-            NodeKind::Method | NodeKind::Property | NodeKind::Constant | NodeKind::EnumCase => {
+            "method" | "property" | "constant" | "enum_case" => {
                 format!("{parent}::{name}")
             }
             _ => format!("{parent}\\{name}"),
@@ -922,14 +797,14 @@ fn last_segment(qname: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn extract(source: &str) -> ExtractedFile {
-        let lang = PhpLanguage::new();
-        let (_tree, extracted) = lang.parse_and_extract(source.as_bytes());
-        extracted
+        let plugin = PhpPlugin::new();
+        plugin.extract(source.as_bytes(), &PathBuf::from("test.php"))
     }
 
-    fn node_qnames(file: &ExtractedFile, kind: NodeKind) -> Vec<String> {
+    fn node_qnames(file: &ExtractedFile, kind: &str) -> Vec<String> {
         file.nodes
             .iter()
             .filter(|n| n.kind == kind)
@@ -942,11 +817,8 @@ mod tests {
             .iter()
             .filter(|r| {
                 matches!(
-                    r.kind,
-                    RefKind::Call
-                        | RefKind::MethodCall
-                        | RefKind::StaticCall
-                        | RefKind::NullsafeMethodCall
+                    r.kind.as_str(),
+                    "call" | "method_call" | "static_call" | "nullsafe_method_call"
                 )
             })
             .map(|r| r.name.clone())
@@ -958,13 +830,13 @@ mod tests {
         let source = include_str!("../../tests/fixtures/php/class_with_members.php");
         let extracted = extract(source);
 
-        let namespaces = node_qnames(&extracted, NodeKind::Namespace);
+        let namespaces = node_qnames(&extracted, "namespace");
         assert_eq!(namespaces, vec!["App\\Services".to_string()]);
 
-        let classes = node_qnames(&extracted, NodeKind::Class);
+        let classes = node_qnames(&extracted, "class");
         assert_eq!(classes, vec!["App\\Services\\OrderService".to_string()]);
 
-        let methods = node_qnames(&extracted, NodeKind::Method);
+        let methods = node_qnames(&extracted, "method");
         assert!(
             methods.contains(&"App\\Services\\OrderService::__construct".to_string()),
             "expected constructor, got {methods:?}"
@@ -974,7 +846,7 @@ mod tests {
             "expected place(), got {methods:?}"
         );
 
-        let properties = node_qnames(&extracted, NodeKind::Property);
+        let properties = node_qnames(&extracted, "property");
         assert!(
             properties.contains(&"App\\Services\\OrderService::$repository".to_string()),
             "expected $repository property, got {properties:?}"
@@ -983,32 +855,32 @@ mod tests {
         let extends: Vec<_> = extracted
             .refs
             .iter()
-            .filter(|r| r.kind == RefKind::Extends)
-            .map(|r| r.qname.clone())
+            .filter(|r| r.kind == "extends")
+            .filter_map(|r| r.qname.clone())
             .collect();
         assert_eq!(extends, vec!["BaseService".to_string()]);
 
         let implements: Vec<_> = extracted
             .refs
             .iter()
-            .filter(|r| r.kind == RefKind::Implements)
-            .map(|r| r.qname.clone())
+            .filter(|r| r.kind == "implements")
+            .filter_map(|r| r.qname.clone())
             .collect();
         assert_eq!(implements, vec!["OrderContract".to_string()]);
 
         let trait_uses: Vec<_> = extracted
             .refs
             .iter()
-            .filter(|r| r.kind == RefKind::TraitUse)
-            .map(|r| r.qname.clone())
+            .filter(|r| r.kind == "trait_use")
+            .filter_map(|r| r.qname.clone())
             .collect();
         assert_eq!(trait_uses, vec!["Loggable".to_string()]);
 
         let imports: Vec<_> = extracted
             .refs
             .iter()
-            .filter(|r| r.kind == RefKind::Import)
-            .map(|r| r.qname.clone())
+            .filter(|r| r.kind == "import")
+            .filter_map(|r| r.qname.clone())
             .collect();
         assert!(
             imports.contains(&"App\\Contracts\\OrderContract".to_string()),
@@ -1029,7 +901,7 @@ mod tests {
         let source = include_str!("../../tests/fixtures/php/function_with_calls.php");
         let extracted = extract(source);
 
-        let functions = node_qnames(&extracted, NodeKind::Function);
+        let functions = node_qnames(&extracted, "function");
         assert!(
             functions.contains(&"App\\Util\\dispatch".to_string()),
             "expected dispatch() function, got {functions:?}"
@@ -1067,7 +939,7 @@ mod tests {
         let sprintf_call = extracted
             .refs
             .iter()
-            .find(|r| r.kind == RefKind::Call && r.name == "sprintf")
+            .find(|r| r.kind == "call" && r.name == "sprintf")
             .expect("sprintf call ref");
         assert_eq!(sprintf_call.container, Some(dispatch_id));
     }
@@ -1082,7 +954,7 @@ mod tests {
             "expected at least one diagnostic for malformed PHP"
         );
 
-        let classes = node_qnames(&extracted, NodeKind::Class);
+        let classes = node_qnames(&extracted, "class");
         assert!(
             classes.iter().any(|q| q.ends_with("Broken")),
             "expected partial class extraction for `Broken`, got {classes:?}"
@@ -1094,16 +966,16 @@ mod tests {
         let source = include_str!("../../tests/fixtures/php/enum_status.php");
         let extracted = extract(source);
 
-        let enums = node_qnames(&extracted, NodeKind::Enum);
+        let enums = node_qnames(&extracted, "enum");
         assert_eq!(enums, vec!["App\\Models\\Status".to_string()]);
 
-        let classes = node_qnames(&extracted, NodeKind::Class);
+        let classes = node_qnames(&extracted, "class");
         assert!(
             classes.is_empty(),
             "enum must not be reported as a class, got {classes:?}"
         );
 
-        let cases = node_qnames(&extracted, NodeKind::EnumCase);
+        let cases = node_qnames(&extracted, "enum_case");
         assert!(
             cases.contains(&"App\\Models\\Status::Active".to_string()),
             "expected Active enum case, got {cases:?}"
@@ -1116,6 +988,6 @@ mod tests {
 
     #[test]
     fn definition_query_compiles() {
-        let _queries = shared_queries();
+        let _queries = compiled_queries();
     }
 }
