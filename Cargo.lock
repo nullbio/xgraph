@@ -2738,6 +2738,7 @@ dependencies = [
  "notify",
  "num_cpus",
  "parking_lot",
+ "rayon",
  "serde",
  "serde_json",
  "sha2 0.11.0",

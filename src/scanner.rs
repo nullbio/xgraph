@@ -1,10 +1,12 @@
 //! Ignore-aware scanning and manifest reconciliation.
 
 use std::fmt;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::hash::{ContentHash, HashError, hash_file};
@@ -94,9 +96,15 @@ pub fn detect_language(path: &Path) -> Option<DetectedLanguage> {
     }
 }
 
+/// Walk the worktree and hash every non-ignored file.
+///
+/// The walk is single-threaded (cheap relative to hashing) but each file's
+/// metadata read + BLAKE3 hash runs on a rayon worker so a cold scan over a
+/// large project saturates available cores. Output is sorted by path so
+/// downstream cross-file resolution is deterministic.
 pub fn scan(root: &Path, matcher: &dyn Matcher) -> Result<Vec<ScannedFile>, ScanError> {
-    let mut files = Vec::new();
-
+    // Walk first; cheap relative to the per-file hash.
+    let mut candidates: Vec<PathBuf> = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -106,50 +114,48 @@ pub fn scan(root: &Path, matcher: &dyn Matcher) -> Result<Vec<ScannedFile>, Scan
             }
             !matcher.matched(entry.path())
         });
-
     for entry in walker {
         let entry = entry.map_err(|source| {
             let path = source.path().map(Path::to_path_buf).unwrap_or_default();
             ScanError::Walk { path, source }
         })?;
-
         if !entry.file_type().is_file() {
             continue;
         }
-
-        let path = entry.path();
-        let metadata = entry.metadata().map_err(|source| {
-            let io_err = match source.into_io_error() {
-                Some(io) => io,
-                None => io::Error::other("walkdir metadata error"),
-            };
-            ScanError::Metadata {
-                path: path.to_path_buf(),
-                source: io_err,
-            }
-        })?;
-
-        let mtime = metadata.modified().map_err(|source| ScanError::Metadata {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let size = metadata.len();
-
-        let content_hash = hash_file(path).map_err(|source| ScanError::Hash {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        files.push(ScannedFile {
-            path: path.to_path_buf(),
-            language: detect_language(path),
-            content_hash,
-            mtime,
-            size,
-        });
+        candidates.push(entry.into_path());
     }
 
+    // Hash + stat in parallel.
+    let mut files: Vec<ScannedFile> = candidates
+        .into_par_iter()
+        .map(hash_candidate)
+        .collect::<Result<Vec<_>, _>>()?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+fn hash_candidate(path: PathBuf) -> Result<ScannedFile, ScanError> {
+    let metadata = fs::metadata(&path).map_err(|source| ScanError::Metadata {
+        path: path.clone(),
+        source,
+    })?;
+    let mtime = metadata.modified().map_err(|source| ScanError::Metadata {
+        path: path.clone(),
+        source,
+    })?;
+    let size = metadata.len();
+    let content_hash = hash_file(&path).map_err(|source| ScanError::Hash {
+        path: path.clone(),
+        source,
+    })?;
+    let language = detect_language(&path);
+    Ok(ScannedFile {
+        path,
+        language,
+        content_hash,
+        mtime,
+        size,
+    })
 }
 
 #[cfg(test)]
