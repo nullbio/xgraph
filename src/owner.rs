@@ -4,14 +4,17 @@
 //! the parser-version constant used in content fact rows. Provides the
 //! daemon-side primitives for initial indexing and incremental updates.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cozo::{
-    ContentHash as CozoContentHash, CozoStore, FileUpdate, FileUpdateMetadata, WriterError,
-    WriterHandle, WriterQueue,
+    ContentHash as CozoContentHash, CozoStore, EdgeFact, FileUpdate, FileUpdateMetadata,
+    WriterError, WriterHandle, WriterQueue, active_node_id,
 };
+use crate::extract::ExtractedFile;
+use crate::hash::ContentHash;
 use crate::ignore::IgnoreMatcher;
 use crate::language::LanguageRegistry;
 use crate::scanner::{DetectedLanguage, ScanError, scan};
@@ -49,22 +52,31 @@ impl WorktreeOwner {
         &self.worktree_root
     }
 
-    /// Walk the worktree and submit one `FileUpdate` per supported file.
+    /// Walk the worktree, extract every supported file, resolve refs into edges
+    /// against the full set, then submit one `FileUpdate` per file.
     /// Returns the number of files submitted to the writer queue.
     pub fn index_all(&mut self) -> Result<usize, OwnerError> {
         let scanned = scan(&self.worktree_root, &self.matcher)?;
-        let mut count = 0usize;
+
+        let mut prepared: Vec<PreparedFile> = Vec::with_capacity(scanned.len());
         for file in scanned {
-            if file.language.is_none() {
-                continue;
+            let Some(lang) = file.language else { continue };
+            if let Some(p) = self.prepare_file(file.path, file.mtime, file.size, lang)? {
+                prepared.push(p);
             }
-            self.submit_file(file.path, file.mtime, file.size, file.language)?;
-            count += 1;
+        }
+
+        let symbol_table = build_symbol_table(&prepared);
+        let count = prepared.len();
+        for prep in prepared {
+            self.submit_prepared(prep, &symbol_table)?;
         }
         Ok(count)
     }
 
-    /// Re-extract a single path and submit the update.
+    /// Re-extract a single path and submit the update. Cross-file resolution
+    /// uses an empty symbol table (callers will be resolved on the next
+    /// scheduled reconciliation pass).
     pub fn process_change(&mut self, path: PathBuf) -> Result<bool, OwnerError> {
         if !path.exists() {
             return Ok(false);
@@ -75,24 +87,24 @@ impl WorktreeOwner {
         })?;
         let mtime = metadata.modified().unwrap_or_else(|_| SystemTime::now());
         let size = metadata.len();
-        let detected = crate::scanner::detect_language(&path);
-        if detected.is_none() {
+        let Some(lang) = crate::scanner::detect_language(&path) else {
             return Ok(false);
-        }
-        self.submit_file(path, mtime, size, detected)?;
+        };
+        let Some(prep) = self.prepare_file(path, mtime, size, lang)? else {
+            return Ok(false);
+        };
+        let empty = SymbolTable::default();
+        self.submit_prepared(prep, &empty)?;
         Ok(true)
     }
 
-    fn submit_file(
-        &mut self,
+    fn prepare_file(
+        &self,
         path: PathBuf,
         mtime: SystemTime,
         size: u64,
-        language: Option<DetectedLanguage>,
-    ) -> Result<(), OwnerError> {
-        let Some(lang) = language else {
-            return Ok(());
-        };
+        language: DetectedLanguage,
+    ) -> Result<Option<PreparedFile>, OwnerError> {
         let bytes = fs::read(&path).map_err(|source| OwnerError::Io {
             path: path.clone(),
             source,
@@ -103,19 +115,39 @@ impl WorktreeOwner {
             .unwrap_or(&path)
             .to_path_buf();
         let Some(extracted) = self.registry.extract_file(&relative, &bytes) else {
-            return Ok(());
+            return Ok(None);
         };
-        let metadata = FileUpdateMetadata {
-            content_hash: CozoContentHash::from_bytes(*content_hash.as_bytes()),
-            language: language_label(lang).to_owned(),
-            parser_version: PARSER_VERSION,
-            mtime: mtime_seconds(mtime),
+        Ok(Some(PreparedFile {
+            relative,
+            content_hash,
+            language,
+            mtime,
             size,
+            extracted,
+        }))
+    }
+
+    fn submit_prepared(
+        &mut self,
+        prep: PreparedFile,
+        symbols: &SymbolTable,
+    ) -> Result<(), OwnerError> {
+        let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
+        let edges = resolve_edges(&prep.content_hash, &prep.extracted, symbols);
+
+        let metadata = FileUpdateMetadata {
+            content_hash: cozo_hash,
+            language: language_label(prep.language).to_owned(),
+            parser_version: PARSER_VERSION,
+            mtime: mtime_seconds(prep.mtime),
+            size: prep.size,
             generation: self.generation,
         };
         self.generation += 1;
-        let mut update = FileUpdate::from_extracted(&extracted, metadata);
-        update.path = relative.to_string_lossy().into_owned();
+
+        let mut update = FileUpdate::from_extracted(&prep.extracted, metadata);
+        update.path = prep.relative.to_string_lossy().into_owned();
+        update.edges = edges;
         self.writer.submit(update)?;
         Ok(())
     }
@@ -168,6 +200,103 @@ impl From<crate::cozo::CozoError> for OwnerError {
 impl From<WriterError> for OwnerError {
     fn from(err: WriterError) -> Self {
         OwnerError::Writer(err)
+    }
+}
+
+struct PreparedFile {
+    relative: PathBuf,
+    content_hash: ContentHash,
+    language: DetectedLanguage,
+    mtime: SystemTime,
+    size: u64,
+    extracted: ExtractedFile,
+}
+
+/// Maps a qualified name to the set of global node ids that own it.
+#[derive(Default)]
+struct SymbolTable {
+    by_qname: HashMap<String, Vec<String>>,
+}
+
+impl SymbolTable {
+    fn register(&mut self, qname: &str, node_id: String) {
+        if qname.is_empty() {
+            return;
+        }
+        self.by_qname
+            .entry(qname.to_owned())
+            .or_default()
+            .push(node_id);
+    }
+
+    fn lookup(&self, qname: &str) -> &[String] {
+        self.by_qname.get(qname).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
+    let mut table = SymbolTable::default();
+    for prep in prepared {
+        let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
+        for node in &prep.extracted.nodes {
+            let node_id = active_node_id(&cozo_hash, node.id);
+            table.register(&node.qname, node_id.clone());
+            // Also index by bare name when it differs, so unqualified callers can resolve.
+            if node.name != node.qname {
+                table.register(&node.name, node_id);
+            }
+        }
+    }
+    table
+}
+
+fn resolve_edges(
+    hash: &ContentHash,
+    extracted: &ExtractedFile,
+    symbols: &SymbolTable,
+) -> Vec<EdgeFact> {
+    let cozo_hash = CozoContentHash::from_bytes(*hash.as_bytes());
+    let mut edges = Vec::new();
+    for r in &extracted.refs {
+        let lookup_key = r.qname.as_deref().unwrap_or(r.name.as_str());
+        let targets = symbols.lookup(lookup_key);
+        if targets.is_empty() {
+            continue;
+        }
+        let edge_kind = edge_kind_for_ref(&r.kind);
+        // Use the ref's container as the edge source if present; otherwise
+        // attribute the edge to the file's first top-level node, falling back
+        // to a synthetic source rooted at the file's content hash.
+        let source_node_id = match r.container {
+            Some(local) => active_node_id(&cozo_hash, local),
+            None => continue,
+        };
+        for target in targets {
+            edges.push(EdgeFact {
+                source_node_id: source_node_id.clone(),
+                kind: edge_kind.to_owned(),
+                target_node_id: target.clone(),
+                provenance: "parser_extract".to_owned(),
+                confidence: 80,
+            });
+        }
+    }
+    edges
+}
+
+fn edge_kind_for_ref(kind: &str) -> &str {
+    match kind {
+        "call" | "method_call" | "static_call" | "nullsafe_method_call" => "calls",
+        "extends" | "inheritance" => "inherits",
+        "implements" => "implements",
+        "trait_use" => "uses",
+        "import" | "import_esm" | "import_cjs" => "imports",
+        "export" | "export_esm" | "export_cjs" => "exports",
+        "type_reference" => "references",
+        "jsx_component" => "renders",
+        "blade_view" | "blade_component" | "blade_x_component" => "renders",
+        "decorator" => "references",
+        _ => "references",
     }
 }
 

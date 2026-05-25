@@ -4,6 +4,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
@@ -12,10 +13,13 @@ use crate::VERSION;
 use crate::cozo::{
     ContentHash as CozoContentHash, CozoStore, FileUpdate, FileUpdateMetadata, WriterQueue,
 };
+use crate::daemon::{DaemonConfig, DaemonError};
 use crate::git::{GitDiscoveryError, WorktreeRoot};
+use crate::handlers::WorktreeHandler;
 use crate::ignore::{IgnoreError, IgnoreMatcher};
 use crate::language::{LanguageId, LanguageRegistry};
-use crate::runtime::{RuntimeError, runtime_dir};
+use crate::owner::WorktreeOwner;
+use crate::runtime::{RuntimeError, ensure_runtime_dir, runtime_dir};
 use crate::scanner::{ScanError, scan};
 use crate::storage::{PersistentPaths, PersistentPathsError};
 
@@ -67,6 +71,9 @@ pub enum CliError {
     },
     Writer(crate::cozo::WriterError),
     Runtime(RuntimeError),
+    Daemon(DaemonError),
+    Owner(crate::owner::OwnerError),
+    Mcp(crate::mcp::McpError),
 }
 
 impl std::fmt::Display for CliError {
@@ -81,6 +88,9 @@ impl std::fmt::Display for CliError {
             CliError::Io { path, source } => write!(f, "io error on {}: {source}", path.display()),
             CliError::Writer(err) => write!(f, "{err}"),
             CliError::Runtime(err) => write!(f, "{err}"),
+            CliError::Daemon(err) => write!(f, "{err}"),
+            CliError::Owner(err) => write!(f, "{err}"),
+            CliError::Mcp(err) => write!(f, "{err}"),
         }
     }
 }
@@ -88,6 +98,18 @@ impl std::fmt::Display for CliError {
 impl From<RuntimeError> for CliError {
     fn from(err: RuntimeError) -> Self {
         CliError::Runtime(err)
+    }
+}
+
+impl From<DaemonError> for CliError {
+    fn from(err: DaemonError) -> Self {
+        CliError::Daemon(err)
+    }
+}
+
+impl From<crate::owner::OwnerError> for CliError {
+    fn from(err: crate::owner::OwnerError) -> Self {
+        CliError::Owner(err)
     }
 }
 
@@ -279,11 +301,103 @@ fn _language_id_from_detected(id: crate::scanner::DetectedLanguage) -> LanguageI
 }
 
 fn cmd_mcp() -> Result<ExitCode, CliError> {
-    unimplemented!("xgraph mcp: requires full daemon spawn + proxy wiring; tracked for follow-up")
+    let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    let runtime = ensure_runtime_dir(worktree.as_path())?;
+
+    let launcher = Arc::new(SubprocessLauncher {
+        worktree_root: worktree.as_path().to_path_buf(),
+    });
+    let config = crate::mcp::McpConfig::new(runtime.as_path().to_path_buf(), launcher);
+
+    let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let exit_code = runtime_tokio
+        .block_on(crate::mcp::run(config))
+        .map_err(CliError::Mcp)?;
+    Ok(exit_code)
+}
+
+struct SubprocessLauncher {
+    worktree_root: PathBuf,
+}
+
+impl crate::mcp::DaemonLauncher for SubprocessLauncher {
+    fn spawn_daemon(&self) -> crate::mcp::SpawnFuture<'_> {
+        let exe = env::current_exe();
+        let cwd = self.worktree_root.clone();
+        Box::pin(async move {
+            let exe_path = exe.map_err(crate::mcp::McpError::Io)?;
+            let _ = std::process::Command::new(exe_path)
+                .arg("daemon")
+                .arg("start")
+                .current_dir(&cwd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .map_err(crate::mcp::McpError::Io)?;
+            Ok(())
+        })
+    }
 }
 
 fn cmd_daemon_start() -> Result<ExitCode, CliError> {
-    unimplemented!("xgraph daemon start: requires owner+listener wiring; tracked for follow-up")
+    let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    let persistent = PersistentPaths::for_worktree(&worktree)?;
+    persistent.ensure_created()?;
+    let runtime = ensure_runtime_dir(worktree.as_path())?;
+
+    let store = CozoStore::open(&persistent.cozo_db_path())?;
+    let matcher = IgnoreMatcher::new(worktree.as_path())?;
+    let registry = LanguageRegistry::with_all();
+    let mut owner = WorktreeOwner::new(
+        worktree.as_path().to_path_buf(),
+        matcher,
+        registry,
+        store.clone(),
+    )?;
+
+    let indexed = owner.index_all()?;
+    println!(
+        "indexed {indexed} files; opening daemon socket at {}",
+        runtime.socket_path().display()
+    );
+
+    let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let result: Result<(), DaemonError> = runtime_tokio.block_on(async move {
+        let handler = Arc::new(WorktreeHandler::new(Arc::new(store)));
+        let config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
+        let handle = crate::daemon::start(config).await?;
+        let socket_path = handle.socket_path().to_path_buf();
+        eprintln!("daemon listening on {}", socket_path.display());
+        // Drain the writer when the daemon ultimately shuts down.
+        let _errors = owner.shutdown();
+        // Wait for SIGTERM/SIGINT.
+        wait_for_shutdown().await;
+        handle.shutdown().await
+    });
+
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn wait_for_shutdown() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
 }
 
 fn cmd_daemon_stop() -> Result<ExitCode, CliError> {
