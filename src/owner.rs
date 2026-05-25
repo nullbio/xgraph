@@ -73,33 +73,56 @@ impl WorktreeOwner {
     /// against the full set, then submit one `FileUpdate` per file.
     /// Returns the number of files submitted to the writer queue.
     pub fn index_all(&mut self) -> Result<usize, OwnerError> {
+        self.index_all_with_progress(&crate::progress::Progress::start())
+    }
+
+    /// Same as `index_all` but reports progress updates to the caller-provided
+    /// renderer. Phase boundaries: scan → parse → resolve → store.
+    pub fn index_all_with_progress(
+        &mut self,
+        progress: &crate::progress::Progress,
+    ) -> Result<usize, OwnerError> {
+        use crate::progress::Phase;
+        progress.phase(Phase::Scanning, None);
         let scanned = scan(&self.worktree_root, &self.matcher)?;
+        progress.tick(scanned.len() as u64);
+        progress.finish_phase();
 
         // Project-scoped import resolvers, built once per pass.
         let ts_resolver = TsAliasResolver::from_worktree(&self.worktree_root);
         let py_resolver = PythonImportResolver::from_worktree(&self.worktree_root);
 
+        progress.phase(Phase::Parsing, Some(scanned.len() as u64));
         let mut prepared: Vec<PreparedFile> = Vec::with_capacity(scanned.len());
-        for file in scanned {
+        for (i, file) in scanned.into_iter().enumerate() {
+            progress.tick(i as u64 + 1);
             let Some(lang) = file.language else { continue };
             if let Some(mut p) = self.prepare_file(file.path, file.mtime, file.size, lang)? {
                 rewrite_imports(
                     &mut p.extracted,
                     &p.relative,
                     lang,
-                    ts_resolver.as_ref(),
+                    &ts_resolver,
                     &py_resolver,
                     &self.worktree_root,
                 );
                 prepared.push(p);
             }
         }
+        progress.finish_phase();
 
+        progress.phase(Phase::Resolving, Some(prepared.len() as u64));
         let symbol_table = build_symbol_table(&prepared);
+        progress.tick(prepared.len() as u64);
+        progress.finish_phase();
+
+        progress.phase(Phase::Storing, Some(prepared.len() as u64));
         let count = prepared.len();
-        for prep in prepared {
+        for (i, prep) in prepared.into_iter().enumerate() {
             self.submit_prepared(prep, &symbol_table)?;
+            progress.tick(i as u64 + 1);
         }
+        progress.finish_phase();
         // After the initial walk completes, MCP queries no longer need the
         // "still booting" caveat. Incremental change-driven catching_up is
         // tracked per-path via DaemonStatus::pending_paths.
@@ -214,19 +237,20 @@ impl WorktreeOwner {
                 crate::languages::php::extract_laravel_input(bytes, &prep.relative)
         {
             let facts = crate::laravel::resolve(std::slice::from_ref(&laravel_input));
-            for fedge in facts.edges {
-                // Framework edges synthesize stable string IDs so they can
-                // reference symbols that may live in other files. The
-                // "lh:" prefix marks them as laravel-heuristic facts.
-                let source_id = format!("lh:{}", fedge.from_qname);
-                let target_id = format!("lh:{}", fedge.to_qname);
-                edges.push(EdgeFact {
-                    source_node_id: source_id,
-                    kind: framework_edge_kind(fedge.kind).to_string(),
-                    target_node_id: target_id,
-                    provenance: "laravel_heuristic".to_string(),
-                    confidence: framework_confidence(fedge.confidence),
-                });
+            append_framework_edges(&facts, &mut edges);
+        }
+        // Blade templates feed the same resolver via a separate input shape.
+        // The Blade ref kinds (`blade_view`, `blade_component`,
+        // `blade_x_component`) are translated 1:1 to `BladeRef`s. The
+        // resolver synthesizes `view.<dotted>` source IDs from the template
+        // path, so every Blade ref produces a framework edge whose source
+        // is the template itself and target is the referenced view or
+        // component.
+        if matches!(prep.language, DetectedLanguage::Blade) {
+            let blade_input = blade_input_from_extracted(&prep.relative, &prep.extracted);
+            if !blade_input.refs.is_empty() {
+                let facts = crate::laravel::resolve_blade(std::slice::from_ref(&blade_input));
+                append_framework_edges(&facts, &mut edges);
             }
         }
 
@@ -411,16 +435,87 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
     let mut table = SymbolTable::default();
     for prep in prepared {
         let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
+        // Path-scoped keys are only meaningful for top-level definitions —
+        // a method on `class Foo` in file `bar.ts` is not importable as
+        // `bar#method`. We precompute the path-prefix once per file.
+        let js_path_prefix = match prep.language {
+            DetectedLanguage::JavaScript
+            | DetectedLanguage::TypeScript
+            | DetectedLanguage::Tsx => Some(js_path_key(&prep.relative)),
+            _ => None,
+        };
+        let python_module_prefix = if matches!(prep.language, DetectedLanguage::Python) {
+            python_module_path(&prep.relative)
+        } else {
+            None
+        };
+
         for node in &prep.extracted.nodes {
             let node_id = active_node_id(&cozo_hash, node.id);
             table.register(&node.qname, node_id.clone());
             // Also index by bare name when it differs, so unqualified callers can resolve.
             if node.name != node.qname {
-                table.register(&node.name, node_id);
+                table.register(&node.name, node_id.clone());
+            }
+
+            // Cross-file linking: top-level defs become importable under a
+            // path-scoped composite key. Skip nested defs (methods, inner
+            // classes, etc.) — only top-level decls can be `export`ed.
+            if node.parent.is_some() {
+                continue;
+            }
+            if let Some(prefix) = js_path_prefix.as_deref() {
+                table.register(&format!("{prefix}#{}", node.name), node_id.clone());
+                // For `index.{ts,tsx,js,jsx}` files, also register under the
+                // containing directory so `import X from './utils'` matches
+                // when `./utils` is a directory containing `index.ts`.
+                if let Some(dir_prefix) = strip_index_suffix(prefix) {
+                    table.register(&format!("{dir_prefix}#{}", node.name), node_id.clone());
+                }
+            }
+            if let Some(module) = python_module_prefix.as_deref() {
+                table.register(&format!("{module}.{}", node.name), node_id);
             }
         }
     }
     table
+}
+
+/// Strip the file extension and convert to forward-slash form so the result
+/// composes with `TsAliasResolver`'s output (`src/utils/format`).
+fn js_path_key(relative: &Path) -> String {
+    let stem = relative.with_extension("");
+    stem.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn strip_index_suffix(path_key: &str) -> Option<&str> {
+    path_key.strip_suffix("/index")
+}
+
+/// Map a Python source path (e.g. `pkg/sub/helper.py`) to its dotted module
+/// name (`pkg.sub.helper`). `__init__.py` files use the parent directory.
+fn python_module_path(relative: &Path) -> Option<String> {
+    let stem = relative.file_stem()?.to_str()?;
+    let dir = relative.parent()?;
+    let dir_parts: Vec<String> = dir
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .map(str::to_owned)
+        .collect();
+    let parts = if stem == "__init__" {
+        dir_parts
+    } else {
+        let mut p = dir_parts;
+        p.push(stem.to_owned());
+        p
+    };
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
 }
 
 fn resolve_edges(
@@ -437,12 +532,21 @@ fn resolve_edges(
             continue;
         }
         let edge_kind = edge_kind_for_ref(&r.kind);
-        // Use the ref's container as the edge source if present; otherwise
-        // attribute the edge to the file's first top-level node, falling back
-        // to a synthetic source rooted at the file's content hash.
+        // Refs inside a function/method/class have a concrete container; use
+        // the container's active_node_id as the edge source. Refs at module
+        // scope (top-level imports especially) have no container; for import
+        // edges we synthesize a stable file-level source ID so the edge
+        // still emits. For other top-level refs the edge is suppressed to
+        // avoid noise from anonymous module code.
         let source_node_id = match r.container {
             Some(local) => active_node_id(&cozo_hash, local),
-            None => continue,
+            None => {
+                if is_file_level_edge_kind(edge_kind) {
+                    file_level_node_id(&extracted.path)
+                } else {
+                    continue;
+                }
+            }
         };
         for target in targets {
             edges.push(EdgeFact {
@@ -457,6 +561,18 @@ fn resolve_edges(
     edges
 }
 
+/// File-level synthesized node ID. The `file:` prefix avoids any collision
+/// with `active_node_id` (always starts with a 64-hex content hash) and the
+/// laravel-heuristic `lh:` prefix. Consumers reading edges with this source
+/// know the edge originates from a module-level (file-scope) reference.
+fn file_level_node_id(relative: &Path) -> String {
+    format!("file:{}", relative.to_string_lossy())
+}
+
+fn is_file_level_edge_kind(edge_kind: &str) -> bool {
+    matches!(edge_kind, "imports" | "exports")
+}
+
 fn edge_kind_for_ref(kind: &str) -> &str {
     match kind {
         "call" | "method_call" | "static_call" | "nullsafe_method_call" => "calls",
@@ -464,6 +580,7 @@ fn edge_kind_for_ref(kind: &str) -> &str {
         "implements" => "implements",
         "trait_use" => "uses",
         "import" | "import_esm" | "import_cjs" => "imports",
+        "import_named" | "import_default" | "import_namespace" => "imports",
         "export" | "export_esm" | "export_cjs" => "exports",
         "type_reference" => "references",
         "jsx_component" => "renders",
@@ -474,43 +591,71 @@ fn edge_kind_for_ref(kind: &str) -> &str {
 }
 
 /// Rewrite import-style refs in an `ExtractedFile` so their `qname` reflects
-/// the project's TypeScript path aliases or Python package layout. Refs that
-/// don't resolve (external packages, stdlib) are left untouched.
+/// the project's TypeScript path aliases / Python package layout, and so
+/// per-binding refs carry a composite `<resolved_path>#<symbol>` (JS/TS) or
+/// `<resolved_module>.<symbol>` (Python) key that matches the registrations
+/// added by `build_symbol_table`. Refs that don't resolve (external
+/// packages, stdlib) are left with their raw source so the symbol table
+/// lookup simply misses, producing no edge.
 fn rewrite_imports(
     extracted: &mut ExtractedFile,
     relative_path: &Path,
     language: DetectedLanguage,
-    ts: Option<&TsAliasResolver>,
+    ts: &TsAliasResolver,
     py: &PythonImportResolver,
     worktree_root: &Path,
 ) {
     match language {
         DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx => {
-            if let Some(resolver) = ts {
-                for r in &mut extracted.refs {
-                    if is_js_import_kind(&r.kind)
-                        && let Some(resolved) = resolver.resolve(&r.name, worktree_root)
-                    {
-                        r.qname = Some(resolved);
+            for r in &mut extracted.refs {
+                match r.kind.as_str() {
+                    // Module-level refs: name carries the raw import string,
+                    // qname starts unset.
+                    "import_esm" | "import_cjs" => {
+                        if let Some(resolved) = ts.resolve(&r.name, relative_path, worktree_root) {
+                            r.qname = Some(resolved);
+                        }
                     }
+                    // Per-binding refs: qname carries the raw module source
+                    // from the extractor; rewrite to `<resolved>#<symbol>`.
+                    "import_named" | "import_default" | "import_namespace" => {
+                        if let Some(module_src) = r.qname.clone()
+                            && let Some(resolved) =
+                                ts.resolve(&module_src, relative_path, worktree_root)
+                        {
+                            r.qname = Some(format!("{resolved}#{}", r.name));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         DetectedLanguage::Python => {
             for r in &mut extracted.refs {
-                if r.kind == "import"
-                    && let Some(resolved) = py.resolve(relative_path, &r.name)
-                {
+                if r.kind != "import" {
+                    continue;
+                }
+                // Two emission shapes from python.rs:
+                //   `import os`             → name="os",  qname=None
+                //   `from .helper import X` → name="X",   qname=Some(".helper.X")
+                //   `from ..pkg import *`   → name="*",   qname=Some("..pkg.*")
+                // In all cases the resolver wants the module portion only.
+                if let Some(existing_qname) = r.qname.clone() {
+                    let suffix = format!(".{}", r.name);
+                    let module = existing_qname
+                        .strip_suffix(&suffix)
+                        .unwrap_or(&existing_qname)
+                        .to_owned();
+                    if let Some(resolved_module) = py.resolve(relative_path, &module) {
+                        r.qname = Some(format!("{resolved_module}.{}", r.name));
+                    }
+                } else if let Some(resolved) = py.resolve(relative_path, &r.name) {
                     r.qname = Some(resolved);
                 }
             }
         }
         DetectedLanguage::Php | DetectedLanguage::Blade => {}
     }
-}
-
-fn is_js_import_kind(kind: &str) -> bool {
-    matches!(kind, "import_esm" | "import_cjs")
 }
 
 fn framework_edge_kind(kind: crate::laravel::FrameworkEdgeKind) -> &'static str {
@@ -523,6 +668,59 @@ fn framework_edge_kind(kind: crate::laravel::FrameworkEdgeKind) -> &'static str 
         ServiceBinding => "binds",
         EventListener => "dispatches_event",
         JobDispatch => "dispatches_job",
+        BladeExtendsView => "extends_view",
+        BladeIncludesView => "includes_view",
+        BladeUsesComponent => "uses_component",
+    }
+}
+
+/// Append a `LaravelFacts.edges` batch to the edge fact list. Framework
+/// edges synthesize stable string node IDs prefixed with `lh:` so they
+/// cannot collide with parser-extracted IDs (always 64-hex-char content
+/// hash prefixes).
+fn append_framework_edges(facts: &crate::laravel::LaravelFacts, edges: &mut Vec<EdgeFact>) {
+    for fedge in &facts.edges {
+        let source_id = format!("lh:{}", fedge.from_qname);
+        let target_id = format!("lh:{}", fedge.to_qname);
+        edges.push(EdgeFact {
+            source_node_id: source_id,
+            kind: framework_edge_kind(fedge.kind).to_string(),
+            target_node_id: target_id,
+            provenance: "laravel_heuristic".to_string(),
+            confidence: framework_confidence(fedge.confidence),
+        });
+    }
+}
+
+/// Translate the canonical Blade refs (`blade_extends`, `blade_view`,
+/// `blade_component`, `blade_x_component`) into the laravel resolver's
+/// `BladeRef` shape.
+fn blade_input_from_extracted(
+    relative: &Path,
+    extracted: &ExtractedFile,
+) -> crate::laravel::BladeExtractInput {
+    use crate::laravel::{BladeRef, BladeRefKind, Span as LavSpan};
+    let mut refs = Vec::new();
+    for r in &extracted.refs {
+        let kind = match r.kind.as_str() {
+            "blade_extends" => BladeRefKind::ExtendsView,
+            "blade_view" => BladeRefKind::IncludesView,
+            "blade_component" => BladeRefKind::Component,
+            "blade_x_component" => BladeRefKind::XComponent,
+            _ => continue,
+        };
+        refs.push(BladeRef {
+            kind,
+            value: r.name.clone(),
+            span: LavSpan {
+                start: r.span.start.byte,
+                end: r.span.end.byte,
+            },
+        });
+    }
+    crate::laravel::BladeExtractInput {
+        path: relative.to_path_buf(),
+        refs,
     }
 }
 

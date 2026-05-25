@@ -159,7 +159,9 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
         status,
     )?;
 
-    let indexed = owner.index_all()?;
+    let progress = crate::progress::Progress::start();
+    let indexed = owner.index_all_with_progress(&progress)?;
+    progress.stop();
     let errors = owner.shutdown();
     if let Some(first) = errors.into_iter().next() {
         return Err(CliError::Writer(first));
@@ -236,6 +238,8 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     // graph immediately; the owner then mirrors fresh updates into them.
     let indexes = Arc::new(crate::indexes::HotIndexes::load_from_cozo(&store)?);
     let status = Arc::new(crate::daemon_status::DaemonStatus::new());
+    // Keep a handle to the store for MCP read tools (impact, node, etc.).
+    let store_for_handler = Arc::new(store.clone());
     let mut owner = WorktreeOwner::new(
         worktree.as_path().to_path_buf(),
         owner_matcher,
@@ -303,8 +307,14 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
             source: err,
         })?;
 
+    let worktree_root_for_handler = worktree.as_path().to_path_buf();
     let result: Result<(), DaemonError> = runtime_tokio.block_on(async move {
-        let handler = Arc::new(WorktreeHandler::new(indexes, status));
+        let handler = Arc::new(WorktreeHandler::new(
+            indexes,
+            status,
+            worktree_root_for_handler,
+            store_for_handler,
+        ));
         let config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
         let handle = crate::daemon::start(config).await?;
         let socket_path = handle.socket_path().to_path_buf();

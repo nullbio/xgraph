@@ -18,6 +18,7 @@
 //!   pressure signal worth surfacing (e.g. `"high_memory_usage"` when RSS
 //!   exceeds `daemon_status::RSS_WARNING_THRESHOLD_BYTES`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
+use crate::cozo::CozoStore;
 use crate::daemon::ConnectionHandler;
 use crate::daemon_status::{DaemonStatus, RSS_WARNING_THRESHOLD_BYTES};
 use crate::indexes::{HotIndexes, NodeId, SymbolKey};
@@ -34,11 +36,27 @@ use crate::indexes::{HotIndexes, NodeId, SymbolKey};
 pub struct WorktreeHandler {
     indexes: Arc<HotIndexes>,
     status: Arc<DaemonStatus>,
+    /// Worktree root — used by the `node` tool to read source byte ranges.
+    worktree_root: PathBuf,
+    /// Cozo store — used by tools that need transitive graph queries
+    /// (`impact`) which the in-memory hot index can't satisfy because it
+    /// only tracks call edges, not inherits/implements/references.
+    store: Arc<CozoStore>,
 }
 
 impl WorktreeHandler {
-    pub fn new(indexes: Arc<HotIndexes>, status: Arc<DaemonStatus>) -> Self {
-        Self { indexes, status }
+    pub fn new(
+        indexes: Arc<HotIndexes>,
+        status: Arc<DaemonStatus>,
+        worktree_root: PathBuf,
+        store: Arc<CozoStore>,
+    ) -> Self {
+        Self {
+            indexes,
+            status,
+            worktree_root,
+            store,
+        }
     }
 
     /// Tool dispatch + per-tool `catching_up` scoping. Returns the result
@@ -118,6 +136,96 @@ impl WorktreeHandler {
                     !self.status.is_reconcile_done() || self.status.is_path_pending(&path_buf);
                 Ok((json!({ "nodes": nodes }), catching_up))
             }
+            "node" => {
+                let params: NodeIdParams = parse_params(request)?;
+                let id = NodeId::from(params.node_id.as_str());
+                let record = match self.indexes.get_node(&id) {
+                    Some(r) => r,
+                    None => {
+                        return Ok((json!({ "node": null }), false));
+                    }
+                };
+                // Pull span + source snippet via Cozo. The span is stored
+                // as a `[start_byte, end_byte, start_row, start_col]` list.
+                let mut span_start: Option<u64> = None;
+                let mut span_end: Option<u64> = None;
+                let mut span_row: Option<u64> = None;
+                let mut span_col: Option<u64> = None;
+                if let Ok(rows) = self.store.run_read(
+                    "?[span] := *active_node[$id, _path, _hash, _local, _kind, _name, _qname, span]",
+                    [(
+                        "id".to_string(),
+                        cozo::DataValue::from(record.id.as_str()),
+                    )]
+                    .into(),
+                ) && let Some(row) = rows.rows.into_iter().next()
+                    && let Some(cozo::DataValue::List(span_list)) = row.into_iter().next()
+                {
+                    let mut it = span_list.into_iter();
+                    span_start = it.next().and_then(data_to_u64);
+                    span_end = it.next().and_then(data_to_u64);
+                    span_row = it.next().and_then(data_to_u64);
+                    span_col = it.next().and_then(data_to_u64);
+                }
+                let source_snippet =
+                    read_snippet(&self.worktree_root, &record.path, span_start, span_end);
+                let catching_up = !self.status.is_reconcile_done()
+                    || self.status.is_path_pending(&record.path);
+                Ok((
+                    json!({
+                        "node": {
+                            "node_id": record.id.as_str(),
+                            "path": record.path.to_string_lossy(),
+                            "kind": record.kind,
+                            "name": record.name,
+                            "qname": record.qname,
+                            "span": {
+                                "start_byte": span_start,
+                                "end_byte": span_end,
+                                "start_row": span_row,
+                                "start_col": span_col,
+                            },
+                            "source": source_snippet,
+                        }
+                    }),
+                    catching_up,
+                ))
+            }
+            "files" => {
+                let paths: Vec<Value> = self
+                    .indexes
+                    .list_files()
+                    .into_iter()
+                    .map(|p| Value::String(p.to_string_lossy().into_owned()))
+                    .collect();
+                let catching_up =
+                    !self.status.is_reconcile_done() || self.status.any_pending();
+                Ok((json!({ "files": paths }), catching_up))
+            }
+            "status" => {
+                let catching_up = !self.status.is_reconcile_done();
+                self.status.refresh_rss();
+                Ok((
+                    json!({
+                        "files": self.indexes.file_count(),
+                        "nodes": self.indexes.node_count(),
+                        "symbols": self.indexes.symbol_count(),
+                        "call_edges": self.indexes.call_edge_count(),
+                        "rss_bytes": self.status.rss_bytes(),
+                        "pending_paths": self.status.pending_count(),
+                        "reconcile_done": self.status.is_reconcile_done(),
+                    }),
+                    catching_up,
+                ))
+            }
+            "impact" => {
+                let params: ImpactParams = parse_params(request)?;
+                let max_depth = params.max_depth.unwrap_or(0);
+                let affected = run_impact_query(&self.store, &params.node_id, max_depth)?;
+                let catching_up =
+                    !self.status.is_reconcile_done() || self.status.any_pending();
+                Ok((json!({ "node_ids": affected }), catching_up))
+            }
             other => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {other}"),
@@ -151,8 +259,15 @@ impl ConnectionHandler for WorktreeHandler {
     fn handle(&self, conn: UnixStream) -> JoinHandle<()> {
         let indexes = Arc::clone(&self.indexes);
         let status = Arc::clone(&self.status);
+        let worktree_root = self.worktree_root.clone();
+        let store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            let handler = WorktreeHandler { indexes, status };
+            let handler = WorktreeHandler {
+                indexes,
+                status,
+                worktree_root,
+                store,
+            };
             let _ = serve_connection(&handler, conn).await;
         })
     }
@@ -230,6 +345,114 @@ struct NodesInFileParams {
     path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImpactParams {
+    node_id: String,
+    /// Optional bound on transitive depth. `None` or `0` runs the
+    /// unbounded variant.
+    #[serde(default)]
+    max_depth: Option<u32>,
+}
+
+/// Decode a Cozo `Int` value into `u64` for span fields. Returns `None`
+/// when the value is missing or has the wrong shape; callers fall back to
+/// an absent span in the response payload.
+fn data_to_u64(v: cozo::DataValue) -> Option<u64> {
+    match v {
+        cozo::DataValue::Num(cozo::Num::Int(i)) => i.try_into().ok(),
+        _ => None,
+    }
+}
+
+/// Read a `[start_byte, end_byte)` slice from `worktree_root.join(relative)`.
+/// Caps the snippet at 4 KiB to keep MCP responses bounded; clients that
+/// need the full source can `read` the file themselves. Returns `None` on
+/// any I/O error so the response simply omits the snippet.
+fn read_snippet(
+    worktree_root: &std::path::Path,
+    relative: &std::path::Path,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> Option<String> {
+    const MAX_SNIPPET_BYTES: u64 = 4096;
+    let start = start?;
+    let end = end?;
+    if end <= start {
+        return None;
+    }
+    let length = (end - start).min(MAX_SNIPPET_BYTES);
+    let full = worktree_root.join(relative);
+    let bytes = std::fs::read(&full).ok()?;
+    let start_usize: usize = start.try_into().ok()?;
+    let length_usize: usize = length.try_into().ok()?;
+    let end_usize = start_usize.checked_add(length_usize)?.min(bytes.len());
+    if start_usize >= bytes.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes[start_usize..end_usize]).into_owned())
+}
+
+/// Backward transitive closure over `Calls`, `Inherits`, `Implements`, and
+/// `References` (and their lowercase variants) edge kinds — every node
+/// whose behavior may be affected if the target changes. Inline Datalog
+/// because `query.rs` types use `u64` ids while our edge source/target
+/// columns are strings.
+fn run_impact_query(
+    store: &CozoStore,
+    node_id: &str,
+    max_depth: u32,
+) -> Result<Vec<String>, RpcError> {
+    // Lowercase edge kinds match what `owner::edge_kind_for_ref` emits.
+    // The `edge` relation has 5 columns (source, kind, target, provenance,
+    // confidence); the wildcards `_p, _c` bind the two we don't filter on.
+    let unbounded = "\
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'calls'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'inherits'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'implements'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'references'
+affected[node] := impact_edge[node, $target]
+affected[node] := affected[downstream], impact_edge[node, downstream]
+?[node] := affected[node]
+:sort node\n";
+    let bounded = "\
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'calls'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'inherits'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'implements'
+impact_edge[from, to] := *edge[from, kind, to, _p, _c], kind = 'references'
+affected[node, depth] := impact_edge[node, $target], depth = 1
+affected[node, depth] := affected[downstream, prev], prev < $max, \
+                        impact_edge[node, downstream], depth = prev + 1
+?[node] := affected[node, _]
+:sort node\n";
+
+    let mut params: BTreeMap<String, cozo::DataValue> = BTreeMap::new();
+    params.insert("target".into(), cozo::DataValue::from(node_id));
+    let script = if max_depth == 0 {
+        unbounded
+    } else {
+        params.insert(
+            "max".into(),
+            cozo::DataValue::from(i64::from(max_depth)),
+        );
+        bounded
+    };
+    let rows = store.run_read(script, params).map_err(|err| RpcError {
+        code: -32603,
+        message: format!("impact query failed: {err}"),
+    })?;
+    let mut out: Vec<String> = rows
+        .rows
+        .into_iter()
+        .filter_map(|row| match row.into_iter().next() {
+            Some(cozo::DataValue::Str(s)) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 #[derive(Debug, Serialize)]
 struct RpcError {
     code: i32,
@@ -253,19 +476,38 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    fn empty_setup() -> (Arc<HotIndexes>, Arc<DaemonStatus>) {
-        (Arc::new(HotIndexes::new()), Arc::new(DaemonStatus::new()))
+    fn empty_setup() -> (
+        Arc<HotIndexes>,
+        Arc<DaemonStatus>,
+        PathBuf,
+        Arc<CozoStore>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cozo_dir = tmp.path().join("cozo");
+        std::fs::create_dir_all(&cozo_dir).unwrap();
+        let store = Arc::new(CozoStore::open(&cozo_dir).unwrap());
+        // Keep the tempdir alive for the duration of the test by leaking it —
+        // the path is only used by `store` which already opened the DB.
+        let worktree_root = tmp.keep();
+        (
+            Arc::new(HotIndexes::new()),
+            Arc::new(DaemonStatus::new()),
+            worktree_root,
+            store,
+        )
     }
 
     async fn run_request(
         indexes: Arc<HotIndexes>,
         status: Arc<DaemonStatus>,
+        worktree_root: PathBuf,
+        store: Arc<CozoStore>,
         request: &str,
     ) -> Value {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
-        let handler = WorktreeHandler::new(indexes, status);
+        let handler = WorktreeHandler::new(indexes, status, worktree_root, store);
 
         let server = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.unwrap();
@@ -288,11 +530,13 @@ mod tests {
 
     #[tokio::test]
     async fn find_symbol_returns_empty_for_unknown() {
-        let (indexes, status) = empty_setup();
+        let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
         let resp = run_request(
             indexes,
             status,
+            root,
+            store,
             r#"{"jsonrpc":"2.0","id":1,"method":"find_symbol","params":{"name":"Nothing"}}"#,
         )
         .await;
@@ -304,11 +548,13 @@ mod tests {
 
     #[tokio::test]
     async fn meta_reports_catching_up_before_initial_reconcile() {
-        let (indexes, status) = empty_setup();
+        let (indexes, status, root, store) = empty_setup();
         // status.mark_reconcile_done() intentionally NOT called.
         let resp = run_request(
             indexes,
             status,
+            root,
+            store,
             r#"{"jsonrpc":"2.0","id":2,"method":"find_symbol","params":{"name":"X"}}"#,
         )
         .await;
@@ -317,12 +563,14 @@ mod tests {
 
     #[tokio::test]
     async fn meta_catching_up_is_per_file_for_nodes_in_file() {
-        let (indexes, status) = empty_setup();
+        let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
         status.mark_pending(std::path::Path::new("src/dirty.rs"));
         let resp = run_request(
             indexes,
             status,
+            root,
+            store,
             r#"{"jsonrpc":"2.0","id":3,"method":"nodes_in_file","params":{"path":"src/clean.rs"}}"#,
         )
         .await;
@@ -334,12 +582,14 @@ mod tests {
 
     #[tokio::test]
     async fn meta_catching_up_true_when_queried_path_is_pending() {
-        let (indexes, status) = empty_setup();
+        let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
         status.mark_pending(std::path::Path::new("src/dirty.rs"));
         let resp = run_request(
             indexes,
             status,
+            root,
+            store,
             r#"{"jsonrpc":"2.0","id":4,"method":"nodes_in_file","params":{"path":"src/dirty.rs"}}"#,
         )
         .await;
@@ -348,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_symbol_returns_registered_node() {
-        let (indexes, status) = empty_setup();
+        let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
         let id = NodeId::from("h:42");
         indexes.insert_node(NodeRecord {
@@ -369,6 +619,8 @@ mod tests {
         let resp = run_request(
             indexes,
             status,
+            root,
+            store,
             r#"{"jsonrpc":"2.0","id":7,"method":"find_symbol","params":{"name":"User"}}"#,
         )
         .await;
@@ -380,15 +632,104 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_returns_jsonrpc_error_with_meta() {
-        let (indexes, status) = empty_setup();
+        let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
         let resp = run_request(
             indexes,
             status,
+            root,
+            store,
             r#"{"jsonrpc":"2.0","id":9,"method":"bogus","params":{}}"#,
         )
         .await;
         assert_eq!(resp["error"]["code"], -32601);
         assert!(resp["meta"]["rss_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn status_tool_reports_counts() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let id = NodeId::from("h:1");
+        indexes.insert_node(NodeRecord {
+            id: id.clone(),
+            path: PathBuf::from("src/a.rs"),
+            kind: "function".to_string(),
+            name: "f".to_string(),
+            qname: "f".to_string(),
+        });
+        indexes.insert_file(PathBuf::from("src/a.rs"), vec![id]);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":10,"method":"status","params":{}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["files"], 1);
+        assert_eq!(resp["result"]["nodes"], 1);
+        assert_eq!(resp["result"]["reconcile_done"], true);
+    }
+
+    #[tokio::test]
+    async fn files_tool_lists_indexed_paths() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        indexes.insert_file(PathBuf::from("src/a.rs"), vec![]);
+        indexes.insert_file(PathBuf::from("src/b.rs"), vec![]);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":11,"method":"files","params":{}}"#,
+        )
+        .await;
+        let files = resp["result"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        // List is sorted for determinism.
+        assert_eq!(files[0], "src/a.rs");
+        assert_eq!(files[1], "src/b.rs");
+    }
+
+    #[tokio::test]
+    async fn node_tool_returns_record_for_known_id() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let id = NodeId::from("h:99");
+        indexes.insert_node(NodeRecord {
+            id: id.clone(),
+            path: PathBuf::from("src/x.rs"),
+            kind: "class".to_string(),
+            name: "X".to_string(),
+            qname: "ns::X".to_string(),
+        });
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":12,"method":"node","params":{"node_id":"h:99"}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["node"]["node_id"], "h:99");
+        assert_eq!(resp["result"]["node"]["kind"], "class");
+        assert_eq!(resp["result"]["node"]["qname"], "ns::X");
+    }
+
+    #[tokio::test]
+    async fn node_tool_returns_null_for_unknown_id() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":13,"method":"node","params":{"node_id":"unknown"}}"#,
+        )
+        .await;
+        assert!(resp["result"]["node"].is_null());
     }
 }

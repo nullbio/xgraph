@@ -114,6 +114,12 @@ pub enum FrameworkEdgeKind {
     ServiceBinding,
     EventListener,
     JobDispatch,
+    /// `@extends('layouts.app')` in a Blade template.
+    BladeExtendsView,
+    /// `@include`, `@includeIf`, `@each`, ... in a Blade template.
+    BladeIncludesView,
+    /// `@component('alert')` or `<x-alert />` in a Blade template.
+    BladeUsesComponent,
 }
 
 /// A framework edge with mandatory provenance and confidence.
@@ -199,6 +205,117 @@ pub fn resolve(inputs: &[PhpExtractInput]) -> LaravelFacts {
     }
 
     facts
+}
+
+/// Kinds of reference a Blade template surfaces to the framework resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BladeRefKind {
+    /// `@extends('layouts.app')` — the template inherits from another view.
+    ExtendsView,
+    /// `@include('partials.header')` and friends — the template embeds
+    /// another view at render time.
+    IncludesView,
+    /// `@component('alert')` — explicit component invocation.
+    Component,
+    /// `<x-alert />` — anonymous component or class component invocation.
+    XComponent,
+}
+
+/// A single reference extracted from a Blade template that the framework
+/// resolver may interpret. `value` carries the literal payload (view name,
+/// component name) as written in the template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BladeRef {
+    pub kind: BladeRefKind,
+    pub value: String,
+    pub span: Span,
+}
+
+/// Per-file input bundle for Blade-driven framework resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BladeExtractInput {
+    /// Worktree-relative path of the template (e.g.
+    /// `resources/views/users/index.blade.php`).
+    pub path: PathBuf,
+    pub refs: Vec<BladeRef>,
+}
+
+/// Resolve Laravel framework facts from Blade templates. Each template
+/// becomes a `view.<dotted>` node and emits one framework edge per Blade
+/// ref that names another view or component. Confidence is `High` because
+/// Blade syntax leaves no ambiguity about what's being referenced.
+pub fn resolve_blade(inputs: &[BladeExtractInput]) -> LaravelFacts {
+    let mut facts = LaravelFacts::default();
+    for input in inputs {
+        let Some(from_qname) = blade_view_qname_from_path(&input.path) else {
+            continue;
+        };
+        for r in &input.refs {
+            let (kind, to_qname) = match r.kind {
+                BladeRefKind::ExtendsView => (
+                    FrameworkEdgeKind::BladeExtendsView,
+                    format!("view.{}", r.value),
+                ),
+                BladeRefKind::IncludesView => (
+                    FrameworkEdgeKind::BladeIncludesView,
+                    format!("view.{}", r.value),
+                ),
+                BladeRefKind::Component | BladeRefKind::XComponent => (
+                    FrameworkEdgeKind::BladeUsesComponent,
+                    format!("component.{}", r.value),
+                ),
+            };
+            facts.edges.push(FrameworkEdge {
+                from_qname: from_qname.clone(),
+                to_qname,
+                kind,
+                provenance: Provenance::LaravelHeuristic,
+                confidence: Confidence::High,
+            });
+        }
+    }
+    facts
+}
+
+/// Map a worktree-relative Blade template path to its canonical view qname:
+/// `resources/views/users/index.blade.php` → `view.users.index`.
+/// Returns `None` for files outside the standard `resources/views/` tree.
+pub fn blade_view_qname_from_path(path: &std::path::Path) -> Option<String> {
+    let mut comps = path.components();
+    // Look for the `resources/views/` prefix; the dotted name is the
+    // remainder with the `.blade.php` extension stripped.
+    let mut found_resources = false;
+    let mut found_views = false;
+    let mut tail: Vec<String> = Vec::new();
+    for comp in comps.by_ref() {
+        let part = comp.as_os_str().to_str()?;
+        match (found_resources, found_views) {
+            (false, _) if part == "resources" => found_resources = true,
+            (true, false) if part == "views" => found_views = true,
+            (true, true) => tail.push(part.to_owned()),
+            _ => {
+                // Reset if `resources` appeared mid-path without a following `views`.
+                if !found_views {
+                    found_resources = false;
+                }
+            }
+        }
+    }
+    if !found_views || tail.is_empty() {
+        return None;
+    }
+    let last_idx = tail.len() - 1;
+    let last = &tail[last_idx];
+    let stripped = last
+        .strip_suffix(".blade.php")
+        .or_else(|| last.strip_suffix(".php"))
+        .unwrap_or(last);
+    let mut dotted = tail[..last_idx].join(".");
+    if !dotted.is_empty() && !stripped.is_empty() {
+        dotted.push('.');
+    }
+    dotted.push_str(stripped);
+    Some(format!("view.{dotted}"))
 }
 
 fn classify(php_ref: &PhpRef, facts: &mut LaravelFacts) {
@@ -1111,5 +1228,110 @@ mod tests {
         for edge in &facts.edges {
             assert_eq!(edge.provenance, Provenance::LaravelHeuristic);
         }
+    }
+
+    fn blade_input(path: &str, refs: Vec<BladeRef>) -> Vec<BladeExtractInput> {
+        vec![BladeExtractInput {
+            path: PathBuf::from(path),
+            refs,
+        }]
+    }
+
+    fn blade_ref(kind: BladeRefKind, value: &str) -> BladeRef {
+        BladeRef {
+            kind,
+            value: value.to_owned(),
+            span: span(),
+        }
+    }
+
+    #[test]
+    fn blade_view_qname_from_resources_views() {
+        assert_eq!(
+            blade_view_qname_from_path(std::path::Path::new(
+                "resources/views/users/index.blade.php"
+            )),
+            Some("view.users.index".to_string())
+        );
+        assert_eq!(
+            blade_view_qname_from_path(std::path::Path::new("resources/views/layout.blade.php")),
+            Some("view.layout".to_string())
+        );
+    }
+
+    #[test]
+    fn blade_view_qname_returns_none_outside_views_tree() {
+        assert_eq!(
+            blade_view_qname_from_path(std::path::Path::new("app/Http/Controllers/X.php")),
+            None
+        );
+        assert_eq!(
+            blade_view_qname_from_path(std::path::Path::new("resources/lang/en.php")),
+            None
+        );
+    }
+
+    #[test]
+    fn blade_extends_emits_extends_edge() {
+        let facts = resolve_blade(&blade_input(
+            "resources/views/users/index.blade.php",
+            vec![blade_ref(BladeRefKind::ExtendsView, "layouts.app")],
+        ));
+        let edge = only_edge(&facts);
+        assert_heuristic(edge);
+        assert_eq!(edge.from_qname, "view.users.index");
+        assert_eq!(edge.to_qname, "view.layouts.app");
+        assert_eq!(edge.kind, FrameworkEdgeKind::BladeExtendsView);
+        assert_eq!(edge.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn blade_include_emits_include_edge() {
+        let facts = resolve_blade(&blade_input(
+            "resources/views/users/index.blade.php",
+            vec![blade_ref(BladeRefKind::IncludesView, "partials.header")],
+        ));
+        let edge = only_edge(&facts);
+        assert_heuristic(edge);
+        assert_eq!(edge.to_qname, "view.partials.header");
+        assert_eq!(edge.kind, FrameworkEdgeKind::BladeIncludesView);
+    }
+
+    #[test]
+    fn blade_component_emits_uses_component_edge() {
+        let facts = resolve_blade(&blade_input(
+            "resources/views/layout.blade.php",
+            vec![
+                blade_ref(BladeRefKind::Component, "alert"),
+                blade_ref(BladeRefKind::XComponent, "card.body"),
+            ],
+        ));
+        assert_eq!(facts.edges.len(), 2);
+        assert!(
+            facts
+                .edges
+                .iter()
+                .any(|e| e.kind == FrameworkEdgeKind::BladeUsesComponent
+                    && e.to_qname == "component.alert")
+        );
+        assert!(
+            facts
+                .edges
+                .iter()
+                .any(|e| e.kind == FrameworkEdgeKind::BladeUsesComponent
+                    && e.to_qname == "component.card.body")
+        );
+    }
+
+    #[test]
+    fn blade_input_outside_views_tree_emits_no_edges() {
+        let facts = resolve_blade(&blade_input(
+            "app/templates/foo.blade.php",
+            vec![blade_ref(BladeRefKind::ExtendsView, "layouts.app")],
+        ));
+        assert!(
+            facts.edges.is_empty(),
+            "blade templates outside resources/views/ must not synthesize view edges"
+        );
     }
 }

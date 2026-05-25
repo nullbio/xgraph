@@ -7,8 +7,9 @@ use crate::extract::{ExtractedFile, LocalNodeId, LocalRefId, Node, Position, Ref
 use crate::language::{LanguageId, LanguagePlugin, LanguageQueries};
 
 use super::javascript::{
-    callee_label, collect_diagnostics, declaration_name, is_component_name, is_require_call,
-    slice_text, strip_string_quotes, variable_kind_from_declarator, walk_tree,
+    ContainerRange, callee_label, collect_diagnostics, declaration_name, emit_named_import_bindings,
+    enclosing_def, is_component_name, is_require_call, slice_text, strip_string_quotes,
+    variable_kind_from_declarator, walk_tree,
 };
 
 const KIND_CLASS: &str = "class";
@@ -259,11 +260,26 @@ fn extract_into(flavor: TsFlavor, tree: &Tree, source: &[u8], out: &mut Extracte
     let root = tree.root_node();
     let mut node_id: LocalNodeId = 0;
     let mut ref_id: LocalRefId = 0;
-    collect_definitions(flavor, &root, source, &mut out.nodes, &mut node_id);
+    let mut container_ranges: Vec<ContainerRange> = Vec::new();
+    collect_definitions(
+        flavor,
+        &root,
+        source,
+        &mut out.nodes,
+        &mut node_id,
+        &mut container_ranges,
+    );
     collect_imports(flavor, &root, source, &mut out.refs, &mut ref_id);
     collect_exports(flavor, &root, source, &mut out.refs, &mut ref_id);
-    collect_calls_and_jsx(flavor, root, source, &mut out.refs, &mut ref_id);
-    collect_type_references(root, source, &mut out.refs, &mut ref_id);
+    collect_calls_and_jsx(
+        flavor,
+        root,
+        source,
+        &mut out.refs,
+        &mut ref_id,
+        &container_ranges,
+    );
+    collect_type_references(root, source, &mut out.refs, &mut ref_id, &container_ranges);
     collect_diagnostics(root, &mut out.diagnostics);
 }
 
@@ -273,6 +289,7 @@ fn collect_definitions(
     source: &[u8],
     out: &mut Vec<Node>,
     next_id: &mut LocalNodeId,
+    container_ranges: &mut Vec<ContainerRange>,
 ) {
     let query = definitions_query(flavor);
     let mut cursor = QueryCursor::new();
@@ -318,13 +335,14 @@ fn collect_definitions(
         if let (Some(kind), Some(name), Some(node)) = (kind, name, def_node) {
             let id = *next_id;
             *next_id += 1;
+            container_ranges.push((node.start_byte(), node.end_byte(), id));
             out.push(Node {
                 id,
                 kind: kind.to_owned(),
                 qname: name.clone(),
                 name,
                 span: span_from_node(node),
-                parent: None,
+                parent: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
             });
         }
     }
@@ -357,7 +375,7 @@ fn collect_imports(
         }
         if let (Some(src), Some(stmt)) = (esm_source, esm_stmt) {
             let raw = slice_text(source, src);
-            let name = strip_string_quotes(&raw).to_owned();
+            let module_name = strip_string_quotes(&raw).to_owned();
             let id = *next_id;
             *next_id += 1;
             out.push(Ref {
@@ -365,10 +383,11 @@ fn collect_imports(
                 kind: REF_IMPORT_ESM.to_owned(),
                 qname: None,
                 alias: None,
-                name,
+                name: module_name.clone(),
                 span: span_from_node(stmt),
                 container: None,
             });
+            emit_named_import_bindings(stmt, source, &module_name, out, next_id);
         }
         if let (Some(func), Some(src)) = (cjs_fn, cjs_source) {
             let fn_name = slice_text(source, func);
@@ -487,6 +506,7 @@ fn collect_calls_and_jsx(
     source: &[u8],
     out: &mut Vec<Ref>,
     next_id: &mut LocalRefId,
+    container_ranges: &[ContainerRange],
 ) {
     walk_tree(root, |node| match node.kind() {
         "call_expression" => {
@@ -504,7 +524,11 @@ fn collect_calls_and_jsx(
                         alias: None,
                         name,
                         span: span_from_node(node),
-                        container: None,
+                        container: enclosing_def(
+                            container_ranges,
+                            node.start_byte(),
+                            node.end_byte(),
+                        ),
                     });
                 }
             }
@@ -520,7 +544,11 @@ fn collect_calls_and_jsx(
                     alias: None,
                     name: slice_text(source, prop),
                     span: span_from_node(node),
-                    container: None,
+                    container: enclosing_def(
+                        container_ranges,
+                        node.start_byte(),
+                        node.end_byte(),
+                    ),
                 });
             }
         }
@@ -539,7 +567,11 @@ fn collect_calls_and_jsx(
                         alias: None,
                         name: text,
                         span: span_from_node(node),
-                        container: None,
+                        container: enclosing_def(
+                            container_ranges,
+                            node.start_byte(),
+                            node.end_byte(),
+                        ),
                     });
                 }
             }
@@ -553,6 +585,7 @@ fn collect_type_references(
     source: &[u8],
     out: &mut Vec<Ref>,
     next_id: &mut LocalRefId,
+    container_ranges: &[ContainerRange],
 ) {
     walk_tree(root, |node| {
         if node.kind() == "type_identifier" && !is_definition_name(node) {
@@ -565,7 +598,7 @@ fn collect_type_references(
                 alias: None,
                 name: slice_text(source, node),
                 span: span_from_node(node),
-                container: None,
+                container: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
             });
         }
     });

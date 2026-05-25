@@ -281,6 +281,38 @@ impl HotIndexes {
         self.files.read().get(path).cloned().unwrap_or_default()
     }
 
+    /// All indexed file paths in deterministic (sorted) order. Used by the
+    /// `files` MCP tool to enumerate the daemon's view of the worktree.
+    pub fn list_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self.files.read().keys().cloned().collect();
+        files.sort();
+        files
+    }
+
+    /// Number of indexed files. O(1).
+    pub fn file_count(&self) -> usize {
+        self.files.read().len()
+    }
+
+    /// Number of active nodes across all files. O(1).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of distinct (name, kind) symbol keys. O(1).
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+
+    /// Number of `caller -> [callees]` entries — proxy for call-edge density.
+    pub fn call_edge_count(&self) -> usize {
+        self.callees
+            .read()
+            .values()
+            .map(|targets| targets.len())
+            .sum()
+    }
+
     pub fn remove_file(&self, path: &Path) -> Vec<NodeId> {
         self.files.write().remove(path).unwrap_or_default()
     }

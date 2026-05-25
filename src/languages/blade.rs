@@ -265,9 +265,15 @@ impl Extractor {
     fn handle_inline_directive(&mut self, node: TsNode<'_>, source: &[u8]) {
         let directive_text = node_text(node, source);
         let directive_name = directive_text.trim();
+        // Differentiate `@extends` from `@include` so framework resolvers
+        // can emit distinct edge kinds. Both used to share `blade_view`;
+        // splitting them preserves all `@include`-style directives under
+        // the existing kind so existing consumers that look for `blade_view`
+        // continue to see one ref per template inclusion.
         let ref_kind = match directive_name {
-            "@extends" | "@include" | "@includeIf" | "@includeWhen" | "@includeUnless"
-            | "@includeFirst" | "@each" => "blade_view",
+            "@extends" => "blade_extends",
+            "@include" | "@includeIf" | "@includeWhen" | "@includeUnless" | "@includeFirst"
+            | "@each" => "blade_view",
             "@yield" => "blade_section_ref",
             "@stack" => "blade_stack_ref",
             _ => return,
@@ -508,7 +514,7 @@ mod tests {
             extracted.diagnostics
         );
         assert!(
-            find_ref(&extracted.refs, "blade_view", "layouts.app").is_some(),
+            find_ref(&extracted.refs, "blade_extends", "layouts.app").is_some(),
             "missing @extends ref; refs={:?}",
             extracted.refs
         );

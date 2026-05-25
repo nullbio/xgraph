@@ -16,6 +16,9 @@ const KIND_VARIABLE: &str = "variable";
 
 const REF_IMPORT_ESM: &str = "import_esm";
 const REF_IMPORT_CJS: &str = "import_cjs";
+pub(super) const REF_IMPORT_NAMED: &str = "import_named";
+pub(super) const REF_IMPORT_DEFAULT: &str = "import_default";
+pub(super) const REF_IMPORT_NAMESPACE: &str = "import_namespace";
 const REF_EXPORT_ESM: &str = "export_esm";
 const REF_EXPORT_CJS: &str = "export_cjs";
 const REF_CALL: &str = "call";
@@ -176,11 +179,44 @@ fn extract_into(tree: &Tree, source: &[u8], out: &mut ExtractedFile) {
     let root = tree.root_node();
     let mut node_id: LocalNodeId = 0;
     let mut ref_id: LocalRefId = 0;
-    collect_definitions(&root, source, &mut out.nodes, &mut node_id);
+    let mut container_ranges: Vec<ContainerRange> = Vec::new();
+    collect_definitions(&root, source, &mut out.nodes, &mut node_id, &mut container_ranges);
     collect_imports(&root, source, &mut out.refs, &mut ref_id);
     collect_exports(&root, source, &mut out.refs, &mut ref_id);
-    collect_calls_and_jsx(root, source, &mut out.refs, &mut ref_id);
+    collect_calls_and_jsx(
+        root,
+        source,
+        &mut out.refs,
+        &mut ref_id,
+        &container_ranges,
+    );
     collect_diagnostics(root, &mut out.diagnostics);
+}
+
+/// `(start_byte, end_byte, local_id)` for each top-level / nested definition,
+/// used to attribute refs (calls, member accesses, JSX components, type refs)
+/// to their enclosing function/class/method.
+pub(super) type ContainerRange = (usize, usize, crate::extract::LocalNodeId);
+
+/// Walk `container_ranges` and return the smallest enclosing definition's
+/// local id, or `None` if `(start, end)` is at module top-level. Smallest
+/// scope wins ties so a method is picked over its enclosing class. Mirrors
+/// PHP's `enclosing_definition_local_id_v2`.
+pub(super) fn enclosing_def(
+    container_ranges: &[ContainerRange],
+    start: usize,
+    end: usize,
+) -> Option<crate::extract::LocalNodeId> {
+    let mut best: Option<(usize, crate::extract::LocalNodeId)> = None;
+    for &(c_start, c_end, id) in container_ranges {
+        if c_start <= start && c_end >= end && (c_start < start || c_end > end) {
+            let span = c_end - c_start;
+            if best.as_ref().is_none_or(|(s, _)| span < *s) {
+                best = Some((span, id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 pub(super) fn span_from_node(node: TsNode<'_>) -> Span {
@@ -222,6 +258,7 @@ fn collect_definitions(
     source: &[u8],
     out: &mut Vec<Node>,
     next_id: &mut LocalNodeId,
+    container_ranges: &mut Vec<ContainerRange>,
 ) {
     let query = definitions_query();
     let mut cursor = QueryCursor::new();
@@ -259,13 +296,14 @@ fn collect_definitions(
         if let (Some(kind), Some(name), Some(node)) = (kind, name, def_node) {
             let id = *next_id;
             *next_id += 1;
+            container_ranges.push((node.start_byte(), node.end_byte(), id));
             out.push(Node {
                 id,
                 kind: kind.to_owned(),
                 qname: name.clone(),
                 name,
                 span: span_from_node(node),
-                parent: None,
+                parent: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
             });
         }
     }
@@ -304,7 +342,8 @@ fn collect_imports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id
         }
         if let (Some(src), Some(stmt)) = (esm_source, esm_stmt) {
             let raw = slice_text(source, src);
-            let name = strip_string_quotes(&raw).to_owned();
+            let module_name = strip_string_quotes(&raw).to_owned();
+            // Module-level ref: drives the file→file `imports` edge.
             let id = *next_id;
             *next_id += 1;
             out.push(Ref {
@@ -312,10 +351,15 @@ fn collect_imports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id
                 kind: REF_IMPORT_ESM.to_owned(),
                 qname: None,
                 alias: None,
-                name,
+                name: module_name.clone(),
                 span: span_from_node(stmt),
                 container: None,
             });
+            // Per-binding refs: drive cross-file edges from this file's
+            // call/usage sites to the actual exported symbol. The owner's
+            // `rewrite_imports` pass rewrites `qname` to a composite
+            // `<resolved_path>#<symbol>` key matched in the symbol table.
+            emit_named_import_bindings(stmt, source, &module_name, out, next_id);
         }
         if let (Some(func), Some(src)) = (cjs_fn, cjs_source) {
             let fn_name = slice_text(source, func);
@@ -336,6 +380,127 @@ fn collect_imports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id
             }
         }
     }
+}
+
+/// Walk an `import_statement` node and push one Ref per binding (default,
+/// namespace, named). `module_name` is the raw module string from the
+/// `from '...'` clause; it is carried through `qname` so the owner's
+/// resolver pass can rewrite it to a project-relative path.
+pub(super) fn emit_named_import_bindings(
+    stmt: TsNode<'_>,
+    source: &[u8],
+    module_name: &str,
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
+    let mut cursor = stmt.walk();
+    for child in stmt.named_children(&mut cursor) {
+        if child.kind() == "import_clause" {
+            walk_import_clause(child, source, module_name, out, next_id);
+        }
+    }
+}
+
+fn walk_import_clause(
+    clause: TsNode<'_>,
+    source: &[u8],
+    module_name: &str,
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
+    let mut cursor = clause.walk();
+    for child in clause.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                // Default import: `import Foo from 'mod'`
+                let local = slice_text(source, child);
+                push_binding(
+                    out,
+                    next_id,
+                    REF_IMPORT_DEFAULT,
+                    "default",
+                    Some(&local),
+                    child,
+                    module_name,
+                );
+            }
+            "namespace_import" => {
+                // `import * as ns from 'mod'`
+                let mut ns_cursor = child.walk();
+                let alias = child
+                    .named_children(&mut ns_cursor)
+                    .find(|c| c.kind() == "identifier")
+                    .map(|c| slice_text(source, c));
+                push_binding(
+                    out,
+                    next_id,
+                    REF_IMPORT_NAMESPACE,
+                    "*",
+                    alias.as_deref(),
+                    child,
+                    module_name,
+                );
+            }
+            "named_imports" => {
+                let mut spec_cursor = child.walk();
+                for spec in child.named_children(&mut spec_cursor) {
+                    if spec.kind() == "import_specifier" {
+                        push_named_specifier(spec, source, module_name, out, next_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_named_specifier(
+    spec: TsNode<'_>,
+    source: &[u8],
+    module_name: &str,
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
+    let Some(name_node) = spec.child_by_field_name("name") else {
+        return;
+    };
+    let symbol = slice_text(source, name_node);
+    let alias = spec
+        .child_by_field_name("alias")
+        .map(|n| slice_text(source, n));
+    push_binding(
+        out,
+        next_id,
+        REF_IMPORT_NAMED,
+        &symbol,
+        alias.as_deref(),
+        spec,
+        module_name,
+    );
+}
+
+fn push_binding(
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+    kind: &str,
+    symbol: &str,
+    alias: Option<&str>,
+    span_node: TsNode<'_>,
+    module_name: &str,
+) {
+    let id = *next_id;
+    *next_id += 1;
+    out.push(Ref {
+        id,
+        kind: kind.to_owned(),
+        // qname carries the module source unchanged out of the extractor;
+        // the owner's rewrite pass turns it into `<resolved>#<symbol>`.
+        qname: Some(module_name.to_owned()),
+        alias: alias.map(str::to_owned),
+        name: symbol.to_owned(),
+        span: span_from_node(span_node),
+        container: None,
+    });
 }
 
 fn collect_exports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id: &mut LocalRefId) {
@@ -451,8 +616,11 @@ pub(super) fn collect_calls_and_jsx(
     source: &[u8],
     out: &mut Vec<Ref>,
     next_id: &mut LocalRefId,
+    container_ranges: &[ContainerRange],
 ) {
-    walk_tree(root, |node| visit_call_or_jsx(node, source, out, next_id));
+    walk_tree(root, |node| {
+        visit_call_or_jsx(node, source, out, next_id, container_ranges)
+    });
 }
 
 fn visit_call_or_jsx(
@@ -460,6 +628,7 @@ fn visit_call_or_jsx(
     source: &[u8],
     out: &mut Vec<Ref>,
     next_id: &mut LocalRefId,
+    container_ranges: &[ContainerRange],
 ) {
     match node.kind() {
         "call_expression" => {
@@ -477,7 +646,11 @@ fn visit_call_or_jsx(
                         alias: None,
                         name,
                         span: span_from_node(node),
-                        container: None,
+                        container: enclosing_def(
+                            container_ranges,
+                            node.start_byte(),
+                            node.end_byte(),
+                        ),
                     });
                 }
             }
@@ -494,7 +667,11 @@ fn visit_call_or_jsx(
                     alias: None,
                     name,
                     span: span_from_node(node),
-                    container: None,
+                    container: enclosing_def(
+                        container_ranges,
+                        node.start_byte(),
+                        node.end_byte(),
+                    ),
                 });
             }
         }
@@ -511,7 +688,11 @@ fn visit_call_or_jsx(
                         alias: None,
                         name: text,
                         span: span_from_node(node),
-                        container: None,
+                        container: enclosing_def(
+                            container_ranges,
+                            node.start_byte(),
+                            node.end_byte(),
+                        ),
                     });
                 }
             }

@@ -58,6 +58,11 @@ struct Extractor<'a> {
     source: &'a [u8],
     next_node_id: u32,
     next_ref_id: u32,
+    /// `(start_byte, end_byte, local_id)` for each top-level / nested def.
+    /// Used by `enclosing_def` so call refs and decorator refs get
+    /// attributed to their containing function/class instead of dropping
+    /// out at edge-resolution time.
+    container_ranges: Vec<(usize, usize, LocalNodeId)>,
 }
 
 impl<'a> Extractor<'a> {
@@ -70,7 +75,21 @@ impl<'a> Extractor<'a> {
             source,
             next_node_id: 0,
             next_ref_id: 0,
+            container_ranges: Vec::new(),
         }
+    }
+
+    fn enclosing_def(&self, start: usize, end: usize) -> Option<LocalNodeId> {
+        let mut best: Option<(usize, LocalNodeId)> = None;
+        for &(c_start, c_end, id) in &self.container_ranges {
+            if c_start <= start && c_end >= end && (c_start < start || c_end > end) {
+                let span = c_end - c_start;
+                if best.as_ref().is_none_or(|(s, _)| span < *s) {
+                    best = Some((span, id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     fn push_node(
@@ -80,9 +99,11 @@ impl<'a> Extractor<'a> {
         qname: String,
         span: Span,
         parent: Option<LocalNodeId>,
+        byte_range: (usize, usize),
     ) -> LocalNodeId {
         let id = self.next_node_id;
         self.next_node_id += 1;
+        self.container_ranges.push((byte_range.0, byte_range.1, id));
         self.out.nodes.push(Node {
             id,
             kind: kind.to_string(),
@@ -332,13 +353,16 @@ fn collect_decorated(extractor: &mut Extractor<'_>, node: TsNode<'_>, parent: Op
         if child.kind() == "decorator" {
             let expr_text = decorator_expression_text(child, extractor.source);
             if !expr_text.is_empty() {
+                let container = def_id.or_else(|| {
+                    extractor.enclosing_def(child.start_byte(), child.end_byte())
+                });
                 extractor.push_ref(
                     "decorator",
                     expr_text,
                     None,
                     None,
                     span_from_node(child),
-                    def_id,
+                    container,
                 );
             }
         }
@@ -367,7 +391,14 @@ fn collect_class(
     let qname = qualified_name(node, &name, extractor.source);
     let span = span_from_node(node);
 
-    let id = extractor.push_node("class", name, qname, span, parent);
+    let id = extractor.push_node(
+        "class",
+        name,
+        qname,
+        span,
+        parent,
+        (node.start_byte(), node.end_byte()),
+    );
 
     if let Some(superclasses) = node.child_by_field_name("superclasses") {
         let mut cursor = superclasses.walk();
@@ -427,7 +458,14 @@ fn collect_function(
     let qname = qualified_name(node, &name, extractor.source);
     let span = span_from_node(node);
 
-    extractor.push_node(kind, name, qname, span, parent)
+    extractor.push_node(
+        kind,
+        name,
+        qname,
+        span,
+        parent,
+        (node.start_byte(), node.end_byte()),
+    )
 }
 
 fn qualified_name(node: TsNode<'_>, leaf: &str, source: &[u8]) -> String {
@@ -474,7 +512,14 @@ fn collect_module_constants(extractor: &mut Extractor<'_>, root: TsNode<'_>) {
                 continue;
             }
             let qname = name.clone();
-            extractor.push_node("constant", name, qname, span_from_node(stmt), None);
+            extractor.push_node(
+                "constant",
+                name,
+                qname,
+                span_from_node(stmt),
+                None,
+                (stmt.start_byte(), stmt.end_byte()),
+            );
         }
     }
 }
@@ -498,7 +543,15 @@ fn walk_for_calls(extractor: &mut Extractor<'_>, root: TsNode<'_>) {
             let chain = member_chain(callee, extractor.source);
             if !chain.is_empty() {
                 let display = chain.join(".");
-                extractor.push_ref("call", display, None, None, span_from_node(node), None);
+                let container = extractor.enclosing_def(node.start_byte(), node.end_byte());
+                extractor.push_ref(
+                    "call",
+                    display,
+                    None,
+                    None,
+                    span_from_node(node),
+                    container,
+                );
             }
         }
 

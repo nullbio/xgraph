@@ -10,12 +10,19 @@
 //! walks the tree once looking for `__init__.py` markers.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Resolves TypeScript / JavaScript import strings against `tsconfig.json`
-/// `compilerOptions.paths` aliases.
+/// Resolves TypeScript / JavaScript import strings to a worktree-relative
+/// module path. Handles two distinct forms:
+///
+/// 1. **Relative imports** (`./foo`, `../shared/bar`) — joined against the
+///    importing file's directory and normalized.
+/// 2. **Aliased imports** (`@/utils`, `~/lib/x`) — resolved through
+///    `tsconfig.json` `compilerOptions.paths`.
+///
+/// Bare package imports (`react`, `lodash`) are external and return `None`.
 #[derive(Debug, Default)]
 pub struct TsAliasResolver {
     base_url: PathBuf,
@@ -23,36 +30,50 @@ pub struct TsAliasResolver {
 }
 
 impl TsAliasResolver {
-    /// Build a resolver from the worktree's root `tsconfig.json`. Returns
-    /// `None` if no tsconfig exists or it has no `paths` configuration.
-    pub fn from_worktree(root: &Path) -> Option<Self> {
+    /// Build a resolver from the worktree's root `tsconfig.json`. Always
+    /// returns a usable resolver — relative-import resolution works even
+    /// when the project has no tsconfig.
+    pub fn from_worktree(root: &Path) -> Self {
         let path = root.join("tsconfig.json");
-        let text = std::fs::read_to_string(&path).ok()?;
-        // tsconfig.json frequently has comments / trailing commas. We attempt
-        // a strict parse; if that fails, strip line comments and retry once.
-        let parsed: TsConfig = serde_json::from_str(&text)
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self {
+                base_url: root.to_path_buf(),
+                aliases: Vec::new(),
+            };
+        };
+        let Some(parsed): Option<TsConfig> = serde_json::from_str(&text)
             .or_else(|_| serde_json::from_str(&strip_jsonc(&text)))
-            .ok()?;
-        let opts = parsed.compiler_options?;
+            .ok()
+        else {
+            return Self {
+                base_url: root.to_path_buf(),
+                aliases: Vec::new(),
+            };
+        };
+        let opts = parsed.compiler_options.unwrap_or_default();
         let paths = opts.paths.unwrap_or_default();
-        if paths.is_empty() {
-            return None;
-        }
         let base_url = opts
             .base_url
             .as_deref()
             .map(|s| root.join(s))
             .unwrap_or_else(|| root.to_path_buf());
-        Some(Self {
+        Self {
             base_url,
             aliases: paths.into_iter().collect(),
-        })
+        }
     }
 
-    /// If `import` matches an alias pattern, return the resolved worktree-
-    /// relative path string. Otherwise return `None` so callers fall back to
-    /// whatever raw module name the extractor emitted.
-    pub fn resolve(&self, import: &str, worktree_root: &Path) -> Option<String> {
+    /// Resolve an import string to a worktree-relative module path (without
+    /// file extension). Returns `None` for external packages.
+    pub fn resolve(
+        &self,
+        import: &str,
+        importing_file: &Path,
+        worktree_root: &Path,
+    ) -> Option<String> {
+        if is_relative_import(import) {
+            return resolve_relative(import, importing_file);
+        }
         for (pattern, targets) in &self.aliases {
             if let Some(captured) = match_pattern(pattern, import)
                 && let Some(target) = targets.first()
@@ -60,13 +81,55 @@ impl TsAliasResolver {
                 let candidate = substitute_target(target, &captured);
                 let resolved = self.base_url.join(&candidate);
                 if let Ok(rel) = resolved.strip_prefix(worktree_root) {
-                    return Some(rel.to_string_lossy().into_owned());
+                    return Some(normalize_to_string(rel));
                 }
-                return Some(resolved.to_string_lossy().into_owned());
+                return Some(normalize_to_string(&resolved));
             }
         }
         None
     }
+}
+
+fn is_relative_import(import: &str) -> bool {
+    import == "."
+        || import == ".."
+        || import.starts_with("./")
+        || import.starts_with("../")
+        || import.starts_with(".\\")
+        || import.starts_with("..\\")
+}
+
+fn resolve_relative(import: &str, importing_file: &Path) -> Option<String> {
+    let dir = importing_file.parent()?;
+    let joined = dir.join(import);
+    Some(normalize_to_string(&joined))
+}
+
+/// Resolve `.` / `..` components without touching the filesystem and return
+/// the path as a forward-slashed string with any trailing file extension
+/// stripped. The trailing-stem rule means relative imports written without
+/// extensions (the JS/TS norm) compose with the symbol-table convention of
+/// keying by extension-stripped path.
+fn normalize_to_string(path: &Path) -> String {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(s) => parts.push(s),
+            other => parts.push(other.as_os_str()),
+        }
+    }
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&part.to_string_lossy());
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -75,7 +138,7 @@ struct TsConfig {
     compiler_options: Option<TsCompilerOptions>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct TsCompilerOptions {
     #[serde(rename = "baseUrl")]
     base_url: Option<String>,
@@ -232,7 +295,11 @@ mod tests {
             base_url: PathBuf::from("/repo"),
             aliases: vec![("@/*".to_string(), vec!["src/*".to_string()])],
         };
-        let resolved = resolver.resolve("@/utils/format", Path::new("/repo"));
+        let resolved = resolver.resolve(
+            "@/utils/format",
+            Path::new("src/app/index.ts"),
+            Path::new("/repo"),
+        );
         assert_eq!(resolved, Some("src/utils/format".to_string()));
     }
 
@@ -243,10 +310,55 @@ mod tests {
             aliases: vec![("common".to_string(), vec!["src/common/index".to_string()])],
         };
         assert_eq!(
-            resolver.resolve("common", Path::new("/repo")),
+            resolver.resolve("common", Path::new("src/app.ts"), Path::new("/repo")),
             Some("src/common/index".to_string())
         );
-        assert_eq!(resolver.resolve("missing", Path::new("/repo")), None);
+        assert_eq!(
+            resolver.resolve("missing", Path::new("src/app.ts"), Path::new("/repo")),
+            None
+        );
+    }
+
+    #[test]
+    fn relative_import_joins_with_importing_dir() {
+        let resolver = TsAliasResolver::default();
+        let resolved = resolver.resolve(
+            "./helper",
+            Path::new("src/components/widget.ts"),
+            Path::new("/repo"),
+        );
+        assert_eq!(resolved, Some("src/components/helper".to_string()));
+    }
+
+    #[test]
+    fn relative_parent_import_climbs_directory() {
+        let resolver = TsAliasResolver::default();
+        let resolved = resolver.resolve(
+            "../shared/util",
+            Path::new("src/components/widget.ts"),
+            Path::new("/repo"),
+        );
+        assert_eq!(resolved, Some("src/shared/util".to_string()));
+    }
+
+    #[test]
+    fn relative_import_without_tsconfig_still_works() {
+        let resolver = TsAliasResolver::from_worktree(Path::new("/nonexistent-repo-xyz"));
+        let resolved = resolver.resolve(
+            "./sibling",
+            Path::new("pkg/foo.ts"),
+            Path::new("/nonexistent-repo-xyz"),
+        );
+        assert_eq!(resolved, Some("pkg/sibling".to_string()));
+    }
+
+    #[test]
+    fn external_package_import_returns_none() {
+        let resolver = TsAliasResolver::default();
+        assert_eq!(
+            resolver.resolve("react", Path::new("src/app.tsx"), Path::new("/repo")),
+            None
+        );
     }
 
     #[test]
