@@ -1,9 +1,18 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::extract::{
+    Diagnostic as CanonicalDiagnostic, ExtractedFile as CanonicalExtractedFile,
+    Node as CanonicalNode, Position, Ref as CanonicalRef, Severity, Span as CanonicalSpan,
+};
+use crate::language::{
+    LanguageId as CanonicalLanguageId, LanguagePlugin as CanonicalLanguagePlugin, LanguageQueries,
+};
+
 use super::javascript::{
-    Diagnostic, ExtractedFile, ExtractedNode, LanguagePlugin, NodeKind, Ref, RefKind, Span,
+    Diagnostic, DiagnosticSeverity, ExtractedFile, ExtractedNode, NodeKind, Ref, RefKind, Span,
     callee_label, collect_diagnostics, declaration_name, is_component_name, is_require_call,
     slice_text, strip_string_quotes, variable_kind_from_declarator, walk_tree,
 };
@@ -91,18 +100,25 @@ impl TypeScriptPlugin {
     }
 }
 
-impl LanguagePlugin for TypeScriptPlugin {
-    fn id(&self) -> super::javascript::LanguageId {
+impl CanonicalLanguagePlugin for TypeScriptPlugin {
+    fn id(&self) -> CanonicalLanguageId {
         match self.flavor {
-            TsFlavor::TypeScript => super::javascript::LanguageId::TypeScript,
-            TsFlavor::Tsx => super::javascript::LanguageId::Tsx,
+            TsFlavor::TypeScript => CanonicalLanguageId::TypeScript,
+            TsFlavor::Tsx => CanonicalLanguageId::Tsx,
         }
     }
 
     fn extensions(&self) -> &'static [&'static str] {
         match self.flavor {
-            TsFlavor::TypeScript => &["ts"],
+            TsFlavor::TypeScript => &["ts", "mts", "cts"],
             TsFlavor::Tsx => &["tsx"],
+        }
+    }
+
+    fn queries(&self) -> &'static LanguageQueries {
+        match self.flavor {
+            TsFlavor::TypeScript => &TYPESCRIPT_QUERIES,
+            TsFlavor::Tsx => &TSX_QUERIES,
         }
     }
 
@@ -113,9 +129,158 @@ impl LanguagePlugin for TypeScriptPlugin {
         }
     }
 
-    fn extract(&self, tree: &Tree, source: &[u8]) -> ExtractedFile {
-        let file = extract_internal(self.flavor, tree, source);
-        file.base
+    fn extract(&self, source: &[u8], path: &Path) -> CanonicalExtractedFile {
+        let legacy = extract(self.flavor, source);
+        to_canonical(path.to_path_buf(), legacy)
+    }
+}
+
+static TYPESCRIPT_QUERIES: LanguageQueries = LanguageQueries {
+    definitions: DEFINITIONS_QUERY,
+    imports: IMPORT_QUERY,
+    exports: EXPORT_QUERY,
+    types: "",
+    routes: "",
+};
+
+static TSX_QUERIES: LanguageQueries = LanguageQueries {
+    definitions: DEFINITIONS_QUERY,
+    imports: IMPORT_QUERY,
+    exports: EXPORT_QUERY,
+    types: "",
+    routes: "",
+};
+
+fn to_canonical_span(span: Span) -> CanonicalSpan {
+    CanonicalSpan {
+        start: Position {
+            byte: span.start_byte,
+            row: span.start_row,
+            column: span.start_col,
+        },
+        end: Position {
+            byte: span.end_byte,
+            row: span.end_row,
+            column: span.end_col,
+        },
+    }
+}
+
+fn node_kind_to_str(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Module => "module",
+        NodeKind::Class => "class",
+        NodeKind::Function => "function",
+        NodeKind::Method => "method",
+        NodeKind::ArrowFunction => "arrow_function",
+        NodeKind::Variable => "variable",
+    }
+}
+
+fn ts_node_kind_to_str(kind: TsNodeKind) -> &'static str {
+    match kind {
+        TsNodeKind::Interface => "interface",
+        TsNodeKind::TypeAlias => "type_alias",
+    }
+}
+
+fn ref_kind_to_str(kind: RefKind) -> &'static str {
+    match kind {
+        RefKind::ImportEsm => "import_esm",
+        RefKind::ImportCjs => "import_cjs",
+        RefKind::ExportEsm => "export_esm",
+        RefKind::ExportCjs => "export_cjs",
+        RefKind::Call => "call",
+        RefKind::MemberAccess => "member_access",
+        RefKind::JsxComponent => "jsx_component",
+    }
+}
+
+fn diagnostic_severity_to_canonical(severity: DiagnosticSeverity) -> Severity {
+    match severity {
+        DiagnosticSeverity::Error => Severity::Error,
+        DiagnosticSeverity::Warning => Severity::Warning,
+    }
+}
+
+fn to_canonical(path: PathBuf, legacy: TsExtractedFile) -> CanonicalExtractedFile {
+    let mut nodes: Vec<CanonicalNode> =
+        Vec::with_capacity(legacy.base.nodes.len() + legacy.type_nodes.len());
+    let mut next_node_id: u32 = 0;
+
+    for node in legacy.base.nodes {
+        nodes.push(CanonicalNode {
+            id: next_node_id,
+            kind: node_kind_to_str(node.kind).to_owned(),
+            name: node.name.clone(),
+            qname: node.name,
+            span: to_canonical_span(node.span),
+            parent: None,
+        });
+        next_node_id += 1;
+    }
+
+    for node in legacy.type_nodes {
+        nodes.push(CanonicalNode {
+            id: next_node_id,
+            kind: ts_node_kind_to_str(node.kind).to_owned(),
+            name: node.name.clone(),
+            qname: node.name,
+            span: to_canonical_span(node.span),
+            parent: None,
+        });
+        next_node_id += 1;
+    }
+
+    let mut refs: Vec<CanonicalRef> =
+        Vec::with_capacity(legacy.base.refs.len() + legacy.type_refs.len());
+    let mut next_ref_id: u32 = 0;
+
+    for r in legacy.base.refs {
+        refs.push(CanonicalRef {
+            id: next_ref_id,
+            kind: ref_kind_to_str(r.kind).to_owned(),
+            name: r.name,
+            qname: None,
+            alias: None,
+            span: to_canonical_span(r.span),
+            container: None,
+        });
+        next_ref_id += 1;
+    }
+
+    for r in legacy.type_refs {
+        let kind_str = match r.kind {
+            TsRefKind::TypeReference => "type_reference",
+        };
+        refs.push(CanonicalRef {
+            id: next_ref_id,
+            kind: kind_str.to_owned(),
+            name: r.name,
+            qname: None,
+            alias: None,
+            span: to_canonical_span(r.span),
+            container: None,
+        });
+        next_ref_id += 1;
+    }
+
+    let diagnostics = legacy
+        .base
+        .diagnostics
+        .into_iter()
+        .map(|d| CanonicalDiagnostic {
+            severity: diagnostic_severity_to_canonical(d.severity),
+            message: d.message,
+            span: Some(to_canonical_span(d.span)),
+        })
+        .collect();
+
+    CanonicalExtractedFile {
+        path,
+        nodes,
+        refs,
+        diagnostics,
     }
 }
 
@@ -491,23 +656,36 @@ fn is_definition_name(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn extract_ts(source: &str) -> TsExtractedFile {
-        extract(TsFlavor::TypeScript, source.as_bytes())
+    fn ts_path() -> PathBuf {
+        PathBuf::from("module.ts")
     }
 
-    fn extract_tsx(source: &str) -> TsExtractedFile {
-        extract(TsFlavor::Tsx, source.as_bytes())
+    fn tsx_path() -> PathBuf {
+        PathBuf::from("Component.tsx")
     }
 
-    fn refs_of_kind(file: &TsExtractedFile, kind: RefKind) -> Vec<&Ref> {
-        file.base.refs.iter().filter(|r| r.kind == kind).collect()
+    fn extract_ts(source: &str) -> CanonicalExtractedFile {
+        TypeScriptPlugin::typescript().extract(source.as_bytes(), &ts_path())
+    }
+
+    fn extract_tsx(source: &str) -> CanonicalExtractedFile {
+        TypeScriptPlugin::tsx().extract(source.as_bytes(), &tsx_path())
+    }
+
+    fn refs_of_kind<'a>(file: &'a CanonicalExtractedFile, kind: &str) -> Vec<&'a CanonicalRef> {
+        file.refs.iter().filter(|r| r.kind == kind).collect()
+    }
+
+    fn nodes_of_kind<'a>(file: &'a CanonicalExtractedFile, kind: &str) -> Vec<&'a CanonicalNode> {
+        file.nodes.iter().filter(|n| n.kind == kind).collect()
     }
 
     #[test]
     fn esm_default_import_extracts_source() {
         let file = extract_ts("import x from 'mod';");
-        let imports = refs_of_kind(&file, RefKind::ImportEsm);
+        let imports = refs_of_kind(&file, "import_esm");
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "mod");
     }
@@ -515,7 +693,7 @@ mod tests {
     #[test]
     fn esm_named_imports_extract_source() {
         let file = extract_ts("import {a, b} from 'mod';");
-        let imports = refs_of_kind(&file, RefKind::ImportEsm);
+        let imports = refs_of_kind(&file, "import_esm");
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "mod");
     }
@@ -523,7 +701,7 @@ mod tests {
     #[test]
     fn esm_namespace_import_extracts_source() {
         let file = extract_ts("import * as ns from 'mod';");
-        let imports = refs_of_kind(&file, RefKind::ImportEsm);
+        let imports = refs_of_kind(&file, "import_esm");
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "mod");
     }
@@ -535,16 +713,8 @@ interface Foo { value: number }
 type Bar = string;
 "#;
         let file = extract_ts(source);
-        let interfaces: Vec<_> = file
-            .type_nodes
-            .iter()
-            .filter(|n| matches!(n.kind, TsNodeKind::Interface))
-            .collect();
-        let aliases: Vec<_> = file
-            .type_nodes
-            .iter()
-            .filter(|n| matches!(n.kind, TsNodeKind::TypeAlias))
-            .collect();
+        let interfaces = nodes_of_kind(&file, "interface");
+        let aliases = nodes_of_kind(&file, "type_alias");
         assert_eq!(interfaces.len(), 1);
         assert_eq!(interfaces[0].name, "Foo");
         assert_eq!(aliases.len(), 1);
@@ -557,8 +727,11 @@ type Bar = string;
 type X = Array<Foo>;
 "#;
         let file = extract_ts(source);
-        let refs: Vec<&str> = file.type_refs.iter().map(|r| r.name.as_str()).collect();
-        assert!(refs.contains(&"Foo"));
+        let names: Vec<&str> = refs_of_kind(&file, "type_reference")
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(names.contains(&"Foo"));
     }
 
     #[test]
@@ -567,8 +740,11 @@ type X = Array<Foo>;
 function take(x: Person): void {}
 "#;
         let file = extract_ts(source);
-        let refs: Vec<&str> = file.type_refs.iter().map(|r| r.name.as_str()).collect();
-        assert!(refs.contains(&"Person"));
+        let names: Vec<&str> = refs_of_kind(&file, "type_reference")
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(names.contains(&"Person"));
     }
 
     #[test]
@@ -580,24 +756,9 @@ class Foo {
 const baz = (): number => 2;
 "#;
         let file = extract_ts(source);
-        let classes: Vec<_> = file
-            .base
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Class))
-            .collect();
-        let methods: Vec<_> = file
-            .base
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Method))
-            .collect();
-        let arrows: Vec<_> = file
-            .base
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::ArrowFunction))
-            .collect();
+        let classes = nodes_of_kind(&file, "class");
+        let methods = nodes_of_kind(&file, "method");
+        let arrows = nodes_of_kind(&file, "arrow_function");
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].name, "Foo");
         assert_eq!(methods.len(), 1);
@@ -609,7 +770,7 @@ const baz = (): number => 2;
     #[test]
     fn require_call_is_cjs_import() {
         let file = extract_ts("const foo = require('foo');");
-        let imports = refs_of_kind(&file, RefKind::ImportCjs);
+        let imports = refs_of_kind(&file, "import_cjs");
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "foo");
     }
@@ -622,7 +783,7 @@ function App() {
 }
 "#;
         let file = extract_tsx(source);
-        let comps = refs_of_kind(&file, RefKind::JsxComponent);
+        let comps = refs_of_kind(&file, "jsx_component");
         assert_eq!(comps.len(), 1);
         assert_eq!(comps[0].name, "MyComponent");
     }
@@ -635,57 +796,103 @@ function App() {
 }
 "#;
         let file = extract_tsx(source);
-        let comps = refs_of_kind(&file, RefKind::JsxComponent);
+        let comps = refs_of_kind(&file, "jsx_component");
         assert!(comps.is_empty());
     }
 
     #[test]
     fn parse_error_emits_diagnostic_without_failing() {
         let file = extract_ts("function ( {");
-        assert!(!file.base.diagnostics.is_empty());
+        assert!(!file.diagnostics.is_empty());
     }
 
     #[test]
     fn plugin_metadata() {
         let ts = TypeScriptPlugin::typescript();
         let tsx = TypeScriptPlugin::tsx();
-        assert_eq!(ts.extensions(), &["ts"]);
+        assert_eq!(ts.id(), CanonicalLanguageId::TypeScript);
+        assert_eq!(tsx.id(), CanonicalLanguageId::Tsx);
+        assert_eq!(ts.extensions(), &["ts", "mts", "cts"]);
         assert_eq!(tsx.extensions(), &["tsx"]);
         assert_eq!(ts.flavor(), TsFlavor::TypeScript);
         assert_eq!(tsx.flavor(), TsFlavor::Tsx);
     }
 
     #[test]
+    fn plugin_queries_are_static() {
+        let ts = TypeScriptPlugin::typescript();
+        let tsx = TypeScriptPlugin::tsx();
+        let ts_queries = ts.queries();
+        let tsx_queries = tsx.queries();
+        assert!(!ts_queries.definitions.is_empty());
+        assert!(!ts_queries.imports.is_empty());
+        assert!(!ts_queries.exports.is_empty());
+        assert!(!tsx_queries.definitions.is_empty());
+    }
+
+    #[test]
     fn interface_name_not_emitted_as_type_ref() {
         let source = "interface Foo { value: number }";
         let file = extract_ts(source);
-        let refs: Vec<&str> = file.type_refs.iter().map(|r| r.name.as_str()).collect();
-        assert!(!refs.contains(&"Foo"));
+        let names: Vec<&str> = refs_of_kind(&file, "type_reference")
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(!names.contains(&"Foo"));
     }
 
     #[test]
     fn generic_argument_emitted_once_per_occurrence() {
         let source = "type X = Array<Foo>; type Y = Map<Bar, Baz>;";
         let file = extract_ts(source);
-        let foo_count = file.type_refs.iter().filter(|r| r.name == "Foo").count();
-        let bar_count = file.type_refs.iter().filter(|r| r.name == "Bar").count();
-        let baz_count = file.type_refs.iter().filter(|r| r.name == "Baz").count();
+        let foo_count = refs_of_kind(&file, "type_reference")
+            .iter()
+            .filter(|r| r.name == "Foo")
+            .count();
+        let bar_count = refs_of_kind(&file, "type_reference")
+            .iter()
+            .filter(|r| r.name == "Bar")
+            .count();
+        let baz_count = refs_of_kind(&file, "type_reference")
+            .iter()
+            .filter(|r| r.name == "Baz")
+            .count();
         assert_eq!(foo_count, 1);
         assert_eq!(bar_count, 1);
         assert_eq!(baz_count, 1);
     }
 
     #[test]
-    fn ts_language_id_reflects_flavor() {
-        let ts_file = extract_ts("type X = number;");
-        let tsx_file = extract_tsx("const x = <Foo />;");
-        assert_eq!(
-            ts_file.base.language,
-            Some(super::super::javascript::LanguageId::TypeScript)
-        );
-        assert_eq!(
-            tsx_file.base.language,
-            Some(super::super::javascript::LanguageId::Tsx)
-        );
+    fn extracted_file_carries_path() {
+        let plugin = TypeScriptPlugin::typescript();
+        let path = PathBuf::from("src/example.ts");
+        let file = plugin.extract(b"type X = number;", &path);
+        assert_eq!(file.path, path);
+    }
+
+    #[test]
+    fn span_uses_nested_positions() {
+        let file = extract_ts("type X = number;");
+        let alias = nodes_of_kind(&file, "type_alias");
+        assert_eq!(alias.len(), 1);
+        let span = alias[0].span;
+        assert_eq!(span.start.row, 0);
+        assert_eq!(span.start.column, 0);
+        assert!(span.end.byte > span.start.byte);
+    }
+
+    #[test]
+    fn node_ids_are_unique() {
+        let source = r#"
+class Foo {
+  bar(): number { return 1; }
+}
+interface Iface {}
+"#;
+        let file = extract_ts(source);
+        let mut ids: Vec<u32> = file.nodes.iter().map(|n| n.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), file.nodes.len());
     }
 }
