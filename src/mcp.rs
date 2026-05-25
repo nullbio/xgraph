@@ -176,15 +176,42 @@ impl McpProxy {
     }
 
     /// Run the full proxy lifecycle against the supplied stdio streams.
+    ///
+    /// Sessions are bounded by the daemon connection. If the daemon
+    /// dies mid-session (e.g. an `xgraph reindex` killed it to take
+    /// the Cozo lock), the proxy lazy-spawns a fresh daemon and
+    /// resumes pumping rather than propagating the closure up to the
+    /// LLM CLI as "Transport closed".
     pub async fn proxy<R, W>(&self, stdin: R, stdout: W) -> Result<(), McpError>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let stream = self.connect().await?;
-        let (socket_reader, socket_writer) = stream.into_split();
-        mcp_pump(stdin, stdout, socket_reader, socket_writer).await
+        let mut stdin = BufReader::new(stdin);
+        let mut stdout = stdout;
+        loop {
+            let stream = self.connect().await?;
+            let (socket_reader, socket_writer) = stream.into_split();
+            match mcp_pump_session(&mut stdin, &mut stdout, socket_reader, socket_writer).await? {
+                PumpOutcome::ClientClosed => return Ok(()),
+                PumpOutcome::DaemonClosed => {
+                    eprintln!("xgraph mcp: daemon socket closed, reconnecting…");
+                    continue;
+                }
+            }
+        }
     }
+}
+
+/// Why a [`mcp_pump_session`] returned. Used by [`McpProxy::proxy`] to
+/// decide whether to reconnect (daemon went away — usually because
+/// `xgraph reindex` killed it) or exit (client closed stdin).
+enum PumpOutcome {
+    /// stdin reached EOF — the LLM CLI is done with us, exit cleanly.
+    ClientClosed,
+    /// The daemon socket closed mid-session. The outer loop should
+    /// lazy-spawn a fresh daemon and start a new session.
+    DaemonClosed,
 }
 
 /// Top-level entry point invoked by the CLI.
@@ -289,23 +316,25 @@ impl Drop for StartupLockGuard {
 /// Sequential — one outstanding daemon request at a time. That matches
 /// how every MCP client we care about (Claude, Codex) drives a server,
 /// and it lets us skip a request-id correlation table.
-async fn mcp_pump<R, W, SR, SW>(
-    stdin: R,
-    stdout: W,
+/// Run a single proxy session bound to a particular daemon socket.
+/// Returns when either stdin closes (`ClientClosed`) or the daemon
+/// socket closes (`DaemonClosed`). The caller — [`McpProxy::proxy`] —
+/// handles reconnect on the daemon-close case.
+async fn mcp_pump_session<R, W, SR, SW>(
+    stdin_reader: &mut BufReader<R>,
+    stdout: &mut W,
     socket_reader: SR,
     socket_writer: SW,
-) -> Result<(), McpError>
+) -> Result<PumpOutcome, McpError>
 where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
     SR: AsyncRead + Unpin + Send + 'static,
     SW: AsyncWrite + Unpin + Send + 'static,
 {
     use crate::mcp_protocol::{Action, classify_request, shape_outgoing};
-    let mut stdin_reader = BufReader::new(stdin);
     let mut socket_reader = BufReader::new(socket_reader);
     let mut socket_writer = socket_writer;
-    let mut stdout = stdout;
 
     let mut request_line = String::new();
     let mut daemon_response_line = String::new();
@@ -315,7 +344,7 @@ where
         // pending forwarded request), the daemon should not send any
         // unsolicited bytes — so `fill_buf` only resolves on EOF or
         // unexpected data, both of which mean the daemon connection is
-        // unusable. Either way, we exit cleanly.
+        // unusable.
         tokio::select! {
             biased;
             res = stdin_reader.read_line(&mut request_line) => {
@@ -324,13 +353,13 @@ where
                     // Client closed stdin → tear the daemon connection
                     // down so the daemon's last-disconnect logic can fire.
                     let _ = socket_writer.shutdown().await;
-                    return Ok(());
+                    return Ok(PumpOutcome::ClientClosed);
                 }
             }
             _ = socket_reader.fill_buf() => {
                 // Daemon closed (or sent unsolicited data, treated the
                 // same — the protocol doesn't permit it).
-                return Ok(());
+                return Ok(PumpOutcome::DaemonClosed);
             }
         }
         match classify_request(&request_line) {
@@ -349,15 +378,10 @@ where
                 daemon_response_line.clear();
                 let bytes = socket_reader.read_line(&mut daemon_response_line).await?;
                 if bytes == 0 {
-                    // Daemon closed mid-request. Tell the client.
-                    let body = crate::mcp_protocol::build_error_line(
-                        serde_json::Value::Null,
-                        -32603,
-                        "daemon closed the socket",
-                    );
-                    let _ = stdout.write_all(body.as_bytes()).await;
-                    let _ = stdout.flush().await;
-                    return Ok(());
+                    // Daemon closed mid-request. Treat as DaemonClosed
+                    // so the outer loop reconnects and the LLM can
+                    // retry the request against the fresh daemon.
+                    return Ok(PumpOutcome::DaemonClosed);
                 }
                 let out_line = shape_outgoing(&daemon_response_line, wrap_in_mcp);
                 stdout.write_all(out_line.as_bytes()).await?;
@@ -668,6 +692,30 @@ mod tests {
         })
     }
 
+    /// Launcher that binds a fresh echo daemon the first (and only)
+    /// time the proxy asks for one. Used by the reconnect test: the
+    /// first daemon drops the socket; on reconnect, this launcher
+    /// brings up an echo daemon so the proxy resumes serving.
+    struct OneShotEchoLauncher {
+        socket_path: PathBuf,
+        daemon: tokio::sync::Mutex<Option<EchoDaemon>>,
+    }
+
+    impl DaemonLauncher for OneShotEchoLauncher {
+        fn spawn_daemon(&self) -> SpawnFuture<'_> {
+            let socket_path = self.socket_path.clone();
+            Box::pin(async move {
+                // The first daemon (bind_close_after_accept) bound the
+                // socket and may have left the file in place even
+                // though its task ended. Remove it so we can rebind.
+                let _ = std::fs::remove_file(&socket_path);
+                let daemon = EchoDaemon::bind(&socket_path).await;
+                *self.daemon.lock().await = Some(daemon);
+                Ok(())
+            })
+        }
+    }
+
     /// End-to-end MCP handshake: the proxy must answer `initialize`
     /// locally (without round-tripping to the daemon), then answer
     /// `tools/list`, and finally forward `tools/call` to the daemon
@@ -753,25 +801,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_shutdown_when_daemon_closes_socket() {
+    async fn proxy_reconnects_when_daemon_socket_closes() {
         let dir = TempDir::new("daemon-close");
         let socket_path = dir.path.join(DEFAULT_SOCKET_NAME);
+        // First daemon: accepts our connection and immediately drops
+        // it. The proxy should detect that, attempt reconnect via the
+        // launcher, get a fresh daemon, and continue.
         let listener_task = bind_close_after_accept(&socket_path).await;
 
-        let config = McpConfig::new(dir.path.clone(), Arc::new(NoopLauncher));
+        // Reconnect target: a fresh echo daemon that the launcher
+        // will bind once the proxy asks for it.
+        let socket_path_for_launcher = socket_path.clone();
+        let launcher: Arc<dyn DaemonLauncher> = Arc::new(OneShotEchoLauncher {
+            socket_path: socket_path_for_launcher,
+            daemon: tokio::sync::Mutex::new(None),
+        });
+        let config = McpConfig::new(dir.path.clone(), launcher);
         let proxy = McpProxy::new(config);
 
-        let (_stdin_writer, stdin_reader) = duplex(4096);
-        let (stdout_writer, _stdout_reader) = duplex(4096);
+        let (stdin_writer, stdin_reader) = duplex(4096);
+        let (stdout_writer, mut stdout_reader) = duplex(4096);
 
         let proxy_task =
             tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
 
-        // Proxy must terminate because the daemon side closed the socket,
-        // even though stdin is still open and idle.
+        // Send one request AFTER the first daemon closes — the proxy
+        // should reconnect to the fresh echo daemon and the echo
+        // response should come back to us on stdout.
+        let mut stdin_writer = stdin_writer;
+        // Give the proxy a moment to discover the daemon close and
+        // start reconnecting before we feed the next request. The
+        // exact timing doesn't matter — once the new daemon is bound
+        // and our request arrives, the response will follow.
+        sleep(Duration::from_millis(100)).await;
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"some_custom_method\"}\n")
+            .await
+            .expect("write");
+        stdin_writer.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; 4096];
+        let n = timeout(Duration::from_secs(3), stdout_reader.read(&mut buf))
+            .await
+            .expect("reconnect should deliver a response within timeout")
+            .expect("read");
+        let response = std::str::from_utf8(&buf[..n]).expect("utf8");
+        assert!(response.contains("\"echo_id\":11"), "got: {response}");
+
+        drop(stdin_writer);
         timeout(Duration::from_secs(2), proxy_task)
             .await
-            .expect("proxy should detect daemon close and exit")
+            .expect("proxy shuts down on stdin EOF")
             .expect("join")
             .expect("proxy ok");
 

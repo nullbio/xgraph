@@ -668,37 +668,55 @@ fn cmd_reindex() -> Result<ExitCode, CliError> {
     init_at(&cwd)
 }
 
-/// Stop any daemon running for this worktree and wait briefly for it
-/// to release the Cozo lock. Used by every command that needs
-/// exclusive write access to the store (`init`, `sync` → via init_at,
-/// `reindex`). Cheap when there's no daemon to stop. Without this,
-/// the next `CozoStore::open` would fail with "RocksDB error:
-/// Resource temporarily unavailable".
+/// Stop any daemon running for this worktree and wait for the process
+/// to actually exit. Used by every command that needs exclusive write
+/// access to the Cozo store (`init`, `sync` via `init_at`, `reindex`).
+///
+/// We poll `/proc/<pid>` rather than waiting for the socket file to
+/// disappear. The socket goes away early in the daemon's shutdown
+/// sequence (right after the accept loop breaks), but the RocksDB
+/// LOCK isn't released until the *process* exits — that's when all
+/// `CozoStore` clones (including those held by per-connection tokio
+/// tasks and the watcher-owned `WorktreeOwner`) finally drop.
 fn ensure_no_running_daemon(worktree: &Path) -> Result<(), CliError> {
     use std::time::{Duration, Instant};
-    let outcome = stop_daemon(worktree, false)?;
-    match outcome {
-        DaemonStopOutcome::NotRunning => return Ok(()),
-        DaemonStopOutcome::AlreadyDead { .. } => return Ok(()),
+    let pid = match stop_daemon(worktree, false)? {
+        DaemonStopOutcome::NotRunning | DaemonStopOutcome::AlreadyDead { .. } => return Ok(()),
         DaemonStopOutcome::Stopped { pid, .. } => {
             eprintln!("xgraph: stopped daemon pid {pid} to take exclusive store lock");
+            pid
         }
-    }
-    // Wait up to ~3 s for the socket file to disappear (which happens
-    // after the daemon's accept loop exits and runs its cleanup). If
-    // it doesn't, escalate to SIGKILL and try once more — the user
-    // would rather lose a stale daemon than have their reindex hang.
-    let runtime = runtime_dir(worktree)?;
-    let socket_path = runtime.socket_path();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while socket_path.exists() && Instant::now() < deadline {
+    };
+    // First grace window: graceful shutdown.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    if socket_path.exists() {
-        eprintln!("xgraph: daemon didn't release socket in time; sending SIGKILL");
-        let _ = stop_daemon(worktree, true)?;
+    if !process_alive(pid) {
+        return Ok(());
+    }
+    // Process is still alive past SIGTERM grace — likely wedged in
+    // tokio shutdown or holding the writer thread join. SIGKILL.
+    eprintln!("xgraph: daemon pid {pid} didn't exit; sending SIGKILL");
+    let _ = stop_daemon(worktree, true)?;
+    // Second grace window: OS-forced exit. SIGKILL is immediate but
+    // the kernel still needs a moment to reap the process and release
+    // any held locks (RocksDB LOCK in particular).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+/// True iff `/proc/<pid>` exists — i.e. the process is still alive.
+/// Returns false for any non-positive pid so the wait loops fall
+/// through without spinning.
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Send a JSON-RPC request to the worktree's daemon socket and pretty-
