@@ -1,37 +1,35 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Language, Node as TsNode, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::extract::{
-    Diagnostic as CanonicalDiagnostic, ExtractedFile as CanonicalExtractedFile,
-    Node as CanonicalNode, Position, Ref as CanonicalRef, Severity, Span as CanonicalSpan,
-};
-use crate::language::{
-    LanguageId as CanonicalLanguageId, LanguagePlugin as CanonicalLanguagePlugin, LanguageQueries,
-};
+use crate::extract::{ExtractedFile, LocalNodeId, LocalRefId, Node, Position, Ref, Span};
+use crate::language::{LanguageId, LanguagePlugin, LanguageQueries};
 
 use super::javascript::{
-    Diagnostic, DiagnosticSeverity, ExtractedFile, ExtractedNode, NodeKind, Ref, RefKind, Span,
     callee_label, collect_diagnostics, declaration_name, is_component_name, is_require_call,
     slice_text, strip_string_quotes, variable_kind_from_declarator, walk_tree,
 };
+
+const KIND_CLASS: &str = "class";
+const KIND_FUNCTION: &str = "function";
+const KIND_METHOD: &str = "method";
+const KIND_INTERFACE: &str = "interface";
+const KIND_TYPE_ALIAS: &str = "type_alias";
+
+const REF_IMPORT_ESM: &str = "import_esm";
+const REF_IMPORT_CJS: &str = "import_cjs";
+const REF_EXPORT_ESM: &str = "export_esm";
+const REF_EXPORT_CJS: &str = "export_cjs";
+const REF_CALL: &str = "call";
+const REF_MEMBER_ACCESS: &str = "member_access";
+const REF_JSX_COMPONENT: &str = "jsx_component";
+const REF_TYPE_REFERENCE: &str = "type_reference";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TsFlavor {
     TypeScript,
     Tsx,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TsNodeKind {
-    Interface,
-    TypeAlias,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TsRefKind {
-    TypeReference,
 }
 
 const DEFINITIONS_QUERY: &str = r#"
@@ -78,6 +76,22 @@ const EXPORT_QUERY: &str = r#"
     property: (property_identifier) @cjs.prop)) @cjs.export
 "#;
 
+static TYPESCRIPT_QUERIES: LanguageQueries = LanguageQueries {
+    definitions: DEFINITIONS_QUERY,
+    imports: IMPORT_QUERY,
+    exports: EXPORT_QUERY,
+    types: "",
+    routes: "",
+};
+
+static TSX_QUERIES: LanguageQueries = LanguageQueries {
+    definitions: DEFINITIONS_QUERY,
+    imports: IMPORT_QUERY,
+    exports: EXPORT_QUERY,
+    types: "",
+    routes: "",
+};
+
 pub struct TypeScriptPlugin {
     flavor: TsFlavor,
 }
@@ -100,11 +114,11 @@ impl TypeScriptPlugin {
     }
 }
 
-impl CanonicalLanguagePlugin for TypeScriptPlugin {
-    fn id(&self) -> CanonicalLanguageId {
+impl LanguagePlugin for TypeScriptPlugin {
+    fn id(&self) -> LanguageId {
         match self.flavor {
-            TsFlavor::TypeScript => CanonicalLanguageId::TypeScript,
-            TsFlavor::Tsx => CanonicalLanguageId::Tsx,
+            TsFlavor::TypeScript => LanguageId::TypeScript,
+            TsFlavor::Tsx => LanguageId::Tsx,
         }
     }
 
@@ -129,187 +143,17 @@ impl CanonicalLanguagePlugin for TypeScriptPlugin {
         }
     }
 
-    fn extract(&self, source: &[u8], path: &Path) -> CanonicalExtractedFile {
-        let legacy = extract(self.flavor, source);
-        to_canonical(path.to_path_buf(), legacy)
-    }
-}
-
-static TYPESCRIPT_QUERIES: LanguageQueries = LanguageQueries {
-    definitions: DEFINITIONS_QUERY,
-    imports: IMPORT_QUERY,
-    exports: EXPORT_QUERY,
-    types: "",
-    routes: "",
-};
-
-static TSX_QUERIES: LanguageQueries = LanguageQueries {
-    definitions: DEFINITIONS_QUERY,
-    imports: IMPORT_QUERY,
-    exports: EXPORT_QUERY,
-    types: "",
-    routes: "",
-};
-
-fn to_canonical_span(span: Span) -> CanonicalSpan {
-    CanonicalSpan {
-        start: Position {
-            byte: span.start_byte,
-            row: span.start_row,
-            column: span.start_col,
-        },
-        end: Position {
-            byte: span.end_byte,
-            row: span.end_row,
-            column: span.end_col,
-        },
-    }
-}
-
-fn node_kind_to_str(kind: NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Module => "module",
-        NodeKind::Class => "class",
-        NodeKind::Function => "function",
-        NodeKind::Method => "method",
-        NodeKind::ArrowFunction => "arrow_function",
-        NodeKind::Variable => "variable",
-    }
-}
-
-fn ts_node_kind_to_str(kind: TsNodeKind) -> &'static str {
-    match kind {
-        TsNodeKind::Interface => "interface",
-        TsNodeKind::TypeAlias => "type_alias",
-    }
-}
-
-fn ref_kind_to_str(kind: RefKind) -> &'static str {
-    match kind {
-        RefKind::ImportEsm => "import_esm",
-        RefKind::ImportCjs => "import_cjs",
-        RefKind::ExportEsm => "export_esm",
-        RefKind::ExportCjs => "export_cjs",
-        RefKind::Call => "call",
-        RefKind::MemberAccess => "member_access",
-        RefKind::JsxComponent => "jsx_component",
-    }
-}
-
-fn diagnostic_severity_to_canonical(severity: DiagnosticSeverity) -> Severity {
-    match severity {
-        DiagnosticSeverity::Error => Severity::Error,
-        DiagnosticSeverity::Warning => Severity::Warning,
-    }
-}
-
-fn to_canonical(path: PathBuf, legacy: TsExtractedFile) -> CanonicalExtractedFile {
-    let mut nodes: Vec<CanonicalNode> =
-        Vec::with_capacity(legacy.base.nodes.len() + legacy.type_nodes.len());
-    let mut next_node_id: u32 = 0;
-
-    for node in legacy.base.nodes {
-        nodes.push(CanonicalNode {
-            id: next_node_id,
-            kind: node_kind_to_str(node.kind).to_owned(),
-            name: node.name.clone(),
-            qname: node.name,
-            span: to_canonical_span(node.span),
-            parent: None,
-        });
-        next_node_id += 1;
-    }
-
-    for node in legacy.type_nodes {
-        nodes.push(CanonicalNode {
-            id: next_node_id,
-            kind: ts_node_kind_to_str(node.kind).to_owned(),
-            name: node.name.clone(),
-            qname: node.name,
-            span: to_canonical_span(node.span),
-            parent: None,
-        });
-        next_node_id += 1;
-    }
-
-    let mut refs: Vec<CanonicalRef> =
-        Vec::with_capacity(legacy.base.refs.len() + legacy.type_refs.len());
-    let mut next_ref_id: u32 = 0;
-
-    for r in legacy.base.refs {
-        refs.push(CanonicalRef {
-            id: next_ref_id,
-            kind: ref_kind_to_str(r.kind).to_owned(),
-            name: r.name,
-            qname: None,
-            alias: None,
-            span: to_canonical_span(r.span),
-            container: None,
-        });
-        next_ref_id += 1;
-    }
-
-    for r in legacy.type_refs {
-        let kind_str = match r.kind {
-            TsRefKind::TypeReference => "type_reference",
+    fn extract(&self, source: &[u8], path: &Path) -> ExtractedFile {
+        let mut file = ExtractedFile {
+            path: path.to_path_buf(),
+            ..Default::default()
         };
-        refs.push(CanonicalRef {
-            id: next_ref_id,
-            kind: kind_str.to_owned(),
-            name: r.name,
-            qname: None,
-            alias: None,
-            span: to_canonical_span(r.span),
-            container: None,
-        });
-        next_ref_id += 1;
+        let Some(tree) = parse(self.flavor, source) else {
+            return file;
+        };
+        extract_into(self.flavor, &tree, source, &mut file);
+        file
     }
-
-    let diagnostics = legacy
-        .base
-        .diagnostics
-        .into_iter()
-        .map(|d| CanonicalDiagnostic {
-            severity: diagnostic_severity_to_canonical(d.severity),
-            message: d.message,
-            span: Some(to_canonical_span(d.span)),
-        })
-        .collect();
-
-    CanonicalExtractedFile {
-        path,
-        nodes,
-        refs,
-        diagnostics,
-    }
-}
-
-fn language_id_for(flavor: TsFlavor) -> super::javascript::LanguageId {
-    match flavor {
-        TsFlavor::TypeScript => super::javascript::LanguageId::TypeScript,
-        TsFlavor::Tsx => super::javascript::LanguageId::Tsx,
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct TsExtractedFile {
-    pub base: ExtractedFile,
-    pub type_nodes: Vec<TsExtractedNode>,
-    pub type_refs: Vec<TsRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TsExtractedNode {
-    pub kind: TsNodeKind,
-    pub name: String,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TsRef {
-    pub kind: TsRefKind,
-    pub name: String,
-    pub span: Span,
 }
 
 fn typescript_language() -> &'static Language {
@@ -374,82 +218,80 @@ fn export_query(flavor: TsFlavor) -> &'static Arc<Query> {
     })
 }
 
-pub fn parse(flavor: TsFlavor, source: &[u8]) -> Option<Tree> {
+fn parse(flavor: TsFlavor, source: &[u8]) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(language_for(flavor)).ok()?;
     parser.parse(source, None)
 }
 
-pub fn extract(flavor: TsFlavor, source: &[u8]) -> TsExtractedFile {
-    let Some(tree) = parse(flavor, source) else {
-        let mut empty = TsExtractedFile::default();
-        empty.base.language = Some(language_id_for(flavor));
-        return empty;
-    };
-    extract_internal(flavor, &tree, source)
+fn span_from_node(node: TsNode<'_>) -> Span {
+    let start = node.start_position();
+    let end = node.end_position();
+    Span {
+        start: Position {
+            byte: node.start_byte(),
+            row: start.row,
+            column: start.column,
+        },
+        end: Position {
+            byte: node.end_byte(),
+            row: end.row,
+            column: end.column,
+        },
+    }
 }
 
-fn extract_internal(flavor: TsFlavor, tree: &Tree, source: &[u8]) -> TsExtractedFile {
-    let mut file = TsExtractedFile::default();
-    file.base.language = Some(language_id_for(flavor));
+fn extract_into(flavor: TsFlavor, tree: &Tree, source: &[u8], out: &mut ExtractedFile) {
     let root = tree.root_node();
-    collect_definitions(
-        flavor,
-        &root,
-        source,
-        &mut file.base.nodes,
-        &mut file.type_nodes,
-    );
-    collect_imports(flavor, &root, source, &mut file.base.refs);
-    collect_exports(flavor, &root, source, &mut file.base.refs);
-    collect_calls_and_jsx(flavor, root, source, &mut file.base.refs);
-    collect_type_references(root, source, &mut file.type_refs);
-    let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    collect_diagnostics(root, &mut diagnostics);
-    file.base.diagnostics = diagnostics;
-    file
+    let mut node_id: LocalNodeId = 0;
+    let mut ref_id: LocalRefId = 0;
+    collect_definitions(flavor, &root, source, &mut out.nodes, &mut node_id);
+    collect_imports(flavor, &root, source, &mut out.refs, &mut ref_id);
+    collect_exports(flavor, &root, source, &mut out.refs, &mut ref_id);
+    collect_calls_and_jsx(flavor, root, source, &mut out.refs, &mut ref_id);
+    collect_type_references(root, source, &mut out.refs, &mut ref_id);
+    collect_diagnostics(root, &mut out.diagnostics);
 }
 
 fn collect_definitions(
     flavor: TsFlavor,
-    root: &Node<'_>,
+    root: &TsNode<'_>,
     source: &[u8],
-    js_out: &mut Vec<ExtractedNode>,
-    ts_out: &mut Vec<TsExtractedNode>,
+    out: &mut Vec<Node>,
+    next_id: &mut LocalNodeId,
 ) {
     let query = definitions_query(flavor);
     let mut cursor = QueryCursor::new();
     let names = query.capture_names();
     let mut matches = cursor.matches(query, *root, source);
     while let Some(m) = matches.next() {
-        let mut js_kind: Option<NodeKind> = None;
-        let mut ts_kind: Option<TsNodeKind> = None;
+        let mut kind: Option<&'static str> = None;
         let mut name: Option<String> = None;
-        let mut def_node: Option<Node<'_>> = None;
+        let mut def_node: Option<TsNode<'_>> = None;
         for cap in m.captures {
             match names[cap.index as usize] {
                 "class.def" => {
-                    js_kind = Some(NodeKind::Class);
+                    kind = Some(KIND_CLASS);
                     def_node = Some(cap.node);
                 }
                 "function.def" => {
-                    js_kind = Some(NodeKind::Function);
+                    kind = Some(KIND_FUNCTION);
                     def_node = Some(cap.node);
                 }
                 "method.def" => {
-                    js_kind = Some(NodeKind::Method);
+                    kind = Some(KIND_METHOD);
                     def_node = Some(cap.node);
                 }
                 "var.def" => {
-                    js_kind = Some(variable_kind_from_declarator(cap.node));
+                    kind = Some(variable_kind_from_declarator(cap.node));
                     def_node = Some(cap.node);
                 }
                 "interface.def" => {
-                    ts_kind = Some(TsNodeKind::Interface);
+                    kind = Some(KIND_INTERFACE);
                     def_node = Some(cap.node);
                 }
                 "type.def" => {
-                    ts_kind = Some(TsNodeKind::TypeAlias);
+                    kind = Some(KIND_TYPE_ALIAS);
                     def_node = Some(cap.node);
                 }
                 "class.name" | "function.name" | "method.name" | "var.name" | "interface.name"
@@ -459,27 +301,37 @@ fn collect_definitions(
                 _ => {}
             }
         }
-        let Some(name) = name else { continue };
-        let Some(node) = def_node else { continue };
-        let span = Span::from_node(node);
-        if let Some(kind) = ts_kind {
-            ts_out.push(TsExtractedNode { kind, name, span });
-        } else if let Some(kind) = js_kind {
-            js_out.push(ExtractedNode { kind, name, span });
+        if let (Some(kind), Some(name), Some(node)) = (kind, name, def_node) {
+            let id = *next_id;
+            *next_id += 1;
+            out.push(Node {
+                id,
+                kind: kind.to_owned(),
+                qname: name.clone(),
+                name,
+                span: span_from_node(node),
+                parent: None,
+            });
         }
     }
 }
 
-fn collect_imports(flavor: TsFlavor, root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
+fn collect_imports(
+    flavor: TsFlavor,
+    root: &TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
     let query = import_query(flavor);
     let mut cursor = QueryCursor::new();
     let names = query.capture_names();
     let mut matches = cursor.matches(query, *root, source);
     while let Some(m) = matches.next() {
-        let mut esm_source: Option<Node<'_>> = None;
-        let mut esm_stmt: Option<Node<'_>> = None;
-        let mut cjs_fn: Option<Node<'_>> = None;
-        let mut cjs_source: Option<Node<'_>> = None;
+        let mut esm_source: Option<TsNode<'_>> = None;
+        let mut esm_stmt: Option<TsNode<'_>> = None;
+        let mut cjs_fn: Option<TsNode<'_>> = None;
+        let mut cjs_source: Option<TsNode<'_>> = None;
         for cap in m.captures {
             match names[cap.index as usize] {
                 "import.source" => esm_source = Some(cap.node),
@@ -492,10 +344,16 @@ fn collect_imports(flavor: TsFlavor, root: &Node<'_>, source: &[u8], out: &mut V
         if let (Some(src), Some(stmt)) = (esm_source, esm_stmt) {
             let raw = slice_text(source, src);
             let name = strip_string_quotes(&raw).to_owned();
+            let id = *next_id;
+            *next_id += 1;
             out.push(Ref {
-                kind: RefKind::ImportEsm,
+                id,
+                kind: REF_IMPORT_ESM.to_owned(),
+                qname: None,
+                alias: None,
                 name,
-                span: Span::from_node(stmt),
+                span: span_from_node(stmt),
+                container: None,
             });
         }
         if let (Some(func), Some(src)) = (cjs_fn, cjs_source) {
@@ -503,26 +361,38 @@ fn collect_imports(flavor: TsFlavor, root: &Node<'_>, source: &[u8], out: &mut V
             if fn_name == "require" {
                 let raw = slice_text(source, src);
                 let name = strip_string_quotes(&raw).to_owned();
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::ImportCjs,
+                    id,
+                    kind: REF_IMPORT_CJS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name,
-                    span: Span::from_node(src),
+                    span: span_from_node(src),
+                    container: None,
                 });
             }
         }
     }
 }
 
-fn collect_exports(flavor: TsFlavor, root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
+fn collect_exports(
+    flavor: TsFlavor,
+    root: &TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
     let query = export_query(flavor);
     let mut cursor = QueryCursor::new();
     let names = query.capture_names();
     let mut matches = cursor.matches(query, *root, source);
     while let Some(m) = matches.next() {
-        let mut esm_export: Option<Node<'_>> = None;
-        let mut cjs_obj: Option<Node<'_>> = None;
-        let mut cjs_prop: Option<Node<'_>> = None;
-        let mut cjs_stmt: Option<Node<'_>> = None;
+        let mut esm_export: Option<TsNode<'_>> = None;
+        let mut cjs_obj: Option<TsNode<'_>> = None;
+        let mut cjs_prop: Option<TsNode<'_>> = None;
+        let mut cjs_stmt: Option<TsNode<'_>> = None;
         for cap in m.captures {
             match names[cap.index as usize] {
                 "export" => esm_export = Some(cap.node),
@@ -534,33 +404,51 @@ fn collect_exports(flavor: TsFlavor, root: &Node<'_>, source: &[u8], out: &mut V
         }
         if let Some(node) = esm_export {
             let name = export_label(node, source);
+            let id = *next_id;
+            *next_id += 1;
             out.push(Ref {
-                kind: RefKind::ExportEsm,
+                id,
+                kind: REF_EXPORT_ESM.to_owned(),
+                qname: None,
+                alias: None,
                 name,
-                span: Span::from_node(node),
+                span: span_from_node(node),
+                container: None,
             });
         }
         if let (Some(obj), Some(prop), Some(stmt)) = (cjs_obj, cjs_prop, cjs_stmt) {
             let obj_text = slice_text(source, obj);
             let prop_text = slice_text(source, prop);
             if obj_text == "module" && prop_text == "exports" {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::ExportCjs,
+                    id,
+                    kind: REF_EXPORT_CJS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name: "module.exports".to_owned(),
-                    span: Span::from_node(stmt),
+                    span: span_from_node(stmt),
+                    container: None,
                 });
             } else if obj_text == "exports" {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::ExportCjs,
+                    id,
+                    kind: REF_EXPORT_CJS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name: format!("exports.{prop_text}"),
-                    span: Span::from_node(stmt),
+                    span: span_from_node(stmt),
+                    container: None,
                 });
             }
         }
     }
 }
 
-fn export_label(export_node: Node<'_>, source: &[u8]) -> String {
+fn export_label(export_node: TsNode<'_>, source: &[u8]) -> String {
     if let Some(decl) = export_node.child_by_field_name("declaration")
         && let Some(name) = declaration_name(decl, source)
     {
@@ -579,7 +467,13 @@ fn export_label(export_node: Node<'_>, source: &[u8]) -> String {
     "export".to_owned()
 }
 
-fn collect_calls_and_jsx(flavor: TsFlavor, root: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
+fn collect_calls_and_jsx(
+    flavor: TsFlavor,
+    root: TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
     walk_tree(root, |node| match node.kind() {
         "call_expression" => {
             if let Some(callee) = node.child_by_field_name("function")
@@ -587,20 +481,32 @@ fn collect_calls_and_jsx(flavor: TsFlavor, root: Node<'_>, source: &[u8], out: &
             {
                 let name = callee_label(callee, source);
                 if !name.is_empty() {
+                    let id = *next_id;
+                    *next_id += 1;
                     out.push(Ref {
-                        kind: RefKind::Call,
+                        id,
+                        kind: REF_CALL.to_owned(),
+                        qname: None,
+                        alias: None,
                         name,
-                        span: Span::from_node(node),
+                        span: span_from_node(node),
+                        container: None,
                     });
                 }
             }
         }
         "member_expression" => {
             if let Some(prop) = node.child_by_field_name("property") {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::MemberAccess,
+                    id,
+                    kind: REF_MEMBER_ACCESS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name: slice_text(source, prop),
-                    span: Span::from_node(node),
+                    span: span_from_node(node),
+                    container: None,
                 });
             }
         }
@@ -610,10 +516,16 @@ fn collect_calls_and_jsx(flavor: TsFlavor, root: Node<'_>, source: &[u8], out: &
             {
                 let text = slice_text(source, name_node);
                 if is_component_name(&text) {
+                    let id = *next_id;
+                    *next_id += 1;
                     out.push(Ref {
-                        kind: RefKind::JsxComponent,
+                        id,
+                        kind: REF_JSX_COMPONENT.to_owned(),
+                        qname: None,
+                        alias: None,
                         name: text,
-                        span: Span::from_node(node),
+                        span: span_from_node(node),
+                        container: None,
                     });
                 }
             }
@@ -622,19 +534,30 @@ fn collect_calls_and_jsx(flavor: TsFlavor, root: Node<'_>, source: &[u8], out: &
     });
 }
 
-fn collect_type_references(root: Node<'_>, source: &[u8], out: &mut Vec<TsRef>) {
+fn collect_type_references(
+    root: TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
     walk_tree(root, |node| {
         if node.kind() == "type_identifier" && !is_definition_name(node) {
-            out.push(TsRef {
-                kind: TsRefKind::TypeReference,
+            let id = *next_id;
+            *next_id += 1;
+            out.push(Ref {
+                id,
+                kind: REF_TYPE_REFERENCE.to_owned(),
+                qname: None,
+                alias: None,
                 name: slice_text(source, node),
-                span: Span::from_node(node),
+                span: span_from_node(node),
+                container: None,
             });
         }
     });
 }
 
-fn is_definition_name(node: Node<'_>) -> bool {
+fn is_definition_name(node: TsNode<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -666,19 +589,19 @@ mod tests {
         PathBuf::from("Component.tsx")
     }
 
-    fn extract_ts(source: &str) -> CanonicalExtractedFile {
+    fn extract_ts(source: &str) -> ExtractedFile {
         TypeScriptPlugin::typescript().extract(source.as_bytes(), &ts_path())
     }
 
-    fn extract_tsx(source: &str) -> CanonicalExtractedFile {
+    fn extract_tsx(source: &str) -> ExtractedFile {
         TypeScriptPlugin::tsx().extract(source.as_bytes(), &tsx_path())
     }
 
-    fn refs_of_kind<'a>(file: &'a CanonicalExtractedFile, kind: &str) -> Vec<&'a CanonicalRef> {
+    fn refs_of_kind<'a>(file: &'a ExtractedFile, kind: &str) -> Vec<&'a Ref> {
         file.refs.iter().filter(|r| r.kind == kind).collect()
     }
 
-    fn nodes_of_kind<'a>(file: &'a CanonicalExtractedFile, kind: &str) -> Vec<&'a CanonicalNode> {
+    fn nodes_of_kind<'a>(file: &'a ExtractedFile, kind: &str) -> Vec<&'a Node> {
         file.nodes.iter().filter(|n| n.kind == kind).collect()
     }
 
@@ -810,8 +733,8 @@ function App() {
     fn plugin_metadata() {
         let ts = TypeScriptPlugin::typescript();
         let tsx = TypeScriptPlugin::tsx();
-        assert_eq!(ts.id(), CanonicalLanguageId::TypeScript);
-        assert_eq!(tsx.id(), CanonicalLanguageId::Tsx);
+        assert_eq!(ts.id(), LanguageId::TypeScript);
+        assert_eq!(tsx.id(), LanguageId::Tsx);
         assert_eq!(ts.extensions(), &["ts", "mts", "cts"]);
         assert_eq!(tsx.extensions(), &["tsx"]);
         assert_eq!(ts.flavor(), TsFlavor::TypeScript);

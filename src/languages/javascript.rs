@@ -1,101 +1,26 @@
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Language, Node as TsNode, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LanguageId {
-    JavaScript,
-    TypeScript,
-    Tsx,
-}
+use crate::extract::{
+    Diagnostic, ExtractedFile, LocalNodeId, LocalRefId, Node, Position, Ref, Severity, Span,
+};
+use crate::language::{LanguageId, LanguagePlugin, LanguageQueries};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodeKind {
-    Module,
-    Class,
-    Function,
-    Method,
-    ArrowFunction,
-    Variable,
-}
+const KIND_CLASS: &str = "class";
+const KIND_FUNCTION: &str = "function";
+const KIND_METHOD: &str = "method";
+const KIND_ARROW_FUNCTION: &str = "arrow_function";
+const KIND_VARIABLE: &str = "variable";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RefKind {
-    ImportEsm,
-    ImportCjs,
-    ExportEsm,
-    ExportCjs,
-    Call,
-    MemberAccess,
-    JsxComponent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_row: usize,
-    pub start_col: usize,
-    pub end_row: usize,
-    pub end_col: usize,
-}
-
-impl Span {
-    pub(super) fn from_node(node: Node<'_>) -> Self {
-        let start = node.start_position();
-        let end = node.end_position();
-        Self {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            start_row: start.row,
-            start_col: start.column,
-            end_row: end.row,
-            end_col: end.column,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtractedNode {
-    pub kind: NodeKind,
-    pub name: String,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ref {
-    pub kind: RefKind,
-    pub name: String,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiagnosticSeverity {
-    Error,
-    Warning,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub severity: DiagnosticSeverity,
-    pub message: String,
-    pub span: Span,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ExtractedFile {
-    pub language: Option<LanguageId>,
-    pub nodes: Vec<ExtractedNode>,
-    pub refs: Vec<Ref>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-pub trait LanguagePlugin {
-    fn id(&self) -> LanguageId;
-    fn extensions(&self) -> &'static [&'static str];
-    fn tree_sitter_language(&self) -> Language;
-    fn extract(&self, tree: &Tree, source: &[u8]) -> ExtractedFile;
-}
+const REF_IMPORT_ESM: &str = "import_esm";
+const REF_IMPORT_CJS: &str = "import_cjs";
+const REF_EXPORT_ESM: &str = "export_esm";
+const REF_EXPORT_CJS: &str = "export_cjs";
+const REF_CALL: &str = "call";
+const REF_MEMBER_ACCESS: &str = "member_access";
+const REF_JSX_COMPONENT: &str = "jsx_component";
 
 const DEFINITIONS_QUERY: &str = r#"
 (class_declaration
@@ -132,6 +57,14 @@ const EXPORT_QUERY: &str = r#"
     property: (property_identifier) @cjs.prop)) @cjs.export
 "#;
 
+static QUERIES: LanguageQueries = LanguageQueries {
+    definitions: DEFINITIONS_QUERY,
+    imports: IMPORT_QUERY,
+    exports: EXPORT_QUERY,
+    types: "",
+    routes: "",
+};
+
 pub struct JavaScriptPlugin;
 
 impl JavaScriptPlugin {
@@ -155,12 +88,24 @@ impl LanguagePlugin for JavaScriptPlugin {
         &["js", "jsx", "cjs", "mjs"]
     }
 
+    fn queries(&self) -> &'static LanguageQueries {
+        &QUERIES
+    }
+
     fn tree_sitter_language(&self) -> Language {
         tree_sitter_javascript::LANGUAGE.into()
     }
 
-    fn extract(&self, tree: &Tree, source: &[u8]) -> ExtractedFile {
-        extract_internal(tree, source)
+    fn extract(&self, source: &[u8], path: &Path) -> ExtractedFile {
+        let mut file = ExtractedFile {
+            path: path.to_path_buf(),
+            ..Default::default()
+        };
+        let Some(tree) = parse(source) else {
+            return file;
+        };
+        extract_into(&tree, source, &mut file);
+        file
     }
 }
 
@@ -205,31 +150,47 @@ pub fn parse(source: &[u8]) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-pub fn extract(source: &[u8]) -> ExtractedFile {
-    let Some(tree) = parse(source) else {
-        return ExtractedFile {
-            language: Some(LanguageId::JavaScript),
-            ..Default::default()
-        };
-    };
-    extract_internal(&tree, source)
-}
-
-fn extract_internal(tree: &Tree, source: &[u8]) -> ExtractedFile {
-    let mut out = ExtractedFile {
-        language: Some(LanguageId::JavaScript),
+pub fn extract(source: &[u8], path: &Path) -> ExtractedFile {
+    let mut file = ExtractedFile {
+        path: path.to_path_buf(),
         ..Default::default()
     };
-    let root = tree.root_node();
-    collect_definitions(&root, source, &mut out.nodes);
-    collect_imports(&root, source, &mut out.refs);
-    collect_exports(&root, source, &mut out.refs);
-    collect_calls_and_jsx(root, source, &mut out.refs);
-    collect_diagnostics(root, &mut out.diagnostics);
-    out
+    let Some(tree) = parse(source) else {
+        return file;
+    };
+    extract_into(&tree, source, &mut file);
+    file
 }
 
-pub(super) fn slice_text(source: &[u8], node: Node<'_>) -> String {
+fn extract_into(tree: &Tree, source: &[u8], out: &mut ExtractedFile) {
+    let root = tree.root_node();
+    let mut node_id: LocalNodeId = 0;
+    let mut ref_id: LocalRefId = 0;
+    collect_definitions(&root, source, &mut out.nodes, &mut node_id);
+    collect_imports(&root, source, &mut out.refs, &mut ref_id);
+    collect_exports(&root, source, &mut out.refs, &mut ref_id);
+    collect_calls_and_jsx(root, source, &mut out.refs, &mut ref_id);
+    collect_diagnostics(root, &mut out.diagnostics);
+}
+
+pub(super) fn span_from_node(node: TsNode<'_>) -> Span {
+    let start = node.start_position();
+    let end = node.end_position();
+    Span {
+        start: Position {
+            byte: node.start_byte(),
+            row: start.row,
+            column: start.column,
+        },
+        end: Position {
+            byte: node.end_byte(),
+            row: end.row,
+            column: end.column,
+        },
+    }
+}
+
+pub(super) fn slice_text(source: &[u8], node: TsNode<'_>) -> String {
     let bytes = &source[node.byte_range()];
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -246,28 +207,33 @@ pub(super) fn strip_string_quotes(raw: &str) -> &str {
     raw
 }
 
-fn collect_definitions(root: &Node<'_>, source: &[u8], out: &mut Vec<ExtractedNode>) {
+fn collect_definitions(
+    root: &TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Node>,
+    next_id: &mut LocalNodeId,
+) {
     let query = definitions_query();
     let mut cursor = QueryCursor::new();
     let names = query.capture_names();
     let mut matches = cursor.matches(query, *root, source);
     while let Some(m) = matches.next() {
-        let mut kind: Option<NodeKind> = None;
+        let mut kind: Option<&'static str> = None;
         let mut name: Option<String> = None;
-        let mut def_node: Option<Node<'_>> = None;
+        let mut def_node: Option<TsNode<'_>> = None;
         for cap in m.captures {
             let cname = names[cap.index as usize];
             match cname {
                 "class.def" => {
-                    kind = Some(NodeKind::Class);
+                    kind = Some(KIND_CLASS);
                     def_node = Some(cap.node);
                 }
                 "function.def" => {
-                    kind = Some(NodeKind::Function);
+                    kind = Some(KIND_FUNCTION);
                     def_node = Some(cap.node);
                 }
                 "method.def" => {
-                    kind = Some(NodeKind::Method);
+                    kind = Some(KIND_METHOD);
                     def_node = Some(cap.node);
                 }
                 "var.def" => {
@@ -281,37 +247,42 @@ fn collect_definitions(root: &Node<'_>, source: &[u8], out: &mut Vec<ExtractedNo
             }
         }
         if let (Some(kind), Some(name), Some(node)) = (kind, name, def_node) {
-            out.push(ExtractedNode {
-                kind,
+            let id = *next_id;
+            *next_id += 1;
+            out.push(Node {
+                id,
+                kind: kind.to_owned(),
+                qname: name.clone(),
                 name,
-                span: Span::from_node(node),
+                span: span_from_node(node),
+                parent: None,
             });
         }
     }
 }
 
-pub(super) fn variable_kind_from_declarator(declarator: Node<'_>) -> NodeKind {
+pub(super) fn variable_kind_from_declarator(declarator: TsNode<'_>) -> &'static str {
     let Some(value) = declarator.child_by_field_name("value") else {
-        return NodeKind::Variable;
+        return KIND_VARIABLE;
     };
     match value.kind() {
-        "arrow_function" => NodeKind::ArrowFunction,
-        "function_expression" | "generator_function" => NodeKind::Function,
-        "class" => NodeKind::Class,
-        _ => NodeKind::Variable,
+        "arrow_function" => KIND_ARROW_FUNCTION,
+        "function_expression" | "generator_function" => KIND_FUNCTION,
+        "class" => KIND_CLASS,
+        _ => KIND_VARIABLE,
     }
 }
 
-fn collect_imports(root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
+fn collect_imports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id: &mut LocalRefId) {
     let query = import_query();
     let mut cursor = QueryCursor::new();
     let names = query.capture_names();
     let mut matches = cursor.matches(query, *root, source);
     while let Some(m) = matches.next() {
-        let mut esm_source: Option<Node<'_>> = None;
-        let mut esm_stmt: Option<Node<'_>> = None;
-        let mut cjs_fn: Option<Node<'_>> = None;
-        let mut cjs_source: Option<Node<'_>> = None;
+        let mut esm_source: Option<TsNode<'_>> = None;
+        let mut esm_stmt: Option<TsNode<'_>> = None;
+        let mut cjs_fn: Option<TsNode<'_>> = None;
+        let mut cjs_source: Option<TsNode<'_>> = None;
         for cap in m.captures {
             match names[cap.index as usize] {
                 "import.source" => esm_source = Some(cap.node),
@@ -324,10 +295,16 @@ fn collect_imports(root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
         if let (Some(src), Some(stmt)) = (esm_source, esm_stmt) {
             let raw = slice_text(source, src);
             let name = strip_string_quotes(&raw).to_owned();
+            let id = *next_id;
+            *next_id += 1;
             out.push(Ref {
-                kind: RefKind::ImportEsm,
+                id,
+                kind: REF_IMPORT_ESM.to_owned(),
+                qname: None,
+                alias: None,
                 name,
-                span: Span::from_node(stmt),
+                span: span_from_node(stmt),
+                container: None,
             });
         }
         if let (Some(func), Some(src)) = (cjs_fn, cjs_source) {
@@ -335,26 +312,32 @@ fn collect_imports(root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
             if fn_name == "require" {
                 let raw = slice_text(source, src);
                 let name = strip_string_quotes(&raw).to_owned();
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::ImportCjs,
+                    id,
+                    kind: REF_IMPORT_CJS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name,
-                    span: Span::from_node(src),
+                    span: span_from_node(src),
+                    container: None,
                 });
             }
         }
     }
 }
 
-fn collect_exports(root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
+fn collect_exports(root: &TsNode<'_>, source: &[u8], out: &mut Vec<Ref>, next_id: &mut LocalRefId) {
     let query = export_query();
     let mut cursor = QueryCursor::new();
     let names = query.capture_names();
     let mut matches = cursor.matches(query, *root, source);
     while let Some(m) = matches.next() {
-        let mut esm_export: Option<Node<'_>> = None;
-        let mut cjs_obj: Option<Node<'_>> = None;
-        let mut cjs_prop: Option<Node<'_>> = None;
-        let mut cjs_stmt: Option<Node<'_>> = None;
+        let mut esm_export: Option<TsNode<'_>> = None;
+        let mut cjs_obj: Option<TsNode<'_>> = None;
+        let mut cjs_prop: Option<TsNode<'_>> = None;
+        let mut cjs_stmt: Option<TsNode<'_>> = None;
         for cap in m.captures {
             match names[cap.index as usize] {
                 "export" => esm_export = Some(cap.node),
@@ -366,33 +349,51 @@ fn collect_exports(root: &Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
         }
         if let Some(node) = esm_export {
             let name = export_label(node, source);
+            let id = *next_id;
+            *next_id += 1;
             out.push(Ref {
-                kind: RefKind::ExportEsm,
+                id,
+                kind: REF_EXPORT_ESM.to_owned(),
+                qname: None,
+                alias: None,
                 name,
-                span: Span::from_node(node),
+                span: span_from_node(node),
+                container: None,
             });
         }
         if let (Some(obj), Some(prop), Some(stmt)) = (cjs_obj, cjs_prop, cjs_stmt) {
             let obj_text = slice_text(source, obj);
             let prop_text = slice_text(source, prop);
             if obj_text == "module" && prop_text == "exports" {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::ExportCjs,
+                    id,
+                    kind: REF_EXPORT_CJS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name: "module.exports".to_owned(),
-                    span: Span::from_node(stmt),
+                    span: span_from_node(stmt),
+                    container: None,
                 });
             } else if obj_text == "exports" {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::ExportCjs,
+                    id,
+                    kind: REF_EXPORT_CJS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name: format!("exports.{prop_text}"),
-                    span: Span::from_node(stmt),
+                    span: span_from_node(stmt),
+                    container: None,
                 });
             }
         }
     }
 }
 
-fn export_label(export_node: Node<'_>, source: &[u8]) -> String {
+fn export_label(export_node: TsNode<'_>, source: &[u8]) -> String {
     if let Some(decl) = export_node.child_by_field_name("declaration")
         && let Some(name) = declaration_name(decl, source)
     {
@@ -408,7 +409,7 @@ fn export_label(export_node: Node<'_>, source: &[u8]) -> String {
     "export".to_owned()
 }
 
-pub(super) fn declaration_name(decl: Node<'_>, source: &[u8]) -> Option<String> {
+pub(super) fn declaration_name(decl: TsNode<'_>, source: &[u8]) -> Option<String> {
     if let Some(name) = decl.child_by_field_name("name") {
         return Some(slice_text(source, name));
     }
@@ -425,7 +426,7 @@ pub(super) fn declaration_name(decl: Node<'_>, source: &[u8]) -> Option<String> 
     None
 }
 
-fn is_default_export(export_node: Node<'_>) -> bool {
+fn is_default_export(export_node: TsNode<'_>) -> bool {
     let mut cursor = export_node.walk();
     for child in export_node.children(&mut cursor) {
         if !child.is_named() && child.kind() == "default" {
@@ -435,11 +436,21 @@ fn is_default_export(export_node: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn collect_calls_and_jsx(root: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
-    walk_tree(root, |node| visit_call_or_jsx(node, source, out));
+pub(super) fn collect_calls_and_jsx(
+    root: TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
+    walk_tree(root, |node| visit_call_or_jsx(node, source, out, next_id));
 }
 
-fn visit_call_or_jsx(node: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
+fn visit_call_or_jsx(
+    node: TsNode<'_>,
+    source: &[u8],
+    out: &mut Vec<Ref>,
+    next_id: &mut LocalRefId,
+) {
     match node.kind() {
         "call_expression" => {
             if let Some(callee) = node.child_by_field_name("function")
@@ -447,10 +458,16 @@ fn visit_call_or_jsx(node: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
             {
                 let name = callee_label(callee, source);
                 if !name.is_empty() {
+                    let id = *next_id;
+                    *next_id += 1;
                     out.push(Ref {
-                        kind: RefKind::Call,
+                        id,
+                        kind: REF_CALL.to_owned(),
+                        qname: None,
+                        alias: None,
                         name,
-                        span: Span::from_node(node),
+                        span: span_from_node(node),
+                        container: None,
                     });
                 }
             }
@@ -458,10 +475,16 @@ fn visit_call_or_jsx(node: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
         "member_expression" => {
             if let Some(prop) = node.child_by_field_name("property") {
                 let name = slice_text(source, prop);
+                let id = *next_id;
+                *next_id += 1;
                 out.push(Ref {
-                    kind: RefKind::MemberAccess,
+                    id,
+                    kind: REF_MEMBER_ACCESS.to_owned(),
+                    qname: None,
+                    alias: None,
                     name,
-                    span: Span::from_node(node),
+                    span: span_from_node(node),
+                    container: None,
                 });
             }
         }
@@ -469,10 +492,16 @@ fn visit_call_or_jsx(node: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let text = slice_text(source, name_node);
                 if is_component_name(&text) {
+                    let id = *next_id;
+                    *next_id += 1;
                     out.push(Ref {
-                        kind: RefKind::JsxComponent,
+                        id,
+                        kind: REF_JSX_COMPONENT.to_owned(),
+                        qname: None,
+                        alias: None,
                         name: text,
-                        span: Span::from_node(node),
+                        span: span_from_node(node),
+                        container: None,
                     });
                 }
             }
@@ -481,11 +510,11 @@ fn visit_call_or_jsx(node: Node<'_>, source: &[u8], out: &mut Vec<Ref>) {
     }
 }
 
-pub(super) fn is_require_call(callee: Node<'_>, source: &[u8]) -> bool {
+pub(super) fn is_require_call(callee: TsNode<'_>, source: &[u8]) -> bool {
     callee.kind() == "identifier" && slice_text(source, callee) == "require"
 }
 
-pub(super) fn callee_label(callee: Node<'_>, source: &[u8]) -> String {
+pub(super) fn callee_label(callee: TsNode<'_>, source: &[u8]) -> String {
     match callee.kind() {
         "identifier" => slice_text(source, callee),
         "member_expression" => {
@@ -506,26 +535,26 @@ pub(super) fn is_component_name(name: &str) -> bool {
         .is_some_and(|c| c.is_ascii_uppercase() || c == '_' || c == '$')
 }
 
-pub(super) fn collect_diagnostics(root: Node<'_>, out: &mut Vec<Diagnostic>) {
+pub(super) fn collect_diagnostics(root: TsNode<'_>, out: &mut Vec<Diagnostic>) {
     if !root.has_error() {
         return;
     }
     walk_tree(root, |node| {
         if node.is_error() || node.is_missing() {
             out.push(Diagnostic {
-                severity: DiagnosticSeverity::Error,
+                severity: Severity::Error,
                 message: if node.is_missing() {
                     format!("missing {}", node.kind())
                 } else {
                     "syntax error".to_owned()
                 },
-                span: Span::from_node(node),
+                span: Some(span_from_node(node)),
             });
         }
     });
 }
 
-pub(super) fn walk_tree<F: FnMut(Node<'_>)>(root: Node<'_>, mut visit: F) {
+pub(super) fn walk_tree<F: FnMut(TsNode<'_>)>(root: TsNode<'_>, mut visit: F) {
     let mut cursor = root.walk();
     'outer: loop {
         visit(cursor.node());
@@ -546,23 +575,24 @@ pub(super) fn walk_tree<F: FnMut(Node<'_>)>(root: Node<'_>, mut visit: F) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn extract_str(source: &str) -> ExtractedFile {
-        extract(source.as_bytes())
+        extract(source.as_bytes(), &PathBuf::from("test.js"))
     }
 
-    fn refs_of_kind(file: &ExtractedFile, kind: RefKind) -> Vec<&Ref> {
+    fn refs_of_kind<'a>(file: &'a ExtractedFile, kind: &str) -> Vec<&'a Ref> {
         file.refs.iter().filter(|r| r.kind == kind).collect()
     }
 
-    fn nodes_of_kind(file: &ExtractedFile, kind: NodeKind) -> Vec<&ExtractedNode> {
+    fn nodes_of_kind<'a>(file: &'a ExtractedFile, kind: &str) -> Vec<&'a Node> {
         file.nodes.iter().filter(|n| n.kind == kind).collect()
     }
 
     #[test]
     fn esm_default_import_extracts_source() {
         let file = extract_str("import x from 'mod';");
-        let imports = refs_of_kind(&file, RefKind::ImportEsm);
+        let imports = refs_of_kind(&file, REF_IMPORT_ESM);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "mod");
     }
@@ -570,7 +600,7 @@ mod tests {
     #[test]
     fn esm_named_imports_extract_source() {
         let file = extract_str("import {a, b} from 'mod';");
-        let imports = refs_of_kind(&file, RefKind::ImportEsm);
+        let imports = refs_of_kind(&file, REF_IMPORT_ESM);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "mod");
     }
@@ -578,7 +608,7 @@ mod tests {
     #[test]
     fn esm_namespace_import_extracts_source() {
         let file = extract_str("import * as ns from 'mod';");
-        let imports = refs_of_kind(&file, RefKind::ImportEsm);
+        let imports = refs_of_kind(&file, REF_IMPORT_ESM);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "mod");
     }
@@ -586,7 +616,7 @@ mod tests {
     #[test]
     fn require_call_is_cjs_import() {
         let file = extract_str("const foo = require('foo');");
-        let imports = refs_of_kind(&file, RefKind::ImportCjs);
+        let imports = refs_of_kind(&file, REF_IMPORT_CJS);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "foo");
     }
@@ -600,9 +630,9 @@ class Foo {
 const baz = () => 2;
 "#;
         let file = extract_str(source);
-        let classes = nodes_of_kind(&file, NodeKind::Class);
-        let methods = nodes_of_kind(&file, NodeKind::Method);
-        let arrows = nodes_of_kind(&file, NodeKind::ArrowFunction);
+        let classes = nodes_of_kind(&file, KIND_CLASS);
+        let methods = nodes_of_kind(&file, KIND_METHOD);
+        let arrows = nodes_of_kind(&file, KIND_ARROW_FUNCTION);
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].name, "Foo");
         assert_eq!(methods.len(), 1);
@@ -614,7 +644,7 @@ const baz = () => 2;
     #[test]
     fn function_declarations_extracted() {
         let file = extract_str("function alpha(x) { return x; }");
-        let funcs = nodes_of_kind(&file, NodeKind::Function);
+        let funcs = nodes_of_kind(&file, KIND_FUNCTION);
         assert_eq!(funcs.len(), 1);
         assert_eq!(funcs[0].name, "alpha");
     }
@@ -622,7 +652,7 @@ const baz = () => 2;
     #[test]
     fn calls_collected() {
         let file = extract_str("foo(); bar.baz();");
-        let calls = refs_of_kind(&file, RefKind::Call);
+        let calls = refs_of_kind(&file, REF_CALL);
         let names: Vec<_> = calls.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"foo"));
         assert!(names.contains(&"baz"));
@@ -634,7 +664,7 @@ const baz = () => 2;
 const tree = <MyComponent prop={x} />;
 "#;
         let file = extract_str(source);
-        let comps = refs_of_kind(&file, RefKind::JsxComponent);
+        let comps = refs_of_kind(&file, REF_JSX_COMPONENT);
         assert_eq!(comps.len(), 1);
         assert_eq!(comps[0].name, "MyComponent");
     }
@@ -643,14 +673,14 @@ const tree = <MyComponent prop={x} />;
     fn jsx_lowercase_not_component() {
         let source = "const tree = <div>hi</div>;";
         let file = extract_str(source);
-        let comps = refs_of_kind(&file, RefKind::JsxComponent);
+        let comps = refs_of_kind(&file, REF_JSX_COMPONENT);
         assert!(comps.is_empty());
     }
 
     #[test]
     fn esm_export_named_emits_ref() {
         let file = extract_str("export function foo() {}");
-        let exports = refs_of_kind(&file, RefKind::ExportEsm);
+        let exports = refs_of_kind(&file, REF_EXPORT_ESM);
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "foo");
     }
@@ -658,7 +688,7 @@ const tree = <MyComponent prop={x} />;
     #[test]
     fn esm_export_const_extracts_variable_name() {
         let file = extract_str("export const value = 1;");
-        let exports = refs_of_kind(&file, RefKind::ExportEsm);
+        let exports = refs_of_kind(&file, REF_EXPORT_ESM);
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "value");
     }
@@ -666,7 +696,7 @@ const tree = <MyComponent prop={x} />;
     #[test]
     fn esm_export_default_anonymous_uses_default_label() {
         let file = extract_str("export default 42;");
-        let exports = refs_of_kind(&file, RefKind::ExportEsm);
+        let exports = refs_of_kind(&file, REF_EXPORT_ESM);
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "default");
     }
@@ -674,8 +704,8 @@ const tree = <MyComponent prop={x} />;
     #[test]
     fn arrow_assigned_to_string_is_not_arrow_function() {
         let file = extract_str("const message = \"use function with =>\";");
-        let arrows = nodes_of_kind(&file, NodeKind::ArrowFunction);
-        let vars = nodes_of_kind(&file, NodeKind::Variable);
+        let arrows = nodes_of_kind(&file, KIND_ARROW_FUNCTION);
+        let vars = nodes_of_kind(&file, KIND_VARIABLE);
         assert!(arrows.is_empty());
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name, "message");
@@ -684,7 +714,7 @@ const tree = <MyComponent prop={x} />;
     #[test]
     fn cjs_module_exports_emits_ref() {
         let file = extract_str("module.exports = function () {};");
-        let exports = refs_of_kind(&file, RefKind::ExportCjs);
+        let exports = refs_of_kind(&file, REF_EXPORT_CJS);
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "module.exports");
     }
