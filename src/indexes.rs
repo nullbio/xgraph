@@ -65,6 +65,9 @@ pub struct SymbolKey {
 pub struct HotIndexes {
     nodes: DashMap<NodeId, NodeRecord>,
     symbols: DashMap<SymbolKey, Vec<NodeId>>,
+    /// Secondary index: `name -> [SymbolKey]` so `lookup_symbol_by_name`
+    /// doesn't have to scan every symbol entry.
+    symbols_by_name: DashMap<String, Vec<SymbolKey>>,
     files: RwLock<HashMap<PathBuf, Vec<NodeId>>>,
     callers: RwLock<HashMap<NodeId, Vec<NodeId>>>,
     callees: RwLock<HashMap<NodeId, Vec<NodeId>>>,
@@ -75,6 +78,7 @@ impl HotIndexes {
         Self {
             nodes: DashMap::new(),
             symbols: DashMap::new(),
+            symbols_by_name: DashMap::new(),
             files: RwLock::new(HashMap::new()),
             callers: RwLock::new(HashMap::new()),
             callees: RwLock::new(HashMap::new()),
@@ -320,9 +324,17 @@ impl HotIndexes {
     }
 
     pub fn register_symbol(&self, key: SymbolKey, node_id: NodeId) {
-        let mut entry = self.symbols.entry(key).or_default();
+        // Primary map: (name, kind) -> node ids.
+        let mut entry = self.symbols.entry(key.clone()).or_default();
         if !entry.contains(&node_id) {
             entry.push(node_id);
+        }
+        drop(entry);
+        // Secondary map: name -> set of registered keys, so a kind-less
+        // lookup avoids scanning every entry.
+        let mut by_name = self.symbols_by_name.entry(key.name.clone()).or_default();
+        if !by_name.contains(&key) {
+            by_name.push(key);
         }
     }
 
@@ -336,20 +348,41 @@ impl HotIndexes {
     /// Symbols matching `name`, regardless of `kind`. Useful for the MCP
     /// `find_symbol` call where the caller doesn't supply a kind filter.
     pub fn lookup_symbol_by_name(&self, name: &str) -> Vec<NodeId> {
+        let Some(keys_ref) = self.symbols_by_name.get(name) else {
+            return Vec::new();
+        };
+        let keys: Vec<SymbolKey> = keys_ref.value().clone();
+        drop(keys_ref);
         let mut hits = Vec::new();
-        for entry in self.symbols.iter() {
-            if entry.key().name == name {
-                hits.extend(entry.value().iter().cloned());
+        for key in &keys {
+            if let Some(ids) = self.symbols.get(key) {
+                hits.extend(ids.value().iter().cloned());
             }
         }
         hits
     }
 
     pub fn unregister_symbol(&self, key: &SymbolKey, node_id: &NodeId) {
-        self.symbols.remove_if_mut(key, |_, ids| {
-            ids.retain(|id| id != node_id);
-            ids.is_empty()
-        });
+        let now_empty = {
+            let mut entry = match self.symbols.get_mut(key) {
+                Some(e) => e,
+                None => return,
+            };
+            entry.retain(|id| id != node_id);
+            entry.is_empty()
+        };
+        if now_empty {
+            self.symbols.remove(key);
+            // Also drop the key from the name-indexed secondary map.
+            let mut should_drop = false;
+            if let Some(mut keys) = self.symbols_by_name.get_mut(&key.name) {
+                keys.retain(|k| k != key);
+                should_drop = keys.is_empty();
+            }
+            if should_drop {
+                self.symbols_by_name.remove(&key.name);
+            }
+        }
     }
 }
 

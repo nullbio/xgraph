@@ -173,12 +173,25 @@ impl<'src> LaravelInputBuilder<'src> {
 
     fn walk(&mut self, node: TsNode<'_>) {
         let kind = node.kind();
-        // Track namespace at the top level so qualified names are correct.
-        if kind == "namespace_definition"
-            && let Some(name_node) = node.child_by_field_name("name")
-        {
-            self.namespace = Some(self.slice(name_node).trim_matches('\\').to_string());
-        }
+        // Track namespace. Two PHP forms:
+        //   1. `namespace X;` (no body) — applies from this point until the
+        //      next namespace_definition or end of file.
+        //   2. `namespace X { ... }` (with body) — scoped to the body block.
+        // For form 2 we save+restore around the walk so siblings see the
+        // outer (or default) namespace correctly.
+        let saved_namespace = if kind == "namespace_definition" {
+            let new_ns = node
+                .child_by_field_name("name")
+                .map(|n| self.slice(n).trim_matches('\\').to_string());
+            let has_body = node.child_by_field_name("body").is_some();
+            let prior = self.namespace.clone();
+            if let Some(ns) = new_ns {
+                self.namespace = Some(ns);
+            }
+            if has_body { Some(prior) } else { None }
+        } else {
+            None
+        };
 
         let pushed_scope = match kind {
             "class_declaration"
@@ -264,6 +277,9 @@ impl<'src> LaravelInputBuilder<'src> {
         }
         if pushed_scope {
             self.scope.pop();
+        }
+        if let Some(prior) = saved_namespace {
+            self.namespace = prior;
         }
     }
 

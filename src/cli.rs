@@ -334,11 +334,13 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
                     }
                 }
                 for path in &batch.deleted {
-                    let _ = path.strip_prefix(&worktree_root_for_thread).unwrap_or(path);
                     if let Err(err) = owner.process_delete(path.clone()) {
                         eprintln!("watcher: process_delete {}: {err}", path.display());
                     }
                 }
+                // worktree_root_for_thread is captured for the diagnostic logs above; the
+                // strip_prefix happens inside process_delete itself.
+                let _ = &worktree_root_for_thread;
                 if batch.ignore_file_changed
                     && let Err(err) = owner.reconcile_after_ignore_change()
                 {
@@ -367,7 +369,9 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         let socket_path = handle.socket_path().to_path_buf();
         eprintln!("daemon listening on {}", socket_path.display());
         // Wait for SIGTERM/SIGINT.
-        wait_for_shutdown().await;
+        if let Err(err) = wait_for_shutdown().await {
+            eprintln!("failed to install signal handler: {err}; shutting down");
+        }
         handle.shutdown().await
     });
 
@@ -380,15 +384,14 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn wait_for_shutdown() {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .expect("install SIGINT handler");
+async fn wait_for_shutdown() -> Result<(), std::io::Error> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
     }
+    Ok(())
 }
 
 fn cmd_daemon_stop() -> Result<ExitCode, CliError> {
@@ -431,10 +434,21 @@ fn cmd_status() -> Result<ExitCode, CliError> {
     let socket_path = runtime.socket_path();
     let socket_state = if !socket_path.exists() {
         "absent"
-    } else if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-        "reachable"
     } else {
-        "stale (file exists but no daemon accepting)"
+        // `UnixStream::connect` blocks indefinitely on a hung socket. There's
+        // no direct connect_timeout for AF_UNIX in std, so we run the connect
+        // on a helper thread and join with a short deadline.
+        let socket_path_for_probe = socket_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let ok = std::os::unix::net::UnixStream::connect(&socket_path_for_probe).is_ok();
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(true) => "reachable",
+            Ok(false) => "stale (file exists but no daemon accepting)",
+            Err(_) => "stale (connect timed out)",
+        }
     };
     let pid_present = runtime.pid_file_path().exists();
     println!("worktree:      {}", worktree.as_path().display());

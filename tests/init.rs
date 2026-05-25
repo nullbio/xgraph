@@ -128,6 +128,47 @@ fn laravel_route_emits_framework_edge() {
     );
 }
 
+/// Deleting a file on disk and re-running init must remove its active rows
+/// from Cozo. Proxies the watcher's process_delete path via cmd_reindex
+/// (which truncates then re-indexes).
+#[test]
+fn reindex_drops_facts_for_deleted_files() {
+    use std::env;
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    fs::write(tmp.path().join("kept.py"), "def kept_fn():\n    return 1\n").unwrap();
+    fs::write(tmp.path().join("gone.py"), "def gone_fn():\n    return 2\n").unwrap();
+
+    init_at(tmp.path()).expect("first init");
+
+    // Verify both symbols indexed.
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    {
+        let store = CozoStore::open(&cozo_path).expect("open store");
+        let idx = HotIndexes::load_from_cozo(&store).expect("load");
+        assert!(!idx.lookup_symbol_by_name("kept_fn").is_empty());
+        assert!(!idx.lookup_symbol_by_name("gone_fn").is_empty());
+    }
+
+    // Delete one file, run reindex (which truncates first).
+    fs::remove_file(tmp.path().join("gone.py")).unwrap();
+    let original = env::current_dir().expect("cwd");
+    env::set_current_dir(tmp.path()).unwrap();
+    let _ = xgraph::cli::run(["xgraph", "reindex"].into_iter().map(String::from));
+    env::set_current_dir(original).unwrap();
+
+    let store = CozoStore::open(&cozo_path).expect("reopen");
+    let idx = HotIndexes::load_from_cozo(&store).expect("load2");
+    assert!(
+        !idx.lookup_symbol_by_name("kept_fn").is_empty(),
+        "kept_fn should still be indexed"
+    );
+    assert!(
+        idx.lookup_symbol_by_name("gone_fn").is_empty(),
+        "gone_fn should be absent after deletion + reindex"
+    );
+}
+
 /// `init_at` is idempotent thanks to the hash-skip cache. Re-running it on
 /// an unchanged worktree must succeed and must not corrupt the prior facts.
 #[test]

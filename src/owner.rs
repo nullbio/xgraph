@@ -166,6 +166,12 @@ impl WorktreeOwner {
         // receivers, methods, and argument literals) that the canonical
         // `ExtractedFile` does not preserve; the resolver consumes it and
         // emits edges with `Provenance::LaravelHeuristic`.
+        //
+        // Synthetic node IDs use the `lh:` prefix so they cannot collide
+        // with parser-extracted IDs (which always start with the 64-hex-char
+        // content hash). MCP clients reading these edges should treat
+        // `lh:*` IDs as framework synthesis points, not as nodes that
+        // exist in `active_node`.
         if matches!(prep.language, DetectedLanguage::Php)
             && let Some(bytes) = &prep.source_bytes
             && let Some(laravel_input) =

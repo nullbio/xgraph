@@ -183,7 +183,10 @@ struct RpcError {
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, RpcError> {
-    serde_json::from_value(request.params.clone()).map_err(|err| RpcError {
+    // serde_json supports deserializing from a `Value` reference via
+    // `T::deserialize(&value)`, avoiding the per-request clone of the whole
+    // params subtree that `from_value` would do.
+    T::deserialize(&request.params).map_err(|err| RpcError {
         code: -32602,
         message: format!("invalid params: {err}"),
     })
