@@ -188,15 +188,54 @@ pub fn worktree_root_hash(canonical_root: &Path) -> String {
 
 /// Compute the runtime directory for the given canonical worktree root.
 ///
-/// Layout: `${XDG_RUNTIME_DIR:-/tmp}/xgraph/<hash>/`.
+/// Layout: `<base>/xgraph/<hash>/` where `<base>` is the first existing
+/// path in this preference order:
+///
+/// 1. `/run/user/$UID` — the systemd-managed per-user runtime dir. UID
+///    is read from `/proc/self`'s file owner so we don't depend on
+///    environment variables that the spawning process may or may not
+///    have set.
+/// 2. `$XDG_RUNTIME_DIR` if explicitly set (sandbox / container override).
+/// 3. `/tmp` (final fallback).
+///
+/// The deliberate choice to prefer `/run/user/$UID` over the env var is
+/// what keeps a daemon spawned by an LLM CLI (which typically doesn't
+/// inherit XDG_RUNTIME_DIR) reachable from a normal user shell (which
+/// usually has it set to the same `/run/user/$UID`). Without this, the
+/// two would disagree and the CLI's `xgraph status` would report
+/// "daemon socket: absent" even though the MCP-spawned daemon was
+/// running fine.
+///
 /// Validates that the resulting socket path fits within Linux's `sun_path`
 /// capacity, returning [`RuntimeError::SocketPathTooLong`] otherwise.
 pub fn runtime_dir(canonical_root: &Path) -> Result<RuntimeDir, RuntimeError> {
-    let base = std::env::var_os(XDG_RUNTIME_DIR_ENV)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_RUNTIME_BASE));
+    let base = default_runtime_base();
     runtime_dir_with_base(&base, canonical_root)
+}
+
+/// Resolve the per-user runtime base directory. See [`runtime_dir`] for
+/// the preference order; this is the function it delegates to.
+fn default_runtime_base() -> PathBuf {
+    if let Some(uid) = current_uid() {
+        let candidate = PathBuf::from(format!("/run/user/{uid}"));
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    if let Some(raw) = std::env::var_os(XDG_RUNTIME_DIR_ENV)
+        && !raw.is_empty()
+    {
+        return PathBuf::from(raw);
+    }
+    PathBuf::from(DEFAULT_RUNTIME_BASE)
+}
+
+/// Read the current uid from `/proc/self`'s file ownership. Returns
+/// `None` only on systems without procfs, where the caller falls back
+/// to `$XDG_RUNTIME_DIR` / `/tmp`.
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
 fn runtime_dir_with_base(base: &Path, canonical_root: &Path) -> Result<RuntimeDir, RuntimeError> {

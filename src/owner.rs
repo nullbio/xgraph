@@ -291,7 +291,12 @@ impl WorktreeOwner {
         symbols: &SymbolTable,
     ) -> Result<usize, OwnerError> {
         let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
-        let mut edges = resolve_edges(&prep.content_hash, &prep.extracted, symbols);
+        let mut edges = resolve_edges(
+            &prep.content_hash,
+            &prep.extracted,
+            symbols,
+            language_family(prep.language),
+        );
 
         // Laravel-specific framework edges run as a post-pass on PHP files.
         // The PHP plugin produces a structured `PhpExtractInput` (with call
@@ -493,25 +498,55 @@ struct PreparedFile {
     source_bytes: Option<Vec<u8>>,
 }
 
-/// Maps a qualified name to the set of global node ids that own it.
+/// Group languages that can share symbol references. PHP and Blade are
+/// the same ecosystem (Blade calls PHP classes / Laravel facades, etc.);
+/// JS / TS / TSX freely cross-reference each other; Python is its own
+/// island. Keeping refs from one family from matching a definition in
+/// another stops bare-name collisions across unrelated codebases — e.g.
+/// PHP's Laravel `config()` helper used to match a JavaScript
+/// `config` variable in storybook setup files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LanguageFamily {
+    PhpBlade,
+    JsTs,
+    Python,
+}
+
+fn language_family(lang: DetectedLanguage) -> LanguageFamily {
+    match lang {
+        DetectedLanguage::Php | DetectedLanguage::Blade => LanguageFamily::PhpBlade,
+        DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx => {
+            LanguageFamily::JsTs
+        }
+        DetectedLanguage::Python => LanguageFamily::Python,
+    }
+}
+
+/// Maps a (language-family, qualified name) pair to the set of global
+/// node ids that own it. The language-family key prevents a Python /
+/// JS / Blade symbol from being treated as a valid target for a PHP
+/// ref (and vice-versa).
 #[derive(Default)]
 struct SymbolTable {
-    by_qname: HashMap<String, Vec<String>>,
+    by_family_qname: HashMap<(LanguageFamily, String), Vec<String>>,
 }
 
 impl SymbolTable {
-    fn register(&mut self, qname: &str, node_id: String) {
+    fn register(&mut self, family: LanguageFamily, qname: &str, node_id: String) {
         if qname.is_empty() {
             return;
         }
-        self.by_qname
-            .entry(qname.to_owned())
+        self.by_family_qname
+            .entry((family, qname.to_owned()))
             .or_default()
             .push(node_id);
     }
 
-    fn lookup(&self, qname: &str) -> &[String] {
-        self.by_qname.get(qname).map(Vec::as_slice).unwrap_or(&[])
+    fn lookup(&self, family: LanguageFamily, qname: &str) -> &[String] {
+        self.by_family_qname
+            .get(&(family, qname.to_owned()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -519,6 +554,7 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
     let mut table = SymbolTable::default();
     for prep in prepared {
         let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
+        let family = language_family(prep.language);
         // Path-scoped keys are only meaningful for top-level definitions —
         // a method on `class Foo` in file `bar.ts` is not importable as
         // `bar#method`. We precompute the path-prefix once per file.
@@ -536,10 +572,10 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
 
         for node in &prep.extracted.nodes {
             let node_id = active_node_id(&cozo_hash, node.id);
-            table.register(&node.qname, node_id.clone());
+            table.register(family, &node.qname, node_id.clone());
             // Also index by bare name when it differs, so unqualified callers can resolve.
             if node.name != node.qname {
-                table.register(&node.name, node_id.clone());
+                table.register(family, &node.name, node_id.clone());
             }
 
             // Cross-file linking: top-level defs become importable under a
@@ -549,16 +585,20 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
                 continue;
             }
             if let Some(prefix) = js_path_prefix.as_deref() {
-                table.register(&format!("{prefix}#{}", node.name), node_id.clone());
+                table.register(family, &format!("{prefix}#{}", node.name), node_id.clone());
                 // For `index.{ts,tsx,js,jsx}` files, also register under the
                 // containing directory so `import X from './utils'` matches
                 // when `./utils` is a directory containing `index.ts`.
                 if let Some(dir_prefix) = strip_index_suffix(prefix) {
-                    table.register(&format!("{dir_prefix}#{}", node.name), node_id.clone());
+                    table.register(
+                        family,
+                        &format!("{dir_prefix}#{}", node.name),
+                        node_id.clone(),
+                    );
                 }
             }
             if let Some(module) = python_module_prefix.as_deref() {
-                table.register(&format!("{module}.{}", node.name), node_id);
+                table.register(family, &format!("{module}.{}", node.name), node_id);
             }
         }
     }
@@ -606,12 +646,13 @@ fn resolve_edges(
     hash: &ContentHash,
     extracted: &ExtractedFile,
     symbols: &SymbolTable,
+    family: LanguageFamily,
 ) -> Vec<EdgeFact> {
     let cozo_hash = CozoContentHash::from_bytes(*hash.as_bytes());
     let mut edges = Vec::new();
     for r in &extracted.refs {
         let lookup_key = r.qname.as_deref().unwrap_or(r.name.as_str());
-        let targets = symbols.lookup(lookup_key);
+        let targets = symbols.lookup(family, lookup_key);
         if targets.is_empty() {
             continue;
         }

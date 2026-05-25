@@ -93,25 +93,36 @@ impl WorktreeHandler {
             }
             "callers_of" => {
                 let params: NodeIdParams = parse_params(request)?;
-                let ids: Vec<String> = self
+                let nodes = self
                     .indexes
                     .callers_of(&NodeId::from(params.node_id.as_str()))
                     .into_iter()
-                    .map(|id| id.as_str().to_owned())
-                    .collect();
+                    .map(|id| self.summarize_node(&id))
+                    .collect::<Vec<_>>();
                 let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-                Ok((json!({ "node_ids": ids }), catching_up))
+                // `node_ids` kept as a plain array of strings so older CLI
+                // clients (and `xgraph callers` pretty-printing) still
+                // work; `nodes` is the agent-friendly format.
+                let ids: Vec<&str> = nodes
+                    .iter()
+                    .filter_map(|n| n.get("node_id").and_then(|v| v.as_str()))
+                    .collect();
+                Ok((json!({ "node_ids": ids, "nodes": nodes }), catching_up))
             }
             "callees_of" => {
                 let params: NodeIdParams = parse_params(request)?;
-                let ids: Vec<String> = self
+                let nodes = self
                     .indexes
                     .callees_of(&NodeId::from(params.node_id.as_str()))
                     .into_iter()
-                    .map(|id| id.as_str().to_owned())
-                    .collect();
+                    .map(|id| self.summarize_node(&id))
+                    .collect::<Vec<_>>();
                 let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-                Ok((json!({ "node_ids": ids }), catching_up))
+                let ids: Vec<&str> = nodes
+                    .iter()
+                    .filter_map(|n| n.get("node_id").and_then(|v| v.as_str()))
+                    .collect();
+                Ok((json!({ "node_ids": ids, "nodes": nodes }), catching_up))
             }
             "nodes_in_file" => {
                 let params: NodesInFileParams = parse_params(request)?;
@@ -438,6 +449,23 @@ impl WorktreeHandler {
         }
         chain.reverse();
         chain.iter().map(|n| self.node_for_trace(n)).collect()
+    }
+
+    /// Compact JSON for "here's a node id, give me just enough to know
+    /// what it is": id + name + kind + qname + path. Used by
+    /// `callers_of` / `callees_of` so an agent doesn't have to fan out
+    /// to `node` / `explore` to learn what each id refers to.
+    fn summarize_node(&self, id: &NodeId) -> Value {
+        match self.indexes.get_node(id) {
+            Some(r) => json!({
+                "node_id": id.as_str(),
+                "name": r.name,
+                "kind": r.kind,
+                "qname": r.qname,
+                "path": r.path.to_string_lossy(),
+            }),
+            None => json!({ "node_id": id.as_str() }),
+        }
     }
 
     fn node_for_trace(&self, id: &NodeId) -> Value {
