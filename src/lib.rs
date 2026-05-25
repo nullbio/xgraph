@@ -19,6 +19,7 @@ pub mod languages;
 pub mod laravel;
 pub mod manifest;
 pub mod mcp;
+pub mod mcp_install;
 pub mod owner;
 pub mod parser;
 pub mod progress;

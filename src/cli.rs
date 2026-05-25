@@ -291,6 +291,17 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
         edges = summary.edges_created,
         dir = persistent.root_dir().display(),
     );
+
+    // If Claude / Codex are installed but xgraph isn't registered as an
+    // MCP server with them, offer to add it. The check is silent when
+    // both clients are absent or already configured. Non-interactive
+    // sessions (CI, piped stdin) print a hint instead of prompting.
+    let candidates = crate::mcp_install::clients_needing_install();
+    if !candidates.is_empty()
+        && let Err(err) = crate::mcp_install::prompt_and_install(&candidates)
+    {
+        eprintln!("xgraph: MCP install skipped: {err}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
