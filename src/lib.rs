@@ -14,6 +14,7 @@ pub mod manifest;
 pub mod mcp;
 pub mod parser;
 pub mod query;
+pub mod resolve;
 pub mod runtime;
 pub mod scanner;
 pub mod storage;
