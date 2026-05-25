@@ -22,7 +22,6 @@ use std::time::Duration;
 use fs2::{FileExt, lock_contended_error};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 
 /// Default file name for the daemon's Unix domain socket.
@@ -184,7 +183,7 @@ impl McpProxy {
     {
         let stream = self.connect().await?;
         let (socket_reader, socket_writer) = stream.into_split();
-        pump(stdin, stdout, socket_reader, socket_writer).await
+        mcp_pump(stdin, stdout, socket_reader, socket_writer).await
     }
 }
 
@@ -279,14 +278,18 @@ impl Drop for StartupLockGuard {
     }
 }
 
-/// Bidirectional newline-delimited JSON pump.
+/// Newline-delimited JSON pump with MCP protocol translation.
 ///
-/// Each direction runs as its own task. The pump returns as soon as either
-/// task completes (whether via EOF or error); the surviving task is aborted
-/// so the proxy does not wait for the opposite end to also close. This
-/// avoids both lost-wakeup races and indefinite hangs when one side errors
-/// while the other is idle on a long-running read.
-async fn pump<R, W, SR, SW>(
+/// Reads one JSON-RPC line from the client (LLM CLI), classifies it via
+/// [`crate::mcp_protocol::classify_request`], and either answers
+/// locally (initialize / tools/list / ping / notification ack) or
+/// forwards a translated payload to the daemon and writes back the
+/// (possibly MCP-wrapped) response.
+///
+/// Sequential — one outstanding daemon request at a time. That matches
+/// how every MCP client we care about (Claude, Codex) drives a server,
+/// and it lets us skip a request-id correlation table.
+async fn mcp_pump<R, W, SR, SW>(
     stdin: R,
     stdout: W,
     socket_reader: SR,
@@ -298,59 +301,70 @@ where
     SR: AsyncRead + Unpin + Send + 'static,
     SW: AsyncWrite + Unpin + Send + 'static,
 {
-    let upstream = spawn_copy(BufReader::new(stdin), socket_writer);
-    let downstream = spawn_copy(BufReader::new(socket_reader), stdout);
+    use crate::mcp_protocol::{Action, classify_request, shape_outgoing};
+    let mut stdin_reader = BufReader::new(stdin);
+    let mut socket_reader = BufReader::new(socket_reader);
+    let mut socket_writer = socket_writer;
+    let mut stdout = stdout;
 
-    tokio::pin!(upstream);
-    tokio::pin!(downstream);
-
-    let result = tokio::select! {
-        biased;
-        outcome = &mut upstream => Outcome::Upstream(outcome),
-        outcome = &mut downstream => Outcome::Downstream(outcome),
-    };
-
-    match result {
-        Outcome::Upstream(outcome) => {
-            downstream.abort();
-            let _ = downstream.await;
-            outcome.map_err(join_to_io)?
-        }
-        Outcome::Downstream(outcome) => {
-            upstream.abort();
-            let _ = upstream.await;
-            outcome.map_err(join_to_io)?
-        }
-    }
-}
-
-enum Outcome {
-    Upstream(Result<Result<(), McpError>, tokio::task::JoinError>),
-    Downstream(Result<Result<(), McpError>, tokio::task::JoinError>),
-}
-
-fn spawn_copy<R, W>(mut reader: BufReader<R>, mut writer: W) -> JoinHandle<Result<(), McpError>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes = reader.read_line(&mut line).await?;
-            if bytes == 0 {
-                let _ = writer.shutdown().await;
+    let mut request_line = String::new();
+    let mut daemon_response_line = String::new();
+    loop {
+        request_line.clear();
+        // Race stdin against the daemon socket. While we're idle (no
+        // pending forwarded request), the daemon should not send any
+        // unsolicited bytes — so `fill_buf` only resolves on EOF or
+        // unexpected data, both of which mean the daemon connection is
+        // unusable. Either way, we exit cleanly.
+        tokio::select! {
+            biased;
+            res = stdin_reader.read_line(&mut request_line) => {
+                let bytes = res?;
+                if bytes == 0 {
+                    // Client closed stdin → tear the daemon connection
+                    // down so the daemon's last-disconnect logic can fire.
+                    let _ = socket_writer.shutdown().await;
+                    return Ok(());
+                }
+            }
+            _ = socket_reader.fill_buf() => {
+                // Daemon closed (or sent unsolicited data, treated the
+                // same — the protocol doesn't permit it).
                 return Ok(());
             }
-            writer.write_all(line.as_bytes()).await?;
-            writer.flush().await?;
         }
-    })
-}
-
-fn join_to_io(err: tokio::task::JoinError) -> McpError {
-    McpError::Io(io::Error::other(format!("proxy task join error: {err}")))
+        match classify_request(&request_line) {
+            Action::NoReply => continue,
+            Action::Drop => {
+                eprintln!("xgraph mcp: dropped malformed JSON-RPC line");
+                continue;
+            }
+            Action::LocalReply(out_line) => {
+                stdout.write_all(out_line.as_bytes()).await?;
+                stdout.flush().await?;
+            }
+            Action::Forward { line, wrap_in_mcp } => {
+                socket_writer.write_all(line.as_bytes()).await?;
+                socket_writer.flush().await?;
+                daemon_response_line.clear();
+                let bytes = socket_reader.read_line(&mut daemon_response_line).await?;
+                if bytes == 0 {
+                    // Daemon closed mid-request. Tell the client.
+                    let body = crate::mcp_protocol::build_error_line(
+                        serde_json::Value::Null,
+                        -32603,
+                        "daemon closed the socket",
+                    );
+                    let _ = stdout.write_all(body.as_bytes()).await;
+                    let _ = stdout.flush().await;
+                    return Ok(());
+                }
+                let out_line = shape_outgoing(&daemon_response_line, wrap_in_mcp);
+                stdout.write_all(out_line.as_bytes()).await?;
+                stdout.flush().await?;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,8 +521,11 @@ mod tests {
             tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
 
         let mut stdin_writer = stdin_writer;
+        // Use a non-MCP method name so the proxy's classifier falls
+        // through to the raw-passthrough branch and our echo daemon
+        // sees the request.
         stdin_writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"some_custom_method\"}\n")
             .await
             .expect("write request");
         stdin_writer.flush().await.expect("flush request");
@@ -547,7 +564,7 @@ mod tests {
 
         let mut stdin_writer = stdin_writer;
         stdin_writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"hello\"}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"some_custom_method\"}\n")
             .await
             .expect("write");
         stdin_writer.flush().await.expect("flush");
@@ -616,7 +633,7 @@ mod tests {
 
         let mut stdin_writer = stdin_writer;
         stdin_writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"bye\"}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"some_custom_method\"}\n")
             .await
             .expect("write");
         stdin_writer.flush().await.expect("flush");
@@ -649,6 +666,90 @@ mod tests {
                 drop(stream);
             }
         })
+    }
+
+    /// End-to-end MCP handshake: the proxy must answer `initialize`
+    /// locally (without round-tripping to the daemon), then answer
+    /// `tools/list`, and finally forward `tools/call` to the daemon
+    /// wrapped in the MCP shape.
+    #[tokio::test]
+    async fn full_mcp_handshake_against_echo_daemon() {
+        let dir = TempDir::new("mcp-handshake");
+        let socket_path = dir.path.join(DEFAULT_SOCKET_NAME);
+        let daemon = EchoDaemon::bind(&socket_path).await;
+
+        let config = McpConfig::new(dir.path.clone(), Arc::new(NoopLauncher));
+        let proxy = McpProxy::new(config);
+
+        let (stdin_writer, stdin_reader) = duplex(8192);
+        let (stdout_writer, mut stdout_reader) = duplex(8192);
+
+        let proxy_task =
+            tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
+
+        let mut stdin_writer = stdin_writer;
+        // 1) initialize — handled locally; daemon never sees it.
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stdout_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(v["result"]["serverInfo"]["name"], "xgraph");
+
+        // 2) tools/list — also local.
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 2);
+        let tools = v["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "search"));
+
+        // 3) tools/call → forwarded to daemon, daemon echoes back with
+        //    echo_id, proxy wraps in MCP content shape.
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"find_symbol\",\"arguments\":{\"name\":\"User\"}}}\n")
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["result"]["isError"], false);
+        // The wrapped content is a single text block whose text payload
+        // is the daemon's `result` re-serialized — here our echo daemon
+        // doesn't actually return a `result` key, so the text is "null".
+        // The important assertion is the MCP shape.
+        assert!(v["result"]["content"][0]["type"] == "text");
+
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        daemon.abort();
     }
 
     #[tokio::test]
