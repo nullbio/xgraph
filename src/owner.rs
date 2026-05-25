@@ -14,6 +14,7 @@ use crate::cozo::{
     ContentHash as CozoContentHash, CozoStore, EdgeFact, FileUpdate, FileUpdateMetadata,
     WriterError, WriterHandle, WriterQueue, active_node_id,
 };
+use crate::daemon_status::DaemonStatus;
 use crate::extract::ExtractedFile;
 use crate::hash::ContentHash;
 use crate::ignore::IgnoreMatcher;
@@ -30,19 +31,23 @@ pub struct WorktreeOwner {
     store: CozoStore,
     writer: WriterHandle,
     indexes: Arc<HotIndexes>,
+    status: Arc<DaemonStatus>,
     generation: u64,
 }
 
 impl WorktreeOwner {
     /// Build an owner against a freshly-opened Cozo store. Caller supplies
-    /// the store and the hot indexes; the owner takes responsibility for the
-    /// writer queue and mirrors every accepted `FileUpdate` into the indexes.
+    /// the store, hot indexes, and shared daemon status. The owner mirrors
+    /// every accepted `FileUpdate` into the indexes and tracks which paths
+    /// are mid-flight so MCP handlers can attach a precise `catching_up`
+    /// flag to file-scoped queries.
     pub fn new(
         worktree_root: PathBuf,
         matcher: IgnoreMatcher,
         registry: LanguageRegistry,
         store: CozoStore,
         indexes: Arc<HotIndexes>,
+        status: Arc<DaemonStatus>,
     ) -> Result<Self, crate::cozo::CozoError> {
         // Keep a read-side handle for the hash-skip cache; the writer thread
         // owns its own clone of the same underlying DbInstance.
@@ -54,6 +59,7 @@ impl WorktreeOwner {
             store,
             writer,
             indexes,
+            status,
             generation: 1,
         })
     }
@@ -81,6 +87,10 @@ impl WorktreeOwner {
         for prep in prepared {
             self.submit_prepared(prep, &symbol_table)?;
         }
+        // After the initial walk completes, MCP queries no longer need the
+        // "still booting" caveat. Incremental change-driven catching_up is
+        // tracked per-path via DaemonStatus::pending_paths.
+        self.status.mark_reconcile_done();
         Ok(count)
     }
 
@@ -91,6 +101,19 @@ impl WorktreeOwner {
         if !path.exists() {
             return Ok(false);
         }
+        // Relative path for pending-set tracking; matches the format MCP
+        // handlers will query with.
+        let relative = path
+            .strip_prefix(&self.worktree_root)
+            .unwrap_or(&path)
+            .to_path_buf();
+        self.status.mark_pending(&relative);
+        let result = self.process_change_inner(path);
+        self.status.unmark_pending(&relative);
+        result
+    }
+
+    fn process_change_inner(&mut self, path: PathBuf) -> Result<bool, OwnerError> {
         let metadata = fs::metadata(&path).map_err(|source| OwnerError::Io {
             path: path.clone(),
             source,
@@ -280,6 +303,13 @@ impl WorktreeOwner {
             .strip_prefix(&self.worktree_root)
             .unwrap_or(&path)
             .to_path_buf();
+        self.status.mark_pending(&relative);
+        let result = self.process_delete_inner(relative.clone());
+        self.status.unmark_pending(&relative);
+        result
+    }
+
+    fn process_delete_inner(&mut self, relative: PathBuf) -> Result<(), OwnerError> {
         let metadata = FileUpdateMetadata {
             content_hash: CozoContentHash::from_bytes([0u8; 32]),
             language: String::new(),
@@ -488,9 +518,16 @@ mod tests {
         let store = CozoStore::open(&store_dir).expect("cozo");
 
         let indexes = Arc::new(HotIndexes::new());
-        let mut owner =
-            WorktreeOwner::new(tmp.path().to_path_buf(), matcher, registry, store, indexes)
-                .expect("owner");
+        let status = Arc::new(DaemonStatus::new());
+        let mut owner = WorktreeOwner::new(
+            tmp.path().to_path_buf(),
+            matcher,
+            registry,
+            store,
+            indexes,
+            status,
+        )
+        .expect("owner");
         let n = owner.index_all().expect("index_all");
         assert_eq!(n, 1, "only the .py file should produce an update");
         let errs = owner.shutdown();
@@ -518,6 +555,7 @@ mod tests {
             registry,
             store.clone(),
             Arc::clone(&indexes),
+            Arc::new(DaemonStatus::new()),
         )
         .expect("owner");
         let first = owner.index_all().expect("index_all first");
@@ -532,6 +570,7 @@ mod tests {
             registry2,
             store,
             Arc::clone(&indexes),
+            Arc::new(DaemonStatus::new()),
         )
         .expect("owner2");
         let second = owner2.index_all().expect("index_all second");
@@ -551,9 +590,16 @@ mod tests {
         let store = CozoStore::open(&store_dir).expect("cozo");
 
         let indexes = Arc::new(HotIndexes::new());
-        let mut owner =
-            WorktreeOwner::new(tmp.path().to_path_buf(), matcher, registry, store, indexes)
-                .expect("owner");
+        let status = Arc::new(DaemonStatus::new());
+        let mut owner = WorktreeOwner::new(
+            tmp.path().to_path_buf(),
+            matcher,
+            registry,
+            store,
+            indexes,
+            status,
+        )
+        .expect("owner");
         let changed = owner
             .process_change(tmp.path().join("README.md"))
             .expect("process_change");
