@@ -7,4 +7,7 @@ description = "Linux-native code graph daemon for Git worktrees"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
+fs2 = "0.4"
+hex = "0.4"
 parking_lot = "0.12"
+sha2 = "0.11"
