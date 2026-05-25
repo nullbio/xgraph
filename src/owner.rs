@@ -18,6 +18,7 @@ use crate::daemon_status::DaemonStatus;
 use crate::extract::ExtractedFile;
 use crate::hash::ContentHash;
 use crate::ignore::IgnoreMatcher;
+use crate::import_resolver::{PythonImportResolver, TsAliasResolver};
 use crate::indexes::HotIndexes;
 use crate::language::LanguageRegistry;
 use crate::scanner::{DetectedLanguage, ScanError, scan};
@@ -74,10 +75,22 @@ impl WorktreeOwner {
     pub fn index_all(&mut self) -> Result<usize, OwnerError> {
         let scanned = scan(&self.worktree_root, &self.matcher)?;
 
+        // Project-scoped import resolvers, built once per pass.
+        let ts_resolver = TsAliasResolver::from_worktree(&self.worktree_root);
+        let py_resolver = PythonImportResolver::from_worktree(&self.worktree_root);
+
         let mut prepared: Vec<PreparedFile> = Vec::with_capacity(scanned.len());
         for file in scanned {
             let Some(lang) = file.language else { continue };
-            if let Some(p) = self.prepare_file(file.path, file.mtime, file.size, lang)? {
+            if let Some(mut p) = self.prepare_file(file.path, file.mtime, file.size, lang)? {
+                rewrite_imports(
+                    &mut p.extracted,
+                    &p.relative,
+                    lang,
+                    ts_resolver.as_ref(),
+                    &py_resolver,
+                    &self.worktree_root,
+                );
                 prepared.push(p);
             }
         }
@@ -458,6 +471,46 @@ fn edge_kind_for_ref(kind: &str) -> &str {
         "decorator" => "references",
         _ => "references",
     }
+}
+
+/// Rewrite import-style refs in an `ExtractedFile` so their `qname` reflects
+/// the project's TypeScript path aliases or Python package layout. Refs that
+/// don't resolve (external packages, stdlib) are left untouched.
+fn rewrite_imports(
+    extracted: &mut ExtractedFile,
+    relative_path: &Path,
+    language: DetectedLanguage,
+    ts: Option<&TsAliasResolver>,
+    py: &PythonImportResolver,
+    worktree_root: &Path,
+) {
+    match language {
+        DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx => {
+            if let Some(resolver) = ts {
+                for r in &mut extracted.refs {
+                    if is_js_import_kind(&r.kind)
+                        && let Some(resolved) = resolver.resolve(&r.name, worktree_root)
+                    {
+                        r.qname = Some(resolved);
+                    }
+                }
+            }
+        }
+        DetectedLanguage::Python => {
+            for r in &mut extracted.refs {
+                if r.kind == "import"
+                    && let Some(resolved) = py.resolve(relative_path, &r.name)
+                {
+                    r.qname = Some(resolved);
+                }
+            }
+        }
+        DetectedLanguage::Php | DetectedLanguage::Blade => {}
+    }
+}
+
+fn is_js_import_kind(kind: &str) -> bool {
+    matches!(kind, "import_esm" | "import_cjs")
 }
 
 fn framework_edge_kind(kind: crate::laravel::FrameworkEdgeKind) -> &'static str {

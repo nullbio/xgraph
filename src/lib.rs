@@ -12,6 +12,7 @@ pub mod git;
 pub mod handlers;
 pub mod hash;
 pub mod ignore;
+pub mod import_resolver;
 pub mod indexes;
 pub mod language;
 pub mod languages;
