@@ -5,22 +5,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
 use crate::VERSION;
-use crate::cozo::{
-    ContentHash as CozoContentHash, CozoStore, FileUpdate, FileUpdateMetadata, WriterQueue,
-};
+use crate::cozo::CozoStore;
 use crate::daemon::{DaemonConfig, DaemonError};
 use crate::git::{GitDiscoveryError, WorktreeRoot};
 use crate::handlers::WorktreeHandler;
 use crate::ignore::{IgnoreError, IgnoreMatcher};
-use crate::language::{LanguageId, LanguageRegistry};
+use crate::language::LanguageRegistry;
 use crate::owner::WorktreeOwner;
 use crate::runtime::{RuntimeError, ensure_runtime_dir, runtime_dir};
-use crate::scanner::{ScanError, scan};
+use crate::scanner::ScanError;
 use crate::storage::{PersistentPaths, PersistentPathsError};
 
 #[derive(Debug, Parser)]
@@ -201,8 +198,6 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
     }
 }
 
-const PARSER_VERSION: u32 = 1;
-
 fn cmd_init() -> Result<ExitCode, CliError> {
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
     init_at(&cwd)
@@ -215,46 +210,20 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
 
     let store = CozoStore::open(&persistent.cozo_db_path())?;
     let matcher = IgnoreMatcher::new(worktree.as_path())?;
-    let scanned = scan(worktree.as_path(), &matcher)?;
     let registry = LanguageRegistry::with_all();
+    let indexes = Arc::new(crate::indexes::HotIndexes::new());
+    let mut owner = WorktreeOwner::new(
+        worktree.as_path().to_path_buf(),
+        matcher,
+        registry,
+        store,
+        indexes,
+    )?;
 
-    let mut handle = WriterQueue::start(store)?;
-    let mut indexed = 0usize;
-    for file in scanned {
-        let language = match file.language {
-            Some(lang) => lang,
-            None => continue,
-        };
-        let bytes = fs::read(&file.path).map_err(|source| CliError::Io {
-            path: file.path.clone(),
-            source,
-        })?;
-        let path_for_extract = file
-            .path
-            .strip_prefix(worktree.as_path())
-            .unwrap_or(&file.path);
-        let Some(extracted) = registry.extract_file(path_for_extract, &bytes) else {
-            continue;
-        };
-        let metadata = FileUpdateMetadata {
-            content_hash: cozo_content_hash(file.content_hash.as_bytes()),
-            language: language_label(language).to_owned(),
-            parser_version: PARSER_VERSION,
-            mtime: mtime_seconds(file.mtime),
-            size: file.size,
-            generation: 1,
-        };
-        let update = FileUpdate::from_extracted(&extracted, metadata);
-        handle.submit(update)?;
-        indexed += 1;
-    }
-    handle.shutdown();
-
-    let writer_errors = handle.take_errors();
-    if !writer_errors.is_empty() {
-        return Err(CliError::Writer(
-            writer_errors.into_iter().next().expect("non-empty"),
-        ));
+    let indexed = owner.index_all()?;
+    let errors = owner.shutdown();
+    if let Some(first) = errors.into_iter().next() {
+        return Err(CliError::Writer(first));
     }
 
     println!(
@@ -262,42 +231,6 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
         persistent.root_dir().display()
     );
     Ok(ExitCode::SUCCESS)
-}
-
-fn cozo_content_hash(hash: &[u8; 32]) -> CozoContentHash {
-    CozoContentHash::from_bytes(*hash)
-}
-
-fn mtime_seconds(time: SystemTime) -> i64 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(dur) => dur.as_secs() as i64,
-        Err(err) => -(err.duration().as_secs() as i64),
-    }
-}
-
-fn language_label(id: crate::scanner::DetectedLanguage) -> &'static str {
-    use crate::scanner::DetectedLanguage::*;
-    match id {
-        Php => "php",
-        Blade => "blade",
-        JavaScript => "javascript",
-        TypeScript => "typescript",
-        Tsx => "tsx",
-        Python => "python",
-    }
-}
-
-#[allow(dead_code)]
-fn _language_id_from_detected(id: crate::scanner::DetectedLanguage) -> LanguageId {
-    use crate::scanner::DetectedLanguage::*;
-    match id {
-        Php => LanguageId::Php,
-        Blade => LanguageId::Blade,
-        JavaScript => LanguageId::JavaScript,
-        TypeScript => LanguageId::TypeScript,
-        Tsx => LanguageId::Tsx,
-        Python => LanguageId::Python,
-    }
 }
 
 fn cmd_mcp() -> Result<ExitCode, CliError> {
@@ -313,7 +246,10 @@ fn cmd_mcp() -> Result<ExitCode, CliError> {
     let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("build tokio runtime");
+        .map_err(|err| CliError::Io {
+            path: PathBuf::from("<tokio runtime>"),
+            source: err,
+        })?;
     let exit_code = runtime_tokio
         .block_on(crate::mcp::run(config))
         .map_err(CliError::Mcp)?;
@@ -492,7 +428,14 @@ fn cmd_status() -> Result<ExitCode, CliError> {
     let persistent = PersistentPaths::for_worktree(&worktree)?;
     let runtime = runtime_dir(worktree.as_path())?;
     let cozo_present = persistent.cozo_db_path().exists();
-    let socket_present = runtime.socket_path().exists();
+    let socket_path = runtime.socket_path();
+    let socket_state = if !socket_path.exists() {
+        "absent"
+    } else if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        "reachable"
+    } else {
+        "stale (file exists but no daemon accepting)"
+    };
     let pid_present = runtime.pid_file_path().exists();
     println!("worktree:      {}", worktree.as_path().display());
     println!("persistent:    {}", persistent.root_dir().display());
@@ -505,10 +448,7 @@ fn cmd_status() -> Result<ExitCode, CliError> {
             "absent (run `xgraph init`)"
         }
     );
-    println!(
-        "daemon socket: {}",
-        if socket_present { "present" } else { "absent" }
-    );
+    println!("daemon socket: {socket_state}");
     println!(
         "daemon pid:    {}",
         if pid_present { "present" } else { "absent" }
@@ -517,17 +457,23 @@ fn cmd_status() -> Result<ExitCode, CliError> {
 }
 
 fn cmd_sync() -> Result<ExitCode, CliError> {
-    // Until the daemon protocol exposes a sync RPC, sync is equivalent to re-running init:
-    // walk the worktree, hash, extract, submit. The CozoStore is idempotent on file
-    // replacement so this converges any drift between graph and disk.
+    // Sync is idempotent: every file is re-hashed and the hash-skip cache
+    // (introduced in Phase P3) keeps untouched files from being re-extracted.
+    // Drift between disk and the active manifest is healed by the same
+    // pipeline as init.
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
     init_at(&cwd)
 }
 
 fn cmd_reindex() -> Result<ExitCode, CliError> {
-    // Reindex from a clean slate. The integration phase will add a destructive
-    // "drop content tables" step before this; for now reindex is sync.
+    // Reindex truncates the graph relations and runs a full fresh scan.
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    let persistent = PersistentPaths::for_worktree(&worktree)?;
+    persistent.ensure_created()?;
+    let store = CozoStore::open(&persistent.cozo_db_path())?;
+    store.truncate_graph()?;
+    drop(store);
     init_at(&cwd)
 }
 

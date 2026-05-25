@@ -350,6 +350,43 @@ impl CozoStore {
         self.run_immutable(script, params)
     }
 
+    /// Drop every fact relation, leaving the schema intact. Used by
+    /// `xgraph reindex` to rebuild the graph from scratch.
+    pub fn truncate_graph(&self) -> Result<(), CozoError> {
+        // `:rm` rules without a key clause delete all rows.
+        for rel in [
+            "content_file",
+            "content_node",
+            "content_ref",
+            "active_file",
+            "active_node",
+            "edge",
+            "symbol",
+        ] {
+            let script = format!("?[a, b, c] := *{rel}{{a, b, c}} \n:rm {rel} {{a, b, c}}");
+            // Some relations have different arity; try the broad delete and
+            // ignore relation-shape errors. The simpler `::remove <rel>` op
+            // drops the whole relation, but we want to keep the schema.
+            let _ = self.run_mutable(&script, BTreeMap::new());
+        }
+        // The above tolerant approach is unreliable for relations with arity
+        // ≠ 3, so also issue per-relation explicit removes via the system op.
+        for rel in [
+            "content_file",
+            "content_node",
+            "content_ref",
+            "active_file",
+            "active_node",
+            "edge",
+            "symbol",
+        ] {
+            let _ = self.run_mutable(&format!("::remove {rel}"), BTreeMap::new());
+        }
+        // Reinstall the schema so the now-removed relations come back empty.
+        self.install_schema()?;
+        Ok(())
+    }
+
     /// Look up the active content hash stored for `path`. Returns `None` if
     /// the file has never been indexed.
     ///
