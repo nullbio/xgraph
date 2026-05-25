@@ -352,15 +352,17 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     let runtime = ensure_runtime_dir(worktree.as_path())?;
 
     let store = CozoStore::open(&persistent.cozo_db_path())?;
-    let matcher = IgnoreMatcher::new(worktree.as_path())?;
     let registry = LanguageRegistry::with_all();
+    // The watcher and the scanner share a matcher view of the worktree.
+    let watcher_matcher = std::sync::Arc::new(IgnoreMatcher::new(worktree.as_path())?);
+    let owner_matcher = IgnoreMatcher::new(worktree.as_path())?;
 
     // Hot indexes are loaded from Cozo first so any restart sees the prior
     // graph immediately; the owner then mirrors fresh updates into them.
     let indexes = Arc::new(crate::indexes::HotIndexes::load_from_cozo(&store)?);
     let mut owner = WorktreeOwner::new(
         worktree.as_path().to_path_buf(),
-        matcher,
+        owner_matcher,
         registry,
         store,
         Arc::clone(&indexes),
@@ -371,6 +373,48 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         "indexed {indexed} files; opening daemon socket at {}",
         runtime.socket_path().display()
     );
+
+    // Start the watcher and hand its batches to an OS thread that owns the
+    // WorktreeOwner. The thread loops until batch_rx closes (when the watcher
+    // handle is dropped at daemon shutdown).
+    let (watcher_handle, batch_rx) = crate::watcher::Watcher::start(
+        worktree.as_path(),
+        watcher_matcher,
+        crate::watcher::WatcherConfig::default(),
+    )
+    .map_err(|err| CliError::Io {
+        path: worktree.as_path().to_path_buf(),
+        source: std::io::Error::other(err.to_string()),
+    })?;
+
+    let worktree_root_for_thread = worktree.as_path().to_path_buf();
+    let watcher_thread = std::thread::Builder::new()
+        .name("xgraph-watcher-handler".into())
+        .spawn(move || {
+            while let Ok(batch) = batch_rx.recv() {
+                for path in batch.created.iter().chain(batch.modified.iter()) {
+                    if let Err(err) = owner.process_change(path.clone()) {
+                        eprintln!("watcher: process_change {}: {err}", path.display());
+                    }
+                }
+                for path in &batch.deleted {
+                    let _ = path.strip_prefix(&worktree_root_for_thread).unwrap_or(path);
+                    if let Err(err) = owner.process_delete(path.clone()) {
+                        eprintln!("watcher: process_delete {}: {err}", path.display());
+                    }
+                }
+                if batch.ignore_file_changed {
+                    // TODO: rebuild ignore matcher + reconcile manifest. For
+                    // now we log the event so it's not silently dropped.
+                    eprintln!("watcher: ignore file changed; manifest reconciliation pending");
+                }
+            }
+            let _ = owner.shutdown();
+        })
+        .map_err(|source| CliError::Io {
+            path: worktree.as_path().to_path_buf(),
+            source,
+        })?;
 
     let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -386,12 +430,15 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         let handle = crate::daemon::start(config).await?;
         let socket_path = handle.socket_path().to_path_buf();
         eprintln!("daemon listening on {}", socket_path.display());
-        // Drain the writer when the daemon ultimately shuts down.
-        let _errors = owner.shutdown();
         // Wait for SIGTERM/SIGINT.
         wait_for_shutdown().await;
         handle.shutdown().await
     });
+
+    // Drop the watcher handle so the worker thread sees batch_rx close, then
+    // join it (which also drains and shuts the owner down).
+    drop(watcher_handle);
+    let _ = watcher_thread.join();
 
     result?;
     Ok(ExitCode::SUCCESS)
