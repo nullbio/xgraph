@@ -39,6 +39,8 @@
 # Vendored or generated dependency/build output from projects used as fixtures.
 node_modules/
 vendor/
+!/vendor/
+!/vendor/**
 dist/
 build/
 coverage/

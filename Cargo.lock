@@ -566,6 +566,7 @@ dependencies = [
 name = "xgraph"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clap",
  "dashmap",
  "fs2",
@@ -573,6 +574,7 @@ dependencies = [
  "parking_lot",
  "sha2",
  "tree-sitter",
+ "tree-sitter-language",
  "tree-sitter-python",
 ]
 
