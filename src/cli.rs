@@ -453,9 +453,30 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         let handle = crate::daemon::start(config).await?;
         let socket_path = handle.socket_path().to_path_buf();
         eprintln!("daemon listening on {}", socket_path.display());
-        // Wait for SIGTERM/SIGINT.
-        if let Err(err) = wait_for_shutdown().await {
-            eprintln!("failed to install signal handler: {err}; shutting down");
+
+        // Wake up on either an external signal (SIGTERM/SIGINT) OR the
+        // daemon's own shutdown trigger — fired when the last client
+        // connection closes. Either way we proceed to `handle.shutdown()`
+        // which is idempotent.
+        let mut shutdown_rx = handle.shutdown_subscriber();
+        tokio::select! {
+            res = wait_for_shutdown() => {
+                if let Err(err) = res {
+                    eprintln!("failed to install signal handler: {err}; shutting down");
+                }
+            }
+            _ = async {
+                loop {
+                    if *shutdown_rx.borrow() {
+                        return;
+                    }
+                    if shutdown_rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            } => {
+                eprintln!("daemon: last client disconnected, exiting");
+            }
         }
         handle.shutdown().await
     });

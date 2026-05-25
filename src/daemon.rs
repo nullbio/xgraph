@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use fs2::FileExt;
 use tokio::io::AsyncWriteExt;
@@ -117,6 +118,15 @@ impl DaemonHandle {
         &self.daemon.runtime_dir
     }
 
+    /// Subscribe to shutdown notifications. The receiver fires when
+    /// shutdown is initiated either externally (via [`Self::shutdown`])
+    /// or by the daemon itself when the last client connection closes.
+    /// Callers (e.g. `cmd_daemon_start`) await this to wake up and tear
+    /// the runtime down once the accept loop has stopped.
+    pub fn shutdown_subscriber(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
     /// Signal the accept loop to stop, await its exit, remove the socket
     /// and PID files (best effort), and release the daemon lock.
     pub async fn shutdown(mut self) -> Result<(), DaemonError> {
@@ -198,7 +208,12 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let accept_task = tokio::spawn(accept_loop(listener, handler, shutdown_rx));
+    let accept_task = tokio::spawn(accept_loop(
+        listener,
+        handler,
+        shutdown_rx,
+        shutdown_tx.clone(),
+    ));
 
     Ok(DaemonHandle {
         daemon: Daemon {
@@ -216,7 +231,16 @@ async fn accept_loop(
     listener: UnixListener,
     handler: Arc<dyn ConnectionHandler>,
     mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
 ) {
+    // Tracks the number of currently-open client connections. The daemon
+    // self-exits when this drops to zero *after* at least one client has
+    // connected. The `ever_connected` gate prevents the daemon from
+    // exiting before the first client (e.g. immediately after spawn,
+    // before `xgraph mcp` connects).
+    let active = Arc::new(AtomicUsize::new(0));
+    let ever_connected = Arc::new(AtomicBool::new(false));
+
     loop {
         tokio::select! {
             biased;
@@ -227,7 +251,23 @@ async fn accept_loop(
             }
             accept = listener.accept() => {
                 if let Ok((stream, _addr)) = accept {
-                    let _task = handler.handle(stream);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    ever_connected.store(true, Ordering::SeqCst);
+                    let task = handler.handle(stream);
+                    let counter = Arc::clone(&active);
+                    let ever = Arc::clone(&ever_connected);
+                    let tx = shutdown_tx.clone();
+                    tokio::spawn(async move {
+                        // Wait for the connection handler to finish — i.e.
+                        // the client closed its end. Then drop the
+                        // connection count and, if we just hit zero,
+                        // signal daemon-self-shutdown.
+                        let _ = task.await;
+                        let prev = counter.fetch_sub(1, Ordering::SeqCst);
+                        if prev == 1 && ever.load(Ordering::SeqCst) {
+                            let _ = tx.send(true);
+                        }
+                    });
                 }
             }
         }
@@ -331,6 +371,65 @@ mod tests {
 
         let response = read_echo_line(handle.socket_path()).await;
         assert_eq!(response, "ok\n");
+
+        handle.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn daemon_self_exits_when_last_connection_closes() {
+        let dir = TempDir::new().expect("tempdir");
+        let handle = start(config(dir.path().to_path_buf()))
+            .await
+            .expect("daemon should start");
+
+        // Subscribe to shutdown notifications BEFORE the client connects
+        // so we don't miss the transition. The receiver is initialized at
+        // `false` and we wait for `true`.
+        let mut shutdown_rx = handle.shutdown_subscriber();
+
+        // Open and immediately drop a connection. The echo handler writes
+        // "ok\n" then shuts down its side, so the client's read_to_string
+        // completes and the connection task ends.
+        let _resp = read_echo_line(handle.socket_path()).await;
+
+        // Wait (with a generous timeout) for the daemon to signal
+        // self-shutdown. The signal fires after the connection task ends
+        // and the counter decrements to zero.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                let _ = shutdown_rx.changed().await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "daemon should self-signal shutdown within 2s after last client closes"
+        );
+
+        handle.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn daemon_does_not_exit_before_any_client_connects() {
+        let dir = TempDir::new().expect("tempdir");
+        let handle = start(config(dir.path().to_path_buf()))
+            .await
+            .expect("daemon should start");
+
+        // No clients have ever connected. The shutdown signal must
+        // remain false for at least a short observation window.
+        let mut shutdown_rx = handle.shutdown_subscriber();
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            shutdown_rx.changed().await
+        })
+        .await;
+        assert!(
+            observed.is_err(),
+            "daemon must not signal shutdown before any client has connected"
+        );
 
         handle.shutdown().await.expect("shutdown should succeed");
     }
