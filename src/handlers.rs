@@ -169,8 +169,8 @@ impl WorktreeHandler {
                 }
                 let source_snippet =
                     read_snippet(&self.worktree_root, &record.path, span_start, span_end);
-                let catching_up = !self.status.is_reconcile_done()
-                    || self.status.is_path_pending(&record.path);
+                let catching_up =
+                    !self.status.is_reconcile_done() || self.status.is_path_pending(&record.path);
                 Ok((
                     json!({
                         "node": {
@@ -198,8 +198,7 @@ impl WorktreeHandler {
                     .into_iter()
                     .map(|p| Value::String(p.to_string_lossy().into_owned()))
                     .collect();
-                let catching_up =
-                    !self.status.is_reconcile_done() || self.status.any_pending();
+                let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
                 Ok((json!({ "files": paths }), catching_up))
             }
             "status" => {
@@ -222,8 +221,7 @@ impl WorktreeHandler {
                 let params: ImpactParams = parse_params(request)?;
                 let max_depth = params.max_depth.unwrap_or(0);
                 let affected = run_impact_query(&self.store, &params.node_id, max_depth)?;
-                let catching_up =
-                    !self.status.is_reconcile_done() || self.status.any_pending();
+                let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
                 Ok((json!({ "node_ids": affected }), catching_up))
             }
             "search" => {
@@ -253,8 +251,7 @@ impl WorktreeHandler {
                         })
                     })
                     .collect();
-                let catching_up =
-                    !self.status.is_reconcile_done() || self.status.any_pending();
+                let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
                 Ok((json!({ "hits": hits }), catching_up))
             }
             "context" => {
@@ -270,8 +267,7 @@ impl WorktreeHandler {
             "trace" => {
                 let params: TraceParams = parse_params(request)?;
                 let payload = self.build_trace(params);
-                let catching_up =
-                    !self.status.is_reconcile_done() || self.status.any_pending();
+                let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
                 Ok((payload, catching_up))
             }
             other => Err(RpcError {
@@ -353,8 +349,7 @@ impl WorktreeHandler {
                 catching_up = true;
             }
             let snippet_cap = per_snippet.min(remaining);
-            let (span, source) =
-                self.lookup_span_and_snippet(&id, &record.path, snippet_cap);
+            let (span, source) = self.lookup_span_and_snippet(&id, &record.path, snippet_cap);
             if let Some(ref s) = source {
                 remaining = remaining.saturating_sub(s.len());
             }
@@ -760,10 +755,7 @@ affected[node, depth] := affected[downstream, prev], prev < $max, \
     let script = if max_depth == 0 {
         unbounded
     } else {
-        params.insert(
-            "max".into(),
-            cozo::DataValue::from(i64::from(max_depth)),
-        );
+        params.insert("max".into(), cozo::DataValue::from(i64::from(max_depth)));
         bounded
     };
     let rows = store.run_read(script, params).map_err(|err| RpcError {
@@ -806,12 +798,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    fn empty_setup() -> (
-        Arc<HotIndexes>,
-        Arc<DaemonStatus>,
-        PathBuf,
-        Arc<CozoStore>,
-    ) {
+    fn empty_setup() -> (Arc<HotIndexes>, Arc<DaemonStatus>, PathBuf, Arc<CozoStore>) {
         let tmp = tempfile::tempdir().unwrap();
         let cozo_dir = tmp.path().join("cozo");
         std::fs::create_dir_all(&cozo_dir).unwrap();
@@ -1065,9 +1052,17 @@ mod tests {
 
     fn populate_demo_symbols(indexes: &HotIndexes) {
         for (name, kind, path) in [
-            ("UserController", "class", "app/Http/Controllers/UserController.rs"),
+            (
+                "UserController",
+                "class",
+                "app/Http/Controllers/UserController.rs",
+            ),
             ("UserService", "class", "app/Services/UserService.rs"),
-            ("PostController", "class", "app/Http/Controllers/PostController.rs"),
+            (
+                "PostController",
+                "class",
+                "app/Http/Controllers/PostController.rs",
+            ),
             ("handleRequest", "function", "lib/http.rs"),
         ] {
             let id = NodeId::from(format!("h:{name}"));

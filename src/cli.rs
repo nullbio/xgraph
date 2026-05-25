@@ -755,8 +755,7 @@ mod tests {
 
     #[test]
     fn parses_find_symbol_command() {
-        let cli =
-            parse(["xgraph", "find-symbol", "User", "--kind", "class"]).expect("parses");
+        let cli = parse(["xgraph", "find-symbol", "User", "--kind", "class"]).expect("parses");
         assert_eq!(
             cli.command,
             Command::FindSymbol {
@@ -821,7 +820,11 @@ mod tests {
     fn parses_context_command() {
         let cli = parse(["xgraph", "context", "User"]).expect("parses");
         match cli.command {
-            Command::Context { name, related_limit, .. } => {
+            Command::Context {
+                name,
+                related_limit,
+                ..
+            } => {
                 assert_eq!(name, "User");
                 assert_eq!(related_limit, 20);
             }

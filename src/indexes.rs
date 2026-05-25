@@ -812,7 +812,11 @@ mod tests {
             path_prefix: None,
             limit: 64,
         });
-        assert_eq!(hits.len(), 2, "expected User+Post controllers; got {hits:?}");
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected User+Post controllers; got {hits:?}"
+        );
     }
 
     #[test]
@@ -909,7 +913,11 @@ mod tests {
             .get(b"aaa")
             .map(|p| p.value().clone())
             .unwrap_or_default();
-        assert_eq!(posting.len(), 1, "trigram list must not duplicate for repeated windows");
+        assert_eq!(
+            posting.len(),
+            1,
+            "trigram list must not duplicate for repeated windows"
+        );
     }
 
     #[test]

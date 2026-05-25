@@ -21,10 +21,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
     #[error("io error on {}: {source}", path.display())]
-    Io {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Io { path: PathBuf, source: io::Error },
     #[error("malformed JSON in {}: {source}", path.display())]
     Json {
         path: PathBuf,
@@ -109,11 +106,10 @@ fn codex_is_registered(path: &Path) -> Result<bool, InstallError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let doc: toml_edit::DocumentMut =
-        text.parse().map_err(|source| InstallError::Toml {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let doc: toml_edit::DocumentMut = text.parse().map_err(|source| InstallError::Toml {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(doc
         .get("mcp_servers")
         .and_then(|t| t.as_table())
@@ -231,11 +227,10 @@ fn install_codex(path: &Path, exe: &Path) -> Result<(), InstallError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut doc: toml_edit::DocumentMut =
-        text.parse().map_err(|source| InstallError::Toml {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|source| InstallError::Toml {
+        path: path.to_path_buf(),
+        source,
+    })?;
 
     // Build the nested table for the new server entry.
     let mut entry = toml_edit::Table::new();
@@ -307,7 +302,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert_eq!(v["otherKey"], 1, "unrelated keys must survive");
         assert_eq!(v["mcpServers"]["existing"]["command"], "/foo");
-        assert_eq!(v["mcpServers"]["xgraph"]["command"], "/usr/local/bin/xgraph");
+        assert_eq!(
+            v["mcpServers"]["xgraph"]["command"],
+            "/usr/local/bin/xgraph"
+        );
         assert_eq!(v["mcpServers"]["xgraph"]["args"][0], "mcp");
     }
 

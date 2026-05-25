@@ -228,7 +228,10 @@ pub fn wrap_tool_response(daemon_response: &Value) -> Value {
             "isError": true,
         });
     }
-    let result = daemon_response.get("result").cloned().unwrap_or(Value::Null);
+    let result = daemon_response
+        .get("result")
+        .cloned()
+        .unwrap_or(Value::Null);
     let text = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
     json!({
         "content": [{ "type": "text", "text": text }],
@@ -290,10 +293,7 @@ pub enum Action {
     /// pass the daemon's reply through to stdout. If `wrap_in_mcp` is
     /// true, the daemon's reply is wrapped in the MCP `tools/call`
     /// shape before being sent to the client.
-    Forward {
-        line: String,
-        wrap_in_mcp: bool,
-    },
+    Forward { line: String, wrap_in_mcp: bool },
     /// The message wasn't valid JSON-RPC at all. The proxy logs and
     /// drops it.
     Drop,
@@ -430,12 +430,12 @@ mod tests {
 
     #[test]
     fn initialize_returns_capabilities_and_server_info() {
-        let line = match classify_request(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-        ) {
-            Action::LocalReply(line) => line,
-            other => panic!("expected LocalReply, got {other:?}"),
-        };
+        let line =
+            match classify_request(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            {
+                Action::LocalReply(line) => line,
+                other => panic!("expected LocalReply, got {other:?}"),
+            };
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["id"], 1);
         assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -452,10 +452,7 @@ mod tests {
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), TOOLS.len());
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"find_symbol"));
         assert!(names.contains(&"search"));
         assert!(names.contains(&"trace"));
@@ -463,8 +460,7 @@ mod tests {
 
     #[test]
     fn initialized_notification_yields_no_reply() {
-        let action =
-            classify_request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        let action = classify_request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
         assert!(matches!(action, Action::NoReply));
     }
 
@@ -494,7 +490,12 @@ mod tests {
         };
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["error"]["code"], -32601);
-        assert!(v["error"]["message"].as_str().unwrap().contains("nonexistent"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nonexistent")
+        );
     }
 
     #[test]
@@ -530,7 +531,8 @@ mod tests {
 
     #[test]
     fn shape_outgoing_wraps_error_response_as_text_with_is_error() {
-        let daemon = r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"method not found"}}"#;
+        let daemon =
+            r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"method not found"}}"#;
         let out = shape_outgoing(daemon, true);
         let v: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["result"]["isError"], true);

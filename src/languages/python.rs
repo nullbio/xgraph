@@ -353,9 +353,8 @@ fn collect_decorated(extractor: &mut Extractor<'_>, node: TsNode<'_>, parent: Op
         if child.kind() == "decorator" {
             let expr_text = decorator_expression_text(child, extractor.source);
             if !expr_text.is_empty() {
-                let container = def_id.or_else(|| {
-                    extractor.enclosing_def(child.start_byte(), child.end_byte())
-                });
+                let container = def_id
+                    .or_else(|| extractor.enclosing_def(child.start_byte(), child.end_byte()));
                 extractor.push_ref(
                     "decorator",
                     expr_text,
@@ -544,14 +543,7 @@ fn walk_for_calls(extractor: &mut Extractor<'_>, root: TsNode<'_>) {
             if !chain.is_empty() {
                 let display = chain.join(".");
                 let container = extractor.enclosing_def(node.start_byte(), node.end_byte());
-                extractor.push_ref(
-                    "call",
-                    display,
-                    None,
-                    None,
-                    span_from_node(node),
-                    container,
-                );
+                extractor.push_ref("call", display, None, None, span_from_node(node), container);
             }
         }
 

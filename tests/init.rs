@@ -367,27 +367,21 @@ fn blade_template_emits_extends_and_include_edges() {
         })
         .collect();
     assert!(
-        edges
-            .iter()
-            .any(|(s, k, t)| k == "extends_view"
-                && s.contains("view.users")
-                && t.contains("view.layouts.app")),
+        edges.iter().any(|(s, k, t)| k == "extends_view"
+            && s.contains("view.users")
+            && t.contains("view.layouts.app")),
         "expected extends_view edge users → layouts.app, got {edges:?}"
     );
     assert!(
-        edges
-            .iter()
-            .any(|(s, k, t)| k == "includes_view"
-                && s.contains("view.users")
-                && t.contains("view.partials.header")),
+        edges.iter().any(|(s, k, t)| k == "includes_view"
+            && s.contains("view.users")
+            && t.contains("view.partials.header")),
         "expected includes_view edge users → partials.header, got {edges:?}"
     );
     assert!(
-        edges
-            .iter()
-            .any(|(s, k, t)| k == "uses_component"
-                && s.contains("view.users")
-                && t.contains("component.alert")),
+        edges.iter().any(|(s, k, t)| k == "uses_component"
+            && s.contains("view.users")
+            && t.contains("component.alert")),
         "expected uses_component edge users → alert, got {edges:?}"
     );
 }
@@ -737,7 +731,11 @@ fn impact_query_returns_callers_via_cozo() {
              affected[node] := affected[downstream], impact_edge[node, downstream]\n\
              ?[node] := affected[node]\n\
              :sort node\n",
-            [("target".to_string(), cozo::DataValue::from(helper_id.as_str()))].into(),
+            [(
+                "target".to_string(),
+                cozo::DataValue::from(helper_id.as_str()),
+            )]
+            .into(),
         )
         .expect("impact");
     let nodes: Vec<String> = affected

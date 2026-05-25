@@ -358,10 +358,7 @@ impl CozoStore {
         // attached, so the prior `::index drop` is load-bearing for
         // `cmd_reindex` correctness.
         for (rel, idx) in [("active_node", "by_path"), ("symbol", "by_path")] {
-            let _ = self.run_mutable(
-                &format!("::index drop {rel}:{idx}"),
-                BTreeMap::new(),
-            );
+            let _ = self.run_mutable(&format!("::index drop {rel}:{idx}"), BTreeMap::new());
         }
         // `:rm` rules without a key clause delete all rows.
         for rel in [
@@ -874,7 +871,6 @@ fn concat_rows<I: Iterator<Item = DataValue>>(iter: I) -> DataValue {
     }
     DataValue::List(all)
 }
-
 
 /// The full file-replacement transaction.
 /// Batched file-replacement transaction.

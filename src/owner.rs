@@ -523,9 +523,9 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
         // a method on `class Foo` in file `bar.ts` is not importable as
         // `bar#method`. We precompute the path-prefix once per file.
         let js_path_prefix = match prep.language {
-            DetectedLanguage::JavaScript
-            | DetectedLanguage::TypeScript
-            | DetectedLanguage::Tsx => Some(js_path_key(&prep.relative)),
+            DetectedLanguage::JavaScript | DetectedLanguage::TypeScript | DetectedLanguage::Tsx => {
+                Some(js_path_key(&prep.relative))
+            }
             _ => None,
         };
         let python_module_prefix = if matches!(prep.language, DetectedLanguage::Python) {

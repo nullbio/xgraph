@@ -279,7 +279,10 @@ fn render_bar(frame: u32, filled: u32, empty: u32) -> String {
         let b = lerp(9.0, 36.0, t);
         bar.push_str(&format!("\x1b[38;2;{r};{g};{b}m{BOLD}{BAR_FILLED}"));
     }
-    bar.push_str(&format!("{RST}{DM}{}{RST}", BAR_EMPTY.repeat(empty as usize)));
+    bar.push_str(&format!(
+        "{RST}{DM}{}{RST}",
+        BAR_EMPTY.repeat(empty as usize)
+    ));
     bar
 }
 

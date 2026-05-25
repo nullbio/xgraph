@@ -7,9 +7,9 @@ use crate::extract::{ExtractedFile, LocalNodeId, LocalRefId, Node, Position, Ref
 use crate::language::{LanguageId, LanguagePlugin, LanguageQueries};
 
 use super::javascript::{
-    ContainerRange, callee_label, collect_diagnostics, declaration_name, emit_named_import_bindings,
-    enclosing_def, is_component_name, is_require_call, slice_text, strip_string_quotes,
-    variable_kind_from_declarator, walk_tree,
+    ContainerRange, callee_label, collect_diagnostics, declaration_name,
+    emit_named_import_bindings, enclosing_def, is_component_name, is_require_call, slice_text,
+    strip_string_quotes, variable_kind_from_declarator, walk_tree,
 };
 
 const KIND_CLASS: &str = "class";
@@ -545,11 +545,7 @@ fn collect_calls_and_jsx(
                     alias: None,
                     name: slice_text(source, prop),
                     span: span_from_node(node),
-                    container: enclosing_def(
-                        container_ranges,
-                        node.start_byte(),
-                        node.end_byte(),
-                    ),
+                    container: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
                 });
             }
         }
@@ -572,11 +568,7 @@ fn collect_calls_and_jsx(
                     alias: None,
                     name: text,
                     span: span_from_node(node),
-                    container: enclosing_def(
-                        container_ranges,
-                        node.start_byte(),
-                        node.end_byte(),
-                    ),
+                    container: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
                 });
             }
         }

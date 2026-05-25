@@ -146,7 +146,10 @@ fn classify_wrapper_calls(file: &ExtractedFile, facts: &mut LaravelFacts) {
         if r.kind != "call" {
             continue;
         }
-        let is_wrapper = matches!(r.name.as_str(), "memo" | "forwardRef" | "React.memo" | "React.forwardRef");
+        let is_wrapper = matches!(
+            r.name.as_str(),
+            "memo" | "forwardRef" | "React.memo" | "React.forwardRef"
+        );
         if !is_wrapper {
             continue;
         }
@@ -297,13 +300,7 @@ mod tests {
         }
     }
 
-    fn ref_for(
-        id: u32,
-        kind: &str,
-        name: &str,
-        container: Option<LocalNodeId>,
-        span: Span,
-    ) -> Ref {
+    fn ref_for(id: u32, kind: &str, name: &str, container: Option<LocalNodeId>, span: Span) -> Ref {
         Ref {
             id,
             kind: kind.to_string(),
@@ -363,8 +360,7 @@ mod tests {
             facts
                 .edges
                 .iter()
-                .any(|e| e.kind == FrameworkEdgeKind::ReactComponent
-                    && e.from_qname == "MyButton")
+                .any(|e| e.kind == FrameworkEdgeKind::ReactComponent && e.from_qname == "MyButton")
         );
     }
 
@@ -385,10 +381,7 @@ mod tests {
 
     #[test]
     fn pascal_case_function_without_jsx_is_not_component() {
-        let file = file_with(
-            vec![function_node(0, "Foo", span(0, 100))],
-            vec![],
-        );
+        let file = file_with(vec![function_node(0, "Foo", span(0, 100))], vec![]);
         let facts = resolve_react(&[&file]);
         assert!(
             !facts
@@ -401,17 +394,13 @@ mod tests {
 
     #[test]
     fn function_named_use_x_is_hook_even_without_calls() {
-        let file = file_with(
-            vec![function_node(0, "useThing", span(0, 100))],
-            vec![],
-        );
+        let file = file_with(vec![function_node(0, "useThing", span(0, 100))], vec![]);
         let facts = resolve_react(&[&file]);
         assert!(
             facts
                 .edges
                 .iter()
-                .any(|e| e.kind == FrameworkEdgeKind::ReactHook
-                    && e.from_qname == "useThing")
+                .any(|e| e.kind == FrameworkEdgeKind::ReactHook && e.from_qname == "useThing")
         );
     }
 
@@ -425,22 +414,35 @@ mod tests {
             ],
         );
         let facts = resolve_react(&[&file]);
-        assert!(facts.edges.iter().any(|e| e.kind
-            == FrameworkEdgeKind::ReactUsesHook
-            && e.from_qname == "MyComp"
-            && e.to_qname == "react.hook.useState"));
+        assert!(
+            facts
+                .edges
+                .iter()
+                .any(|e| e.kind == FrameworkEdgeKind::ReactUsesHook
+                    && e.from_qname == "MyComp"
+                    && e.to_qname == "react.hook.useState")
+        );
     }
 
     #[test]
     fn class_extending_react_component_is_classified() {
         let file = file_with(
             vec![class_node(0, "OldStyle", span(0, 200))],
-            vec![ref_for(0, "inheritance", "Component", Some(0), span(10, 20))],
+            vec![ref_for(
+                0,
+                "inheritance",
+                "Component",
+                Some(0),
+                span(10, 20),
+            )],
         );
         let facts = resolve_react(&[&file]);
-        assert!(facts.edges.iter().any(|e| e.kind
-            == FrameworkEdgeKind::ReactComponent
-            && e.from_qname == "OldStyle"));
+        assert!(
+            facts
+                .edges
+                .iter()
+                .any(|e| e.kind == FrameworkEdgeKind::ReactComponent && e.from_qname == "OldStyle")
+        );
     }
 
     #[test]
@@ -460,8 +462,11 @@ mod tests {
         let refs = vec![ref_for(0, "call", "memo", Some(0), span(10, 50))];
         let file = file_with(nodes, refs);
         let facts = resolve_react(&[&file]);
-        assert!(facts.edges.iter().any(|e| e.kind
-            == FrameworkEdgeKind::ReactComponent
-            && e.from_qname == "Wrapped"));
+        assert!(
+            facts
+                .edges
+                .iter()
+                .any(|e| e.kind == FrameworkEdgeKind::ReactComponent && e.from_qname == "Wrapped")
+        );
     }
 }

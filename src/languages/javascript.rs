@@ -181,16 +181,16 @@ fn extract_into(tree: &Tree, source: &[u8], out: &mut ExtractedFile) {
     let mut node_id: LocalNodeId = 0;
     let mut ref_id: LocalRefId = 0;
     let mut container_ranges: Vec<ContainerRange> = Vec::new();
-    collect_definitions(&root, source, &mut out.nodes, &mut node_id, &mut container_ranges);
+    collect_definitions(
+        &root,
+        source,
+        &mut out.nodes,
+        &mut node_id,
+        &mut container_ranges,
+    );
     collect_imports(&root, source, &mut out.refs, &mut ref_id);
     collect_exports(&root, source, &mut out.refs, &mut ref_id);
-    collect_calls_and_jsx(
-        root,
-        source,
-        &mut out.refs,
-        &mut ref_id,
-        &container_ranges,
-    );
+    collect_calls_and_jsx(root, source, &mut out.refs, &mut ref_id, &container_ranges);
     collect_diagnostics(root, &mut out.diagnostics);
 }
 
@@ -668,11 +668,7 @@ fn visit_call_or_jsx(
                     alias: None,
                     name,
                     span: span_from_node(node),
-                    container: enclosing_def(
-                        container_ranges,
-                        node.start_byte(),
-                        node.end_byte(),
-                    ),
+                    container: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
                 });
             }
         }
@@ -693,11 +689,7 @@ fn visit_call_or_jsx(
                     alias: None,
                     name: text,
                     span: span_from_node(node),
-                    container: enclosing_def(
-                        container_ranges,
-                        node.start_byte(),
-                        node.end_byte(),
-                    ),
+                    container: enclosing_def(container_ranges, node.start_byte(), node.end_byte()),
                 });
             }
         }

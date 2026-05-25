@@ -275,8 +275,7 @@ fn bench_index_phases(c: &mut Criterion) {
                         let persistent =
                             PersistentPaths::for_worktree(&worktree).expect("persistent");
                         persistent.ensure_created().expect("ensure");
-                        let store =
-                            CozoStore::open(&persistent.cozo_db_path()).expect("cozo");
+                        let store = CozoStore::open(&persistent.cozo_db_path()).expect("cozo");
                         let matcher = IgnoreMatcher::new(worktree.as_path()).expect("matcher");
                         let registry = LanguageRegistry::with_all();
                         let indexes = Arc::new(HotIndexes::new());
@@ -291,9 +290,7 @@ fn bench_index_phases(c: &mut Criterion) {
                         )
                         .expect("owner");
                         let progress = xgraph::progress::Progress::start();
-                        let summary = owner
-                            .index_all_with_progress(&progress)
-                            .expect("index_all");
+                        let summary = owner.index_all_with_progress(&progress).expect("index_all");
                         progress.stop();
                         let _ = owner.shutdown();
                         total += Duration::from_micros(extract(&summary.timings));
