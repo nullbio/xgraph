@@ -97,12 +97,363 @@ fn language() -> &'static Language {
     LANG.get_or_init(|| tree_sitter_php::LANGUAGE_PHP.into())
 }
 
+/// Build a Laravel-resolver input bundle for the given PHP source. Returns
+/// `None` only when the parser fails to produce a tree (malformed input
+/// still produces a partial bundle).
+///
+/// This is intentionally separate from `LanguagePlugin::extract` because
+/// `laravel::PhpExtractInput` carries structured call arguments
+/// (receiver/method/args) that the canonical `ExtractedFile::Ref` does not
+/// preserve. Owner-side integration calls both: the canonical extractor for
+/// nodes and the in-memory hot indexes, this function for framework edges.
+pub fn extract_laravel_input(
+    source: &[u8],
+    path: &Path,
+) -> Option<crate::laravel::PhpExtractInput> {
+    let tree = parse(source)?;
+    let mut builder = LaravelInputBuilder::new(source);
+    builder.walk(tree.root_node());
+    Some(crate::laravel::PhpExtractInput {
+        path: path.to_path_buf(),
+        nodes: builder.nodes,
+        refs: builder.refs,
+    })
+}
+
+struct LaravelInputBuilder<'src> {
+    source: &'src [u8],
+    nodes: Vec<crate::laravel::PhpNode>,
+    refs: Vec<crate::laravel::PhpRef>,
+    namespace: Option<String>,
+    /// Stack of enclosing definition qualified names so each call gets the
+    /// right `enclosing_qname` attribution.
+    scope: Vec<String>,
+}
+
+impl<'src> LaravelInputBuilder<'src> {
+    fn new(source: &'src [u8]) -> Self {
+        Self {
+            source,
+            nodes: Vec::new(),
+            refs: Vec::new(),
+            namespace: None,
+            scope: Vec::new(),
+        }
+    }
+
+    fn slice(&self, node: TsNode<'_>) -> &str {
+        let range = node.byte_range();
+        std::str::from_utf8(&self.source[range]).unwrap_or_default()
+    }
+
+    fn span(&self, node: TsNode<'_>) -> crate::laravel::Span {
+        crate::laravel::Span {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        }
+    }
+
+    fn current_scope(&self) -> String {
+        self.scope.last().cloned().unwrap_or_default()
+    }
+
+    fn qualify(&self, name: &str) -> String {
+        if let Some(parent) = self.scope.last()
+            && !parent.is_empty()
+        {
+            return format!("{parent}\\{name}");
+        }
+        if let Some(ns) = &self.namespace
+            && !ns.is_empty()
+        {
+            return format!("{ns}\\{name}");
+        }
+        name.to_string()
+    }
+
+    fn walk(&mut self, node: TsNode<'_>) {
+        let kind = node.kind();
+        // Track namespace at the top level so qualified names are correct.
+        if kind == "namespace_definition"
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            self.namespace = Some(self.slice(name_node).trim_matches('\\').to_string());
+        }
+
+        let pushed_scope = match kind {
+            "class_declaration"
+            | "trait_declaration"
+            | "interface_declaration"
+            | "enum_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = self.slice(name_node).to_string();
+                    let qname = self.qualify(&name);
+                    let kind = match node.kind() {
+                        "class_declaration" => crate::laravel::PhpNodeKind::Class,
+                        // Only Class is in laravel::PhpNodeKind; map traits/interfaces/enums
+                        // to Class too so resolver can find them as types. Resolver only
+                        // distinguishes Class/Method/Function so this is the right bucket.
+                        _ => crate::laravel::PhpNodeKind::Class,
+                    };
+                    self.nodes.push(crate::laravel::PhpNode {
+                        kind,
+                        name,
+                        qname: qname.clone(),
+                        span: self.span(node),
+                    });
+                    self.scope.push(qname);
+                    true
+                } else {
+                    false
+                }
+            }
+            "method_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = self.slice(name_node).to_string();
+                    let qname = self.qualify(&name);
+                    self.nodes.push(crate::laravel::PhpNode {
+                        kind: crate::laravel::PhpNodeKind::Method,
+                        name,
+                        qname: qname.clone(),
+                        span: self.span(node),
+                    });
+                    self.scope.push(qname);
+                    true
+                } else {
+                    false
+                }
+            }
+            "function_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = self.slice(name_node).to_string();
+                    let qname = self.qualify(&name);
+                    self.nodes.push(crate::laravel::PhpNode {
+                        kind: crate::laravel::PhpNodeKind::Function,
+                        name,
+                        qname: qname.clone(),
+                        span: self.span(node),
+                    });
+                    self.scope.push(qname);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        // Capture call expressions of every supported flavor.
+        match kind {
+            "function_call_expression"
+            | "scoped_call_expression"
+            | "member_call_expression"
+            | "nullsafe_member_call_expression" => {
+                self.emit_call(node);
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                self.walk(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        if pushed_scope {
+            self.scope.pop();
+        }
+    }
+
+    fn emit_call(&mut self, call: TsNode<'_>) {
+        let (receiver, method) = match call.kind() {
+            "function_call_expression" => {
+                let Some(fn_node) = call.child_by_field_name("function") else {
+                    return;
+                };
+                (
+                    crate::laravel::PhpCallReceiver::None,
+                    self.slice(fn_node).to_string(),
+                )
+            }
+            "scoped_call_expression" => {
+                let Some(scope) = call.child_by_field_name("scope") else {
+                    return;
+                };
+                let Some(name) = call.child_by_field_name("name") else {
+                    return;
+                };
+                (
+                    crate::laravel::PhpCallReceiver::StaticClass(self.slice(scope).to_string()),
+                    self.slice(name).to_string(),
+                )
+            }
+            "member_call_expression" | "nullsafe_member_call_expression" => {
+                let Some(obj) = call.child_by_field_name("object") else {
+                    return;
+                };
+                let Some(name) = call.child_by_field_name("name") else {
+                    return;
+                };
+                let obj_text = self.slice(obj);
+                let receiver = if obj_text == "$this" {
+                    crate::laravel::PhpCallReceiver::ThisInstance
+                } else if obj_text == "$this->app" {
+                    crate::laravel::PhpCallReceiver::ThisAppContainer
+                } else {
+                    crate::laravel::PhpCallReceiver::OtherInstance
+                };
+                (receiver, self.slice(name).to_string())
+            }
+            _ => return,
+        };
+
+        let args = call
+            .child_by_field_name("arguments")
+            .map(|n| self.parse_arguments(n))
+            .unwrap_or_default();
+
+        self.refs.push(crate::laravel::PhpRef {
+            receiver,
+            method,
+            args,
+            span: self.span(call),
+            enclosing_qname: self.current_scope(),
+        });
+    }
+
+    fn parse_arguments(&self, args_node: TsNode<'_>) -> Vec<crate::laravel::PhpArg> {
+        let mut out = Vec::new();
+        let mut cursor = args_node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.kind() == "argument" {
+                    // The actual expression is the first non-trivia child.
+                    let mut argc = child.walk();
+                    if argc.goto_first_child() {
+                        loop {
+                            let inner = argc.node();
+                            if inner.is_named() {
+                                out.push(self.parse_arg_expression(inner));
+                                break;
+                            }
+                            if !argc.goto_next_sibling() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn parse_arg_expression(&self, node: TsNode<'_>) -> crate::laravel::PhpArg {
+        match node.kind() {
+            "string" | "encapsed_string" => {
+                let raw = self.slice(node);
+                crate::laravel::PhpArg::String(unquote_php_string(raw))
+            }
+            "class_constant_access_expression" => {
+                // `Foo::class` — children are: name "Foo", "::", name "class".
+                // Capture the first `name` / `qualified_name` child.
+                let mut c = node.walk();
+                if c.goto_first_child() {
+                    loop {
+                        let inner = c.node();
+                        if inner.kind() == "name" || inner.kind() == "qualified_name" {
+                            return crate::laravel::PhpArg::ClassConstant(
+                                self.slice(inner).to_string(),
+                            );
+                        }
+                        if !c.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+                crate::laravel::PhpArg::Other
+            }
+            "array_creation_expression" => {
+                let mut elements = Vec::new();
+                let mut cursor = node.walk();
+                if cursor.goto_first_child() {
+                    loop {
+                        let child = cursor.node();
+                        if child.kind() == "array_element_initializer" {
+                            // First named child is the value (or key for "k => v").
+                            let mut c = child.walk();
+                            if c.goto_first_child() {
+                                // Skip non-named siblings; take the last named sibling
+                                // before any "=>" as the value when no key is present.
+                                // For simplicity, use the LAST named child as the value.
+                                let mut last_named: Option<TsNode<'_>> = None;
+                                loop {
+                                    let inner = c.node();
+                                    if inner.is_named() {
+                                        last_named = Some(inner);
+                                    }
+                                    if !c.goto_next_sibling() {
+                                        break;
+                                    }
+                                }
+                                if let Some(value) = last_named {
+                                    elements.push(self.parse_arg_expression(value));
+                                }
+                            }
+                        }
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+                crate::laravel::PhpArg::Array(elements)
+            }
+            "object_creation_expression" => {
+                // `new Foo(...)` — capture the class identifier.
+                let mut c = node.walk();
+                if c.goto_first_child() {
+                    loop {
+                        let inner = c.node();
+                        if inner.kind() == "name" || inner.kind() == "qualified_name" {
+                            return crate::laravel::PhpArg::NewInstance(
+                                self.slice(inner).to_string(),
+                            );
+                        }
+                        if !c.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+                crate::laravel::PhpArg::Other
+            }
+            _ => crate::laravel::PhpArg::Other,
+        }
+    }
+}
+
+fn unquote_php_string(raw: &str) -> String {
+    if raw.len() >= 2 {
+        let first = raw.chars().next().unwrap();
+        let last = raw.chars().last().unwrap();
+        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+            return raw[1..raw.len() - 1].to_string();
+        }
+    }
+    raw.to_string()
+}
+
 thread_local! {
     static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
 }
 
 /// Parse a PHP source with a thread-local parser that's reused across calls.
-fn parse(source: &[u8]) -> Option<Tree> {
+pub fn parse(source: &[u8]) -> Option<Tree> {
     PARSER.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {

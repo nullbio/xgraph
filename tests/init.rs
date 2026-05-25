@@ -70,6 +70,64 @@ fn cozo_restart_repopulates_hot_indexes() {
     );
 }
 
+/// `Route::get('/users', [UserController::class, 'index'])` in a PHP file
+/// should emit a `routes_to` framework edge in Cozo, attributing the route
+/// to its controller method via the Laravel resolver.
+#[test]
+fn laravel_route_emits_framework_edge() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_git_repo(tmp.path());
+    fs::create_dir_all(tmp.path().join("routes")).unwrap();
+    fs::write(
+        tmp.path().join("routes").join("web.php"),
+        "<?php\nuse App\\Http\\Controllers\\UserController;\nRoute::get('/users', [UserController::class, 'index']);\n",
+    )
+    .unwrap();
+
+    init_at(tmp.path()).expect("init");
+
+    let cozo_path = tmp.path().join(".git").join("xgraph").join("graph.cozo");
+    let store = CozoStore::open(&cozo_path).expect("reopen");
+    let rows = store
+        .run_read(
+            "?[source, target] := *edge[source, $kind, target, $prov, _conf]",
+            [
+                (
+                    "kind".to_string(),
+                    cozo::DataValue::from("routes_to".to_string()),
+                ),
+                (
+                    "prov".to_string(),
+                    cozo::DataValue::from("laravel_heuristic".to_string()),
+                ),
+            ]
+            .into(),
+        )
+        .expect("read edges");
+    let edges: Vec<(String, String)> = rows
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let src = match it.next()? {
+                cozo::DataValue::Str(s) => s.to_string(),
+                _ => return None,
+            };
+            let dst = match it.next()? {
+                cozo::DataValue::Str(s) => s.to_string(),
+                _ => return None,
+            };
+            Some((src, dst))
+        })
+        .collect();
+    assert!(
+        edges
+            .iter()
+            .any(|(s, t)| s.contains("/users") && t.contains("UserController::index")),
+        "expected a routes_to edge from /users to UserController::index, got {edges:?}",
+    );
+}
+
 /// `init_at` is idempotent thanks to the hash-skip cache. Re-running it on
 /// an unchanged worktree must succeed and must not corrupt the prior facts.
 #[test]

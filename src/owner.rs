@@ -137,6 +137,11 @@ impl WorktreeOwner {
         let Some(extracted) = self.registry.extract_file(&relative, &bytes) else {
             return Ok(None);
         };
+        let source_bytes = if matches!(language, DetectedLanguage::Php) {
+            Some(bytes)
+        } else {
+            None
+        };
         Ok(Some(PreparedFile {
             relative,
             content_hash,
@@ -144,6 +149,7 @@ impl WorktreeOwner {
             mtime,
             size,
             extracted,
+            source_bytes,
         }))
     }
 
@@ -153,7 +159,34 @@ impl WorktreeOwner {
         symbols: &SymbolTable,
     ) -> Result<(), OwnerError> {
         let cozo_hash = CozoContentHash::from_bytes(*prep.content_hash.as_bytes());
-        let edges = resolve_edges(&prep.content_hash, &prep.extracted, symbols);
+        let mut edges = resolve_edges(&prep.content_hash, &prep.extracted, symbols);
+
+        // Laravel-specific framework edges run as a post-pass on PHP files.
+        // The PHP plugin produces a structured `PhpExtractInput` (with call
+        // receivers, methods, and argument literals) that the canonical
+        // `ExtractedFile` does not preserve; the resolver consumes it and
+        // emits edges with `Provenance::LaravelHeuristic`.
+        if matches!(prep.language, DetectedLanguage::Php)
+            && let Some(bytes) = &prep.source_bytes
+            && let Some(laravel_input) =
+                crate::languages::php::extract_laravel_input(bytes, &prep.relative)
+        {
+            let facts = crate::laravel::resolve(std::slice::from_ref(&laravel_input));
+            for fedge in facts.edges {
+                // Framework edges synthesize stable string IDs so they can
+                // reference symbols that may live in other files. The
+                // "lh:" prefix marks them as laravel-heuristic facts.
+                let source_id = format!("lh:{}", fedge.from_qname);
+                let target_id = format!("lh:{}", fedge.to_qname);
+                edges.push(EdgeFact {
+                    source_node_id: source_id,
+                    kind: framework_edge_kind(fedge.kind).to_string(),
+                    target_node_id: target_id,
+                    provenance: "laravel_heuristic".to_string(),
+                    confidence: framework_confidence(fedge.confidence),
+                });
+            }
+        }
 
         let metadata = FileUpdateMetadata {
             content_hash: cozo_hash,
@@ -320,6 +353,10 @@ struct PreparedFile {
     mtime: SystemTime,
     size: u64,
     extracted: ExtractedFile,
+    /// Source bytes — retained only when a downstream framework resolver
+    /// (currently Laravel for PHP) needs to re-walk the tree for structured
+    /// call-argument data. `None` for non-PHP languages keeps memory lean.
+    source_bytes: Option<Vec<u8>>,
 }
 
 /// Maps a qualified name to the set of global node ids that own it.
@@ -407,6 +444,28 @@ fn edge_kind_for_ref(kind: &str) -> &str {
         "blade_view" | "blade_component" | "blade_x_component" => "renders",
         "decorator" => "references",
         _ => "references",
+    }
+}
+
+fn framework_edge_kind(kind: crate::laravel::FrameworkEdgeKind) -> &'static str {
+    use crate::laravel::FrameworkEdgeKind::*;
+    match kind {
+        RouteToController => "routes_to",
+        ControllerToModel => "uses_model",
+        EloquentRelationship => "relates_to",
+        FacadeCall => "facade_call",
+        ServiceBinding => "binds",
+        EventListener => "dispatches_event",
+        JobDispatch => "dispatches_job",
+    }
+}
+
+fn framework_confidence(conf: crate::laravel::Confidence) -> u32 {
+    use crate::laravel::Confidence::*;
+    match conf {
+        Low => 40,
+        Medium => 70,
+        High => 90,
     }
 }
 
