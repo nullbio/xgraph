@@ -102,8 +102,13 @@ pub enum SearchMode {
 pub enum DaemonAction {
     /// Start the daemon manually.
     Start,
-    /// Stop the daemon.
-    Stop,
+    /// Stop the daemon. Sends SIGTERM by default; pass `--force` to
+    /// send SIGKILL and clean up stale runtime files even if the
+    /// daemon is wedged or the socket is unresponsive.
+    Stop {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,8 +184,8 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             action: DaemonAction::Start,
         } => cmd_daemon_start(),
         Command::Daemon {
-            action: DaemonAction::Stop,
-        } => cmd_daemon_stop(),
+            action: DaemonAction::Stop { force },
+        } => cmd_daemon_stop(force),
         Command::Status => cmd_status(),
         Command::Sync => cmd_sync(),
         Command::Reindex => cmd_reindex(),
@@ -261,6 +266,12 @@ pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
     let worktree = WorktreeRoot::discover(start)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
     persistent.ensure_created()?;
+
+    // RocksDB is single-writer. If a daemon is alive for this worktree
+    // it holds an exclusive lock on the Cozo store. Stop it first;
+    // the next MCP request will lazy-spawn a fresh one against the
+    // updated graph.
+    ensure_no_running_daemon(worktree.as_path())?;
 
     let store = CozoStore::open(&persistent.cozo_db_path())?;
     let matcher = IgnoreMatcher::new(worktree.as_path())?;
@@ -500,14 +511,34 @@ async fn wait_for_shutdown() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn cmd_daemon_stop() -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
-    let runtime = runtime_dir(worktree.as_path())?;
+/// Outcome of [`stop_daemon`] so callers can surface a useful message.
+enum DaemonStopOutcome {
+    /// No daemon was running for this worktree.
+    NotRunning,
+    /// Signal was delivered.
+    Stopped { pid: i32, forced: bool },
+    /// PID file existed but the process was already gone.
+    AlreadyDead { pid: i32 },
+}
+
+/// Stop the daemon (if any) for the given worktree. When `force` is
+/// true, sends SIGKILL and also removes the socket / pid / lock files
+/// up front so a wedged daemon can be replaced. Returns once the
+/// signal has been delivered; doesn't wait for the process to exit.
+///
+/// Used both by `xgraph daemon stop` and by `xgraph reindex` to clear
+/// the way before opening the Cozo store for exclusive write access.
+fn stop_daemon(worktree: &Path, force: bool) -> Result<DaemonStopOutcome, CliError> {
+    let runtime = runtime_dir(worktree)?;
     let pid_path = runtime.pid_file_path();
     if !pid_path.exists() {
-        println!("no daemon running for this worktree");
-        return Ok(ExitCode::SUCCESS);
+        if force {
+            // Clean up any stale runtime files even when there's no
+            // pid file — they may be left over from a kill -9'd daemon.
+            let _ = fs::remove_file(runtime.socket_path());
+            let _ = fs::remove_file(runtime.daemon_lock_path());
+        }
+        return Ok(DaemonStopOutcome::NotRunning);
     }
     let pid_text = fs::read_to_string(&pid_path).map_err(|source| CliError::Io {
         path: pid_path.clone(),
@@ -515,18 +546,57 @@ fn cmd_daemon_stop() -> Result<ExitCode, CliError> {
     })?;
     let pid: i32 = pid_text.trim().parse().unwrap_or(0);
     if pid <= 0 {
-        println!("daemon pid file is invalid; cleaning up");
         let _ = fs::remove_file(&pid_path);
-        return Ok(ExitCode::SUCCESS);
+        if force {
+            let _ = fs::remove_file(runtime.socket_path());
+            let _ = fs::remove_file(runtime.daemon_lock_path());
+        }
+        return Ok(DaemonStopOutcome::AlreadyDead { pid });
     }
-    // SIGTERM via libc; nix isn't a direct dep. Use std::process::Command kill -15 fallback.
+    let signal = if force { "-9" } else { "-15" };
     let status = std::process::Command::new("kill")
-        .arg("-15")
+        .arg(signal)
         .arg(pid.to_string())
         .status();
     match status {
-        Ok(s) if s.success() => println!("sent SIGTERM to daemon pid {pid}"),
-        Ok(_) | Err(_) => println!("daemon pid {pid} no longer running"),
+        Ok(s) if s.success() => {
+            if force {
+                // Give the process a moment to actually die, then
+                // clean up the runtime files so a fresh start isn't
+                // confused by stale state.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _ = fs::remove_file(runtime.socket_path());
+                let _ = fs::remove_file(&pid_path);
+                let _ = fs::remove_file(runtime.daemon_lock_path());
+            }
+            Ok(DaemonStopOutcome::Stopped { pid, forced: force })
+        }
+        Ok(_) | Err(_) => {
+            // The process was already gone. Tidy up the pid file (and
+            // socket + lock if --force) so the next start doesn't
+            // think a daemon is still around.
+            let _ = fs::remove_file(&pid_path);
+            if force {
+                let _ = fs::remove_file(runtime.socket_path());
+                let _ = fs::remove_file(runtime.daemon_lock_path());
+            }
+            Ok(DaemonStopOutcome::AlreadyDead { pid })
+        }
+    }
+}
+
+fn cmd_daemon_stop(force: bool) -> Result<ExitCode, CliError> {
+    let cwd = env::current_dir().map_err(CliError::Cwd)?;
+    let worktree = WorktreeRoot::discover(&cwd)?;
+    match stop_daemon(worktree.as_path(), force)? {
+        DaemonStopOutcome::NotRunning => println!("no daemon running for this worktree"),
+        DaemonStopOutcome::Stopped { pid, forced } => {
+            let signal = if forced { "SIGKILL" } else { "SIGTERM" };
+            println!("sent {signal} to daemon pid {pid}");
+        }
+        DaemonStopOutcome::AlreadyDead { pid } => {
+            println!("daemon pid {pid} no longer running")
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -589,12 +659,46 @@ fn cmd_reindex() -> Result<ExitCode, CliError> {
     // Reindex truncates the graph relations and runs a full fresh scan.
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
     let worktree = WorktreeRoot::discover(&cwd)?;
+    ensure_no_running_daemon(worktree.as_path())?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
     persistent.ensure_created()?;
     let store = CozoStore::open(&persistent.cozo_db_path())?;
     store.truncate_graph()?;
     drop(store);
     init_at(&cwd)
+}
+
+/// Stop any daemon running for this worktree and wait briefly for it
+/// to release the Cozo lock. Used by every command that needs
+/// exclusive write access to the store (`init`, `sync` → via init_at,
+/// `reindex`). Cheap when there's no daemon to stop. Without this,
+/// the next `CozoStore::open` would fail with "RocksDB error:
+/// Resource temporarily unavailable".
+fn ensure_no_running_daemon(worktree: &Path) -> Result<(), CliError> {
+    use std::time::{Duration, Instant};
+    let outcome = stop_daemon(worktree, false)?;
+    match outcome {
+        DaemonStopOutcome::NotRunning => return Ok(()),
+        DaemonStopOutcome::AlreadyDead { .. } => return Ok(()),
+        DaemonStopOutcome::Stopped { pid, .. } => {
+            eprintln!("xgraph: stopped daemon pid {pid} to take exclusive store lock");
+        }
+    }
+    // Wait up to ~3 s for the socket file to disappear (which happens
+    // after the daemon's accept loop exits and runs its cleanup). If
+    // it doesn't, escalate to SIGKILL and try once more — the user
+    // would rather lose a stale daemon than have their reindex hang.
+    let runtime = runtime_dir(worktree)?;
+    let socket_path = runtime.socket_path();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while socket_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if socket_path.exists() {
+        eprintln!("xgraph: daemon didn't release socket in time; sending SIGKILL");
+        let _ = stop_daemon(worktree, true)?;
+    }
+    Ok(())
 }
 
 /// Send a JSON-RPC request to the worktree's daemon socket and pretty-
@@ -730,7 +834,19 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Daemon {
-                action: DaemonAction::Stop
+                action: DaemonAction::Stop { force: false }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_daemon_stop_force_flag() {
+        let cli = parse(["xgraph", "daemon", "stop", "--force"])
+            .expect("daemon stop --force should parse");
+        assert_eq!(
+            cli.command,
+            Command::Daemon {
+                action: DaemonAction::Stop { force: true }
             }
         );
     }
