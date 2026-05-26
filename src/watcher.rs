@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,11 @@ use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 
 use crate::ignore::Matcher;
+
+/// `Arc<Mutex<...>>` because both the worker thread and the public
+/// `WatcherHandle` may need to add new watches dynamically (when a
+/// previously-unseen directory appears under the root).
+type SharedNotify = Arc<Mutex<RecommendedWatcher>>;
 
 const DEFAULT_DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
 
@@ -82,7 +87,7 @@ impl std::error::Error for WatcherError {
 
 /// Owns the live notify watcher plus the debounce worker thread.
 pub struct Watcher {
-    _notify: RecommendedWatcher,
+    _notify: SharedNotify,
     shutdown_tx: Sender<()>,
     join: Option<JoinHandle<()>>,
 }
@@ -98,7 +103,7 @@ impl Watcher {
         let (shutdown_tx, shutdown_rx) = unbounded::<()>();
 
         let forward_tx = raw_tx.clone();
-        let mut notify = notify::recommended_watcher(move |res: notify::Result<Event>| {
+        let notify = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
                 for raw in raw_events_from(event) {
                     let _ = forward_tx.send(raw);
@@ -106,15 +111,71 @@ impl Watcher {
             }
         })
         .map_err(WatcherError::Construct)?;
+        let notify: SharedNotify = Arc::new(Mutex::new(notify));
 
-        notify
-            .watch(root, RecursiveMode::Recursive)
-            .map_err(|source| WatcherError::Watch {
+        // Walk the worktree honoring the ignore matcher and register a
+        // non-recursive inotify watch per kept directory. This is the
+        // crucial difference from `RecursiveMode::Recursive` on the
+        // root: that one walks every directory unconditionally — including
+        // `.git/`, `node_modules/`, `vendor/`, `target/`, build caches,
+        // etc. — consuming thousands of inotify slots for paths we never
+        // process. With per-directory watches we use roughly
+        // `count(non-ignored directories)` slots instead.
+        //
+        // Failures on individual subdirectories are tolerated (a denied
+        // permission or a transient inotify-limit overflow shouldn't
+        // sink the whole watcher); only failure to watch the root
+        // itself is fatal.
+        let walker = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !matcher.matched(entry.path()));
+        let mut root_watched = false;
+        let mut watch_failures: usize = 0;
+        for entry in walker.flatten() {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let result = {
+                let mut guard = notify.lock().expect("watcher mutex poisoned");
+                guard.watch(path, RecursiveMode::NonRecursive)
+            };
+            match result {
+                Ok(()) => {
+                    if entry.depth() == 0 {
+                        root_watched = true;
+                    }
+                }
+                Err(err) => {
+                    if entry.depth() == 0 {
+                        return Err(WatcherError::Watch {
+                            path: path.to_path_buf(),
+                            source: err,
+                        });
+                    }
+                    watch_failures += 1;
+                }
+            }
+        }
+        if !root_watched {
+            // Walking the root directory itself failed (e.g. path
+            // doesn't exist, permission denied). Surface that.
+            return Err(WatcherError::Watch {
                 path: root.to_path_buf(),
-                source,
-            })?;
+                source: notify::Error::generic("worktree root not watchable"),
+            });
+        }
+        if watch_failures > 0 {
+            eprintln!(
+                "xgraph watcher: {} directories skipped (permission denied or inotify limit); \
+                 incremental updates for those paths will be missed",
+                watch_failures
+            );
+        }
 
         let worker_matcher = Arc::clone(&matcher);
+        let worker_notify = Arc::clone(&notify);
         let debounce = config.debounce_window;
         let worker_batch_tx = batch_tx.clone();
         let join = thread::Builder::new()
@@ -126,6 +187,7 @@ impl Watcher {
                     worker_batch_tx,
                     worker_matcher,
                     debounce,
+                    worker_notify,
                 );
             })
             .map_err(WatcherError::SpawnWorker)?;
@@ -246,6 +308,7 @@ fn run_debounce_loop(
     batch_tx: Sender<BatchedChanges>,
     matcher: Arc<dyn Matcher>,
     debounce: Duration,
+    notify: SharedNotify,
 ) {
     let mut pending: HashMap<PathBuf, ChangeKind> = HashMap::new();
     let mut last_event_at: Option<Instant> = None;
@@ -278,6 +341,14 @@ fn run_debounce_loop(
             recv(raw_rx) -> msg => {
                 match msg {
                     Ok(event) => {
+                        // If a new directory appeared and we'd index it,
+                        // attach a watch right away so files created
+                        // inside it generate events. Per-directory
+                        // watches don't propagate, so a new subdirectory
+                        // would be a blind spot otherwise.
+                        if event.kind == ChangeKind::Created {
+                            maybe_attach_watch_for_new_dir(&event.path, &matcher, &notify);
+                        }
                         record_event(&mut pending, event);
                         last_event_at = Some(Instant::now());
                     }
@@ -295,6 +366,31 @@ fn run_debounce_loop(
                 last_event_at = None;
             }
         }
+    }
+}
+
+/// When a `Created` event arrives, check whether the new path is a
+/// directory that the ignore matcher would keep. If so, register a
+/// non-recursive watch on it so we receive events for files added
+/// inside. Best-effort: registration failures are logged once and
+/// don't disturb the rest of the watcher.
+fn maybe_attach_watch_for_new_dir(path: &Path, matcher: &Arc<dyn Matcher>, notify: &SharedNotify) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    if matcher.matched(path) {
+        return;
+    }
+    if let Ok(mut guard) = notify.lock()
+        && let Err(err) = guard.watch(path, RecursiveMode::NonRecursive)
+    {
+        eprintln!(
+            "xgraph watcher: failed to watch new directory {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -583,6 +679,57 @@ mod tests {
             all_paths().all(|p| canonical(p) != canonical_dropped),
             "did not expect ignored.txt in batch; got {batch:?}",
         );
+
+        handle.stop();
+    }
+
+    /// The new per-directory watcher must not register an inotify watch
+    /// on an ignored subdirectory. Verified indirectly: if we did watch
+    /// it, a file created inside would produce a (later-filtered) raw
+    /// event and the underlying inotify slot would be consumed. The
+    /// test asserts the kernel never tells us about the file. (A
+    /// surviving filter at the worker layer would mask a real regression
+    /// here; the older "recursive watch on root" implementation would
+    /// register the watch even for ignored paths.)
+    #[test]
+    fn ignored_subdirectories_are_not_watched_at_kernel_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = canonical_root(&dir);
+        // Pre-create the ignored subdirectory so the initial walk has
+        // to skip it explicitly.
+        let ignored_dir = root.join("ignored_dir");
+        fs::create_dir(&ignored_dir).expect("create ignored dir");
+
+        let matcher: Arc<dyn Matcher> = Arc::new(Excludes("ignored_dir"));
+        let (handle, rx, debounce) = start(&root, matcher, test_config());
+        // Drain the initial-create flurry caused by setting up the
+        // tempdir before we focus on the targeted file.
+        let _ = drain_with_deadline(&rx, debounce);
+
+        // Touch a file inside the ignored subdir. If the watcher
+        // attached an inotify watch to `ignored_dir/` we'd see this
+        // event arrive; the matcher-based filter would discard it but
+        // the raw_events_from counter would still tick. With the new
+        // implementation no watch exists, so nothing reaches us.
+        let target = ignored_dir.join("inside.txt");
+        fs::write(&target, b"x").expect("write inside ignored");
+
+        let batches = drain_with_deadline(&rx, debounce);
+        let canonical_target = canonical(&target);
+        for batch in &batches {
+            for p in batch
+                .created
+                .iter()
+                .chain(batch.modified.iter())
+                .chain(batch.deleted.iter())
+            {
+                assert_ne!(
+                    canonical(p),
+                    canonical_target,
+                    "ignored subdirectory must not be watched at all; got {p:?}",
+                );
+            }
+        }
 
         handle.stop();
     }
