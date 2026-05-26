@@ -26,6 +26,7 @@ pub mod parser;
 pub mod progress;
 pub mod query;
 pub mod react;
+pub mod render;
 pub mod resolve;
 pub mod runtime;
 pub mod scanner;

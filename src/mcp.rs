@@ -285,9 +285,13 @@ impl McpProxy {
                 crate::mcp_protocol::Action::LocalReply(out_line) => {
                     write_client_message(&mut stdout, &out_line, message.framing).await?;
                 }
-                crate::mcp_protocol::Action::Forward { line, wrap_in_mcp } => {
+                crate::mcp_protocol::Action::Forward {
+                    line,
+                    wrap_in_mcp,
+                    tool,
+                } => {
                     let out_line = self
-                        .forward_with_reconnect(&line, wrap_in_mcp, &mut daemon)
+                        .forward_with_reconnect(&line, wrap_in_mcp, tool.as_ref(), &mut daemon)
                         .await;
                     write_client_message(&mut stdout, &out_line, message.framing).await?;
                 }
@@ -299,6 +303,7 @@ impl McpProxy {
         &self,
         line: &str,
         wrap_in_mcp: bool,
+        tool: Option<&crate::mcp_protocol::ToolCall>,
         daemon: &mut Option<DaemonConnectionState>,
     ) -> String {
         for attempt in 0..=1 {
@@ -309,6 +314,7 @@ impl McpProxy {
                         return crate::mcp_protocol::shape_forward_error(
                             line,
                             wrap_in_mcp,
+                            tool,
                             &err.to_string(),
                         );
                     }
@@ -318,7 +324,7 @@ impl McpProxy {
             let Some(state) = daemon.as_mut() else {
                 continue;
             };
-            match forward_once(state, line, wrap_in_mcp).await {
+            match forward_once(state, line, wrap_in_mcp, tool).await {
                 Ok(out_line) => return out_line,
                 Err(err) => {
                     eprintln!("xgraph mcp: daemon socket error: {err}");
@@ -329,12 +335,18 @@ impl McpProxy {
                     return crate::mcp_protocol::shape_forward_error(
                         line,
                         wrap_in_mcp,
+                        tool,
                         &format!("daemon socket error: {err}"),
                     );
                 }
             }
         }
-        crate::mcp_protocol::shape_forward_error(line, wrap_in_mcp, "daemon socket unavailable")
+        crate::mcp_protocol::shape_forward_error(
+            line,
+            wrap_in_mcp,
+            tool,
+            "daemon socket unavailable",
+        )
     }
 }
 
@@ -526,6 +538,7 @@ async fn forward_once(
     state: &mut DaemonConnectionState,
     line: &str,
     wrap_in_mcp: bool,
+    tool: Option<&crate::mcp_protocol::ToolCall>,
 ) -> Result<String, McpError> {
     state.writer.write_all(line.as_bytes()).await?;
     state.writer.flush().await?;
@@ -541,6 +554,7 @@ async fn forward_once(
     Ok(crate::mcp_protocol::shape_outgoing(
         &daemon_response_line,
         wrap_in_mcp,
+        tool,
     ))
 }
 

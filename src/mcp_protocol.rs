@@ -241,12 +241,18 @@ pub fn resource_templates_list_result() -> Value {
     json!({ "resourceTemplates": [] })
 }
 
-/// Wrap a daemon response into the MCP `tools/call` result shape. The
-/// daemon returns `{"jsonrpc":"2.0","id":N,"result":<x>}` or an `error`
-/// object. We surface `<x>` (or the error string) as the text content
-/// of a single content block — that's the agreed-upon MCP contract
-/// when a server doesn't have richer structured-content support.
-pub fn wrap_tool_response(daemon_response: &Value) -> Value {
+/// Wrap a daemon response into the MCP `tools/call` result shape.
+///
+/// When `tool` is `Some`, the daemon `result` plus `meta` is rendered as
+/// Markdown via [`crate::render::render_tool_result`] — that's what LLM
+/// agents see. When `tool` is `None`, we fall back to serializing the raw
+/// `result` as compact JSON; that path is only taken when an MCP request
+/// somehow lacks tool context (defensive) and matches the legacy shape.
+///
+/// Errors always become MCP tool errors: the error message becomes the
+/// text content and `isError` is set, mirroring the agreed-upon MCP
+/// contract for servers without structured-content support.
+pub fn wrap_tool_response(daemon_response: &Value, tool: Option<&ToolCall>) -> Value {
     if let Some(err) = daemon_response.get("error") {
         return json!({
             "content": [{
@@ -262,7 +268,11 @@ pub fn wrap_tool_response(daemon_response: &Value) -> Value {
         .get("result")
         .cloned()
         .unwrap_or(Value::Null);
-    let text = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
+    let meta = daemon_response.get("meta").cloned().unwrap_or(Value::Null);
+    let text = match tool {
+        Some(call) => crate::render::render_tool_result(&call.name, &call.arguments, &result, &meta),
+        None => serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string()),
+    };
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
@@ -272,8 +282,16 @@ pub fn wrap_tool_response(daemon_response: &Value) -> Value {
 /// Build a local failure response for a forwarded request that could not
 /// reach the daemon. For MCP `tools/call` we keep the protocol-level request
 /// successful and mark the tool result as `isError`; legacy direct callers get
-/// a normal JSON-RPC error.
-pub fn shape_forward_error(forwarded_line: &str, wrap_in_mcp: bool, message: &str) -> String {
+/// a normal JSON-RPC error. `tool` is accepted so callers don't have to
+/// re-derive it; the message itself is rendered as-is rather than through the
+/// Markdown layer because forwarding errors carry no `result`/`meta` to
+/// render.
+pub fn shape_forward_error(
+    forwarded_line: &str,
+    wrap_in_mcp: bool,
+    _tool: Option<&ToolCall>,
+    message: &str,
+) -> String {
     let parsed: Value = serde_json::from_str(forwarded_line.trim()).unwrap_or(Value::Null);
     let id = parsed.get("id").cloned().unwrap_or(Value::Null);
     if wrap_in_mcp {
@@ -331,6 +349,17 @@ pub fn build_error_line(id: Value, code: i32, message: &str) -> String {
     s
 }
 
+/// Identifies the MCP tool whose result the proxy is shaping. Carried
+/// through [`Action::Forward`] and into [`shape_outgoing`] / [`wrap_tool_response`]
+/// so the Markdown renderer can address it specifically and re-use the
+/// caller's arguments (e.g. the search needle, the target node id for
+/// `callers_of`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
 /// What kind of action should the proxy take after parsing one message
 /// from stdin? Returned by [`classify_request`] so the proxy loop
 /// itself stays small.
@@ -344,8 +373,13 @@ pub enum Action {
     /// Forward this fully-formed JSON-RPC line to the daemon, then
     /// pass the daemon's reply through to stdout. If `wrap_in_mcp` is
     /// true, the daemon's reply is wrapped in the MCP `tools/call`
-    /// shape before being sent to the client.
-    Forward { line: String, wrap_in_mcp: bool },
+    /// shape and rendered as Markdown using `tool` (which is always
+    /// `Some` for `tools/call`, `None` for legacy passthrough).
+    Forward {
+        line: String,
+        wrap_in_mcp: bool,
+        tool: Option<ToolCall>,
+    },
     /// The message wasn't valid JSON-RPC at all. Retained for callers
     /// that choose to ignore a message explicitly; protocol parse failures
     /// are answered with JSON-RPC errors by `classify_request`.
@@ -472,6 +506,10 @@ pub fn classify_request(raw_line: &str) -> Action {
             Action::Forward {
                 line: forwarded,
                 wrap_in_mcp: true,
+                tool: Some(ToolCall {
+                    name: name.to_string(),
+                    arguments,
+                }),
             }
         }
         // ------------------------------------------------------------
@@ -486,6 +524,7 @@ pub fn classify_request(raw_line: &str) -> Action {
             Action::Forward {
                 line,
                 wrap_in_mcp: false,
+                tool: None,
             }
         }
     }
@@ -494,11 +533,11 @@ pub fn classify_request(raw_line: &str) -> Action {
 /// Given a daemon response line and whether we should wrap it for MCP,
 /// produce the line the proxy should write to stdout.
 ///
-/// The `incoming_id` is the id from the *client's* original message —
-/// the daemon mirrors whatever id we forwarded, so for direct
-/// passthrough we don't need to remap, but the tools/call path wants
-/// the same id back on the wrapped reply.
-pub fn shape_outgoing(daemon_line: &str, wrap_in_mcp: bool) -> String {
+/// The `tool` is the same value forwarded with [`Action::Forward`] — it
+/// drives Markdown rendering of `result` + `meta`. Direct passthrough
+/// (`wrap_in_mcp == false`) ignores it; the daemon mirrors whatever id we
+/// forwarded, so the tools/call path also doesn't need to remap.
+pub fn shape_outgoing(daemon_line: &str, wrap_in_mcp: bool, tool: Option<&ToolCall>) -> String {
     if !wrap_in_mcp {
         let mut s = daemon_line.to_string();
         if !s.ends_with('\n') {
@@ -517,7 +556,7 @@ pub fn shape_outgoing(daemon_line: &str, wrap_in_mcp: bool) -> String {
         }
     };
     let id = daemon.get("id").cloned().unwrap_or(Value::Null);
-    let wrapped = wrap_tool_response(&daemon);
+    let wrapped = wrap_tool_response(&daemon, tool);
     build_response_line(id, wrapped)
 }
 
@@ -595,15 +634,37 @@ mod tests {
         let action = classify_request(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"name":"User","mode":"prefix"}}}"#,
         );
-        let Action::Forward { line, wrap_in_mcp } = action else {
+        let Action::Forward {
+            line,
+            wrap_in_mcp,
+            tool,
+        } = action
+        else {
             panic!("expected Forward");
         };
         assert!(wrap_in_mcp);
+        let tool = tool.expect("tools/call should carry tool context");
+        assert_eq!(tool.name, "search");
+        assert_eq!(tool.arguments["name"], "User");
+        assert_eq!(tool.arguments["mode"], "prefix");
         let forwarded: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(forwarded["method"], "search");
         assert_eq!(forwarded["id"], 3);
         assert_eq!(forwarded["params"]["name"], "User");
         assert_eq!(forwarded["params"]["mode"], "prefix");
+    }
+
+    #[test]
+    fn legacy_passthrough_carries_no_tool_context() {
+        let action = classify_request(r#"{"jsonrpc":"2.0","id":1,"method":"search","params":{}}"#);
+        let Action::Forward {
+            tool, wrap_in_mcp, ..
+        } = action
+        else {
+            panic!("expected Forward");
+        };
+        assert!(!wrap_in_mcp);
+        assert!(tool.is_none());
     }
 
     #[test]
@@ -657,17 +718,36 @@ mod tests {
         assert_eq!(v["error"]["code"], -32600);
     }
 
+    fn search_tool_call() -> ToolCall {
+        ToolCall {
+            name: "search".to_string(),
+            arguments: json!({"name": "User", "mode": "exact"}),
+        }
+    }
+
     #[test]
-    fn shape_outgoing_wraps_successful_tool_response() {
-        let daemon = r#"{"jsonrpc":"2.0","id":5,"result":{"hits":[{"name":"User"}]}}"#;
-        let out = shape_outgoing(daemon, true);
+    fn shape_outgoing_renders_tool_response_as_markdown() {
+        let daemon = r#"{"jsonrpc":"2.0","id":5,"result":{"hits":[{"node_id":"abc:1","name":"User","qname":"App\\Models\\User","kind":"class","path":"app/Models/User.php"}]},"meta":{"catching_up":false,"rss_bytes":1048576,"pending_paths":0,"warnings":[]}}"#;
+        let tool = search_tool_call();
+        let out = shape_outgoing(daemon, true, Some(&tool));
         let v: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["id"], 5);
         assert_eq!(v["result"]["isError"], false);
-        let content = v["result"]["content"].as_array().unwrap();
-        assert_eq!(content[0]["type"], "text");
-        // The text payload contains the daemon's `result` body as JSON.
-        let inner: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("## Search: User"));
+        assert!(text.contains("App\\Models\\User"));
+        assert!(text.contains("abc:1"));
+        assert!(text.contains("Index State: current."));
+    }
+
+    #[test]
+    fn shape_outgoing_without_tool_falls_back_to_json_text() {
+        let daemon = r#"{"jsonrpc":"2.0","id":5,"result":{"hits":[{"name":"User"}]}}"#;
+        let out = shape_outgoing(daemon, true, None);
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        let inner: Value =
+            serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["hits"][0]["name"], "User");
     }
 
@@ -675,7 +755,8 @@ mod tests {
     fn shape_outgoing_wraps_error_response_as_text_with_is_error() {
         let daemon =
             r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"method not found"}}"#;
-        let out = shape_outgoing(daemon, true);
+        let tool = search_tool_call();
+        let out = shape_outgoing(daemon, true, Some(&tool));
         let v: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["result"]["isError"], true);
         assert!(
@@ -689,14 +770,15 @@ mod tests {
     #[test]
     fn shape_outgoing_passthrough_when_not_wrapping() {
         let daemon = r#"{"jsonrpc":"2.0","id":7,"result":{"hits":[]}}"#;
-        let out = shape_outgoing(daemon, false);
+        let out = shape_outgoing(daemon, false, None);
         assert_eq!(out.trim_end_matches('\n'), daemon);
     }
 
     #[test]
     fn shape_forward_error_uses_mcp_tool_error_shape() {
         let forwarded = r#"{"jsonrpc":"2.0","id":8,"method":"search","params":{}}"#;
-        let out = shape_forward_error(forwarded, true, "daemon unavailable");
+        let tool = search_tool_call();
+        let out = shape_forward_error(forwarded, true, Some(&tool), "daemon unavailable");
         let v: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["id"], 8);
         assert_eq!(v["result"]["isError"], true);
@@ -706,7 +788,7 @@ mod tests {
     #[test]
     fn shape_forward_error_uses_jsonrpc_error_for_direct_calls() {
         let forwarded = r#"{"jsonrpc":"2.0","id":9,"method":"search","params":{}}"#;
-        let out = shape_forward_error(forwarded, false, "daemon unavailable");
+        let out = shape_forward_error(forwarded, false, None, "daemon unavailable");
         let v: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["id"], 9);
         assert_eq!(v["error"]["code"], -32000);
