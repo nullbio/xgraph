@@ -18,7 +18,7 @@
 //!   pressure signal worth surfacing (e.g. `"high_memory_usage"` when RSS
 //!   exceeds `daemon_status::RSS_WARNING_THRESHOLD_BYTES`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -34,6 +34,12 @@ use crate::daemon::ConnectionHandler;
 use crate::daemon_status::{DaemonStatus, RSS_WARNING_THRESHOLD_BYTES};
 use crate::indexes::{HotIndexes, NodeId, SearchMode, SearchQuery, SymbolKey};
 use crate::owner::{IndexSummary, MaintenanceCommand, MaintenanceSender};
+
+const MAX_TEXT_PARAM_BYTES: usize = 10_000;
+const MAX_PATH_PARAM_BYTES: usize = 4096;
+const MAX_NODE_ID_BYTES: usize = 1024;
+const MAX_KIND_PARAM_BYTES: usize = 128;
+const MAX_EXPLORE_NODE_IDS: usize = 256;
 
 pub struct WorktreeHandler {
     indexes: Arc<HotIndexes>,
@@ -127,37 +133,26 @@ impl WorktreeHandler {
                 Ok((json!({ "hits": hits }), catching_up))
             }
             "callers_of" => {
-                let params: NodeIdParams = parse_params(request)?;
-                let nodes = self
+                let params: RelatedNodesParams = parse_params(request)?;
+                let ids = self
                     .indexes
-                    .callers_of(&NodeId::from(params.node_id.as_str()))
-                    .into_iter()
-                    .map(|id| self.summarize_node(&id))
-                    .collect::<Vec<_>>();
+                    .callers_of(&NodeId::from(params.node_id.as_str()));
                 let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-                // `node_ids` kept as a plain array of strings so older CLI
-                // clients (and `xgraph callers` pretty-printing) still
-                // work; `nodes` is the agent-friendly format.
-                let ids: Vec<&str> = nodes
-                    .iter()
-                    .filter_map(|n| n.get("node_id").and_then(|v| v.as_str()))
-                    .collect();
-                Ok((json!({ "node_ids": ids, "nodes": nodes }), catching_up))
+                Ok((
+                    self.related_nodes_payload(ids, params.limit, params.offset),
+                    catching_up,
+                ))
             }
             "callees_of" => {
-                let params: NodeIdParams = parse_params(request)?;
-                let nodes = self
+                let params: RelatedNodesParams = parse_params(request)?;
+                let ids = self
                     .indexes
-                    .callees_of(&NodeId::from(params.node_id.as_str()))
-                    .into_iter()
-                    .map(|id| self.summarize_node(&id))
-                    .collect::<Vec<_>>();
+                    .callees_of(&NodeId::from(params.node_id.as_str()));
                 let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-                let ids: Vec<&str> = nodes
-                    .iter()
-                    .filter_map(|n| n.get("node_id").and_then(|v| v.as_str()))
-                    .collect();
-                Ok((json!({ "node_ids": ids, "nodes": nodes }), catching_up))
+                Ok((
+                    self.related_nodes_payload(ids, params.limit, params.offset),
+                    catching_up,
+                ))
             }
             "nodes_in_file" => {
                 let params: NodesInFileParams = parse_params(request)?;
@@ -183,7 +178,7 @@ impl WorktreeHandler {
                 Ok((json!({ "nodes": nodes }), catching_up))
             }
             "node" => {
-                let params: NodeIdParams = parse_params(request)?;
+                let params: NodeParams = parse_params(request)?;
                 let id = NodeId::from(params.node_id.as_str());
                 let record = match self.indexes.get_node(&id) {
                     Some(r) => r,
@@ -191,30 +186,41 @@ impl WorktreeHandler {
                         return Ok((json!({ "node": null }), false));
                     }
                 };
-                // Pull span + source snippet via Cozo. The span is stored
-                // as a `[start_byte, end_byte, start_row, start_col]` list.
-                let mut span_start: Option<u64> = None;
-                let mut span_end: Option<u64> = None;
-                let mut span_row: Option<u64> = None;
-                let mut span_col: Option<u64> = None;
-                if let Ok(rows) = self.store.run_read(
-                    "?[span] := *active_node[$id, _path, _hash, _local, _kind, _name, _qname, span]",
-                    [(
-                        "id".to_string(),
-                        cozo::DataValue::from(record.id.as_str()),
-                    )]
-                    .into(),
-                ) && let Some(row) = rows.rows.into_iter().next()
-                    && let Some(cozo::DataValue::List(span_list)) = row.into_iter().next()
-                {
-                    let mut it = span_list.into_iter();
-                    span_start = it.next().and_then(data_to_u64);
-                    span_end = it.next().and_then(data_to_u64);
-                    span_row = it.next().and_then(data_to_u64);
-                    span_col = it.next().and_then(data_to_u64);
-                }
-                let source_snippet =
-                    read_snippet(&self.worktree_root, &record.path, span_start, span_end);
+                let snippet_bytes = params.snippet_bytes.unwrap_or(4096).min(16 * 1024);
+                let related_limit = params.related_limit.unwrap_or(20).min(200);
+                let (span, source, source_lines, source_truncated) =
+                    self.lookup_span_and_snippet(&id, &record.path, snippet_bytes);
+                let caller_nodes = self
+                    .indexes
+                    .callers_of(&id)
+                    .into_iter()
+                    .take(related_limit)
+                    .map(|caller| self.summarize_node(&caller))
+                    .collect::<Vec<_>>();
+                let callee_nodes = self
+                    .indexes
+                    .callees_of(&id)
+                    .into_iter()
+                    .take(related_limit)
+                    .map(|callee| self.summarize_node(&callee))
+                    .collect::<Vec<_>>();
+                let callers = node_ids_from_summaries(&caller_nodes);
+                let callees = node_ids_from_summaries(&callee_nodes);
+                let member_ids = self.member_node_ids(&record, related_limit);
+                let member_nodes = member_ids
+                    .iter()
+                    .map(|member| self.summarize_node(member))
+                    .collect::<Vec<_>>();
+                let member_caller_nodes = self.aggregate_member_related(
+                    &member_ids,
+                    RelatedDirection::Callers,
+                    related_limit,
+                );
+                let member_callee_nodes = self.aggregate_member_related(
+                    &member_ids,
+                    RelatedDirection::Callees,
+                    related_limit,
+                );
                 let catching_up =
                     !self.status.is_reconcile_done() || self.status.is_path_pending(&record.path);
                 Ok((
@@ -225,13 +231,17 @@ impl WorktreeHandler {
                             "kind": record.kind,
                             "name": record.name,
                             "qname": record.qname,
-                            "span": {
-                                "start_byte": span_start,
-                                "end_byte": span_end,
-                                "start_row": span_row,
-                                "start_col": span_col,
-                            },
-                            "source": source_snippet,
+                            "span": span,
+                            "source": source,
+                            "source_lines": source_lines,
+                            "source_truncated": source_truncated,
+                            "callers": callers,
+                            "callees": callees,
+                            "caller_nodes": caller_nodes,
+                            "callee_nodes": callee_nodes,
+                            "member_nodes": member_nodes,
+                            "member_caller_nodes": member_caller_nodes,
+                            "member_callee_nodes": member_callee_nodes,
                         }
                     }),
                     catching_up,
@@ -292,8 +302,35 @@ impl WorktreeHandler {
                 let params: ImpactParams = parse_params(request)?;
                 let max_depth = params.max_depth.unwrap_or(0);
                 let affected = run_impact_query(&self.store, &params.node_id, max_depth)?;
+                let total = affected.len();
+                let (offset, limit) = page_bounds(total, params.offset, params.limit, 500, 5000);
+                let page = affected
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(NodeId::from)
+                    .collect::<Vec<_>>();
+                let node_ids = page
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                let nodes = page
+                    .iter()
+                    .map(|id| self.summarize_node(id))
+                    .collect::<Vec<_>>();
                 let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
-                Ok((json!({ "node_ids": affected }), catching_up))
+                Ok((
+                    json!({
+                        "target": self.summarize_node(&NodeId::from(params.node_id.as_str())),
+                        "node_ids": node_ids,
+                        "nodes": nodes,
+                        "total": total,
+                        "offset": offset,
+                        "limit": limit,
+                        "truncated": offset.saturating_add(limit) < total,
+                    }),
+                    catching_up,
+                ))
             }
             "search" => {
                 let params: SearchParams = parse_params(request)?;
@@ -434,7 +471,8 @@ impl WorktreeHandler {
             if matches.len() >= match_limit {
                 continue;
             }
-            let (span, source) = self.lookup_span_and_snippet(id, &record.path, snippet_bytes);
+            let (span, source, source_lines, source_truncated) =
+                self.lookup_span_and_snippet(id, &record.path, snippet_bytes);
             let caller_nodes: Vec<Value> = self
                 .indexes
                 .callers_of(id)
@@ -449,22 +487,23 @@ impl WorktreeHandler {
                 .take(related_limit)
                 .map(|c| self.summarize_node(&c))
                 .collect();
-            let callers: Vec<String> = caller_nodes
+            let callers = node_ids_from_summaries(&caller_nodes);
+            let callees = node_ids_from_summaries(&callee_nodes);
+            let member_ids = self.member_node_ids(&record, related_limit);
+            let member_nodes = member_ids
                 .iter()
-                .filter_map(|node| {
-                    node.get("node_id")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                })
-                .collect();
-            let callees: Vec<String> = callee_nodes
-                .iter()
-                .filter_map(|node| {
-                    node.get("node_id")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                })
-                .collect();
+                .map(|member| self.summarize_node(member))
+                .collect::<Vec<_>>();
+            let member_caller_nodes = self.aggregate_member_related(
+                &member_ids,
+                RelatedDirection::Callers,
+                related_limit,
+            );
+            let member_callee_nodes = self.aggregate_member_related(
+                &member_ids,
+                RelatedDirection::Callees,
+                related_limit,
+            );
             matches.push(json!({
                 "node_id": id.as_str(),
                 "name": record.name,
@@ -473,10 +512,15 @@ impl WorktreeHandler {
                 "path": record.path.to_string_lossy(),
                 "span": span,
                 "source": source,
+                "source_lines": source_lines,
+                "source_truncated": source_truncated,
                 "callers": callers,
                 "callees": callees,
                 "caller_nodes": caller_nodes,
                 "callee_nodes": callee_nodes,
+                "member_nodes": member_nodes,
+                "member_caller_nodes": member_caller_nodes,
+                "member_callee_nodes": member_callee_nodes,
             }));
         }
 
@@ -493,6 +537,7 @@ impl WorktreeHandler {
     fn build_explore(&self, params: ExploreParams) -> (Value, bool) {
         let total_budget = params.byte_budget.unwrap_or(32 * 1024).min(128 * 1024);
         let per_snippet = params.per_snippet_bytes.unwrap_or(4096).min(16 * 1024);
+        let related_limit = params.related_limit.unwrap_or(0).min(50);
         let mut remaining = total_budget;
 
         let mut items: Vec<Value> = Vec::with_capacity(params.node_ids.len());
@@ -507,10 +552,25 @@ impl WorktreeHandler {
                 catching_up = true;
             }
             let snippet_cap = per_snippet.min(remaining);
-            let (span, source) = self.lookup_span_and_snippet(&id, &record.path, snippet_cap);
+            let (span, source, source_lines, source_truncated) =
+                self.lookup_span_and_snippet(&id, &record.path, snippet_cap);
             if let Some(ref s) = source {
                 remaining = remaining.saturating_sub(s.len());
             }
+            let caller_nodes = self
+                .indexes
+                .callers_of(&id)
+                .into_iter()
+                .take(related_limit)
+                .map(|caller| self.summarize_node(&caller))
+                .collect::<Vec<_>>();
+            let callee_nodes = self
+                .indexes
+                .callees_of(&id)
+                .into_iter()
+                .take(related_limit)
+                .map(|callee| self.summarize_node(&callee))
+                .collect::<Vec<_>>();
             items.push(json!({
                 "node_id": raw_id,
                 "name": record.name,
@@ -519,6 +579,10 @@ impl WorktreeHandler {
                 "path": record.path.to_string_lossy(),
                 "span": span,
                 "source": source,
+                "source_lines": source_lines,
+                "source_truncated": source_truncated,
+                "caller_nodes": caller_nodes,
+                "callee_nodes": callee_nodes,
             }));
             if remaining == 0 {
                 break;
@@ -598,6 +662,33 @@ impl WorktreeHandler {
         chain.iter().map(|n| self.node_for_trace(n)).collect()
     }
 
+    fn related_nodes_payload(
+        &self,
+        ids: Vec<NodeId>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Value {
+        let total = ids.len();
+        let (offset, limit) = page_bounds(total, offset, limit, 200, 1000);
+        let page = ids.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        let node_ids = page
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let nodes = page
+            .iter()
+            .map(|id| self.summarize_node(id))
+            .collect::<Vec<_>>();
+        json!({
+            "node_ids": node_ids,
+            "nodes": nodes,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset.saturating_add(limit) < total,
+        })
+    }
+
     /// Compact JSON for "here's a node id, give me just enough to know
     /// what it is": id + name + kind + qname + path. Used by
     /// `callers_of` / `callees_of` so an agent doesn't have to fan out
@@ -628,6 +719,53 @@ impl WorktreeHandler {
         }
     }
 
+    fn member_node_ids(&self, record: &crate::indexes::NodeRecord, limit: usize) -> Vec<NodeId> {
+        if !matches!(
+            record.kind.as_str(),
+            "class" | "interface" | "trait" | "enum" | "component"
+        ) {
+            return Vec::new();
+        }
+        let qname_prefix = format!("{}::", record.qname);
+        self.indexes
+            .nodes_in_file(&record.path)
+            .into_iter()
+            .filter(|id| {
+                self.indexes
+                    .get_node(id)
+                    .is_some_and(|member| member.qname.starts_with(&qname_prefix))
+            })
+            .take(limit)
+            .collect()
+    }
+
+    fn aggregate_member_related(
+        &self,
+        member_ids: &[NodeId],
+        direction: RelatedDirection,
+        limit: usize,
+    ) -> Vec<Value> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let member_set: HashSet<&str> = member_ids.iter().map(NodeId::as_str).collect();
+        let mut out = Vec::new();
+        for member in member_ids {
+            let related = match direction {
+                RelatedDirection::Callers => self.indexes.callers_of(member),
+                RelatedDirection::Callees => self.indexes.callees_of(member),
+            };
+            for id in related {
+                if member_set.contains(id.as_str()) || !seen.insert(id.as_str().to_owned()) {
+                    continue;
+                }
+                out.push(self.summarize_node(&id));
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
     /// Fetch the `span` array + a bounded source snippet for a node id.
     /// Returns `(span_json, snippet)` where either may be null if the
     /// active_node row is missing or the file is unreadable.
@@ -636,7 +774,7 @@ impl WorktreeHandler {
         id: &NodeId,
         path: &std::path::Path,
         max_bytes: usize,
-    ) -> (Value, Option<String>) {
+    ) -> (Value, Option<String>, Option<String>, bool) {
         let mut span_start: Option<u64> = None;
         let mut span_end: Option<u64> = None;
         let mut span_row: Option<u64> = None;
@@ -653,19 +791,25 @@ impl WorktreeHandler {
             span_row = it.next().and_then(data_to_u64);
             span_col = it.next().and_then(data_to_u64);
         }
-        let snippet = if max_bytes > 0 {
+        let (snippet, truncated) = if max_bytes > 0 {
             read_snippet_with_cap(&self.worktree_root, path, span_start, span_end, max_bytes)
         } else {
-            None
+            (None, false)
         };
+        let source_lines = snippet
+            .as_deref()
+            .and_then(|source| line_numbered_source(source, span_row));
         (
             json!({
                 "start_byte": span_start,
                 "end_byte": span_end,
                 "start_row": span_row,
                 "start_col": span_col,
+                "start_line": span_row.map(|row| row + 1),
             }),
             snippet,
+            source_lines,
+            truncated,
         )
     }
 
@@ -781,14 +925,52 @@ struct FindSymbolParams {
     kind: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NodeIdParams {
-    node_id: String,
+impl RpcParams for FindSymbolParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_len("name", &self.name, MAX_TEXT_PARAM_BYTES)?;
+        validate_optional_len("kind", self.kind.as_ref(), MAX_KIND_PARAM_BYTES)
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct NodesInFileParams {
     path: String,
+}
+
+impl RpcParams for NodesInFileParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_len("path", &self.path, MAX_PATH_PARAM_BYTES)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeParams {
+    node_id: String,
+    #[serde(default)]
+    related_limit: Option<usize>,
+    #[serde(default)]
+    snippet_bytes: Option<usize>,
+}
+
+impl RpcParams for NodeParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_node_id("node_id", &self.node_id)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RelatedNodesParams {
+    node_id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+impl RpcParams for RelatedNodesParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_node_id("node_id", &self.node_id)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -801,6 +983,12 @@ struct FilesParams {
     offset: Option<usize>,
 }
 
+impl RpcParams for FilesParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_optional_len("prefix", self.prefix.as_ref(), MAX_PATH_PARAM_BYTES)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ImpactParams {
     node_id: String,
@@ -808,6 +996,16 @@ struct ImpactParams {
     /// unbounded variant.
     #[serde(default)]
     max_depth: Option<u32>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+impl RpcParams for ImpactParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_node_id("node_id", &self.node_id)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -823,6 +1021,27 @@ struct SearchParams {
     /// Hard cap on returned hits. Defaults to 64; max 1024.
     #[serde(default)]
     limit: Option<usize>,
+}
+
+impl RpcParams for SearchParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_len("name", &self.name, MAX_TEXT_PARAM_BYTES)?;
+        validate_optional_len("kind", self.kind.as_ref(), MAX_KIND_PARAM_BYTES)?;
+        validate_optional_len(
+            "path_prefix",
+            self.path_prefix.as_ref(),
+            MAX_PATH_PARAM_BYTES,
+        )?;
+        if let Some(mode) = &self.mode
+            && !matches!(mode.as_str(), "exact" | "prefix" | "contains")
+        {
+            return Err(RpcError {
+                code: -32602,
+                message: format!("invalid params: unsupported `mode`: {mode}"),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,6 +1062,18 @@ struct ContextParams {
     snippet_bytes: Option<usize>,
 }
 
+impl RpcParams for ContextParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_len("name", &self.name, MAX_TEXT_PARAM_BYTES)?;
+        validate_optional_len("kind", self.kind.as_ref(), MAX_KIND_PARAM_BYTES)?;
+        validate_optional_len(
+            "path_prefix",
+            self.path_prefix.as_ref(),
+            MAX_PATH_PARAM_BYTES,
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ExploreParams {
     /// Node ids to expand into source snippets. Order is preserved.
@@ -854,6 +1085,32 @@ struct ExploreParams {
     /// whole budget. Defaults to 4 KiB.
     #[serde(default)]
     per_snippet_bytes: Option<usize>,
+    /// How many caller/callee summaries to include per item. Defaults to 0.
+    #[serde(default)]
+    related_limit: Option<usize>,
+}
+
+impl RpcParams for ExploreParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        if self.node_ids.len() > MAX_EXPLORE_NODE_IDS {
+            return Err(RpcError {
+                code: -32602,
+                message: format!(
+                    "invalid params: `node_ids` exceeds {MAX_EXPLORE_NODE_IDS} entries"
+                ),
+            });
+        }
+        for (index, node_id) in self.node_ids.iter().enumerate() {
+            validate_node_id(&format!("node_ids[{index}]"), node_id)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RelatedDirection {
+    Callers,
+    Callees,
 }
 
 #[derive(Debug, Deserialize)]
@@ -864,6 +1121,13 @@ struct TraceParams {
     /// rarely insightful and the search starts to dominate latency.
     #[serde(default)]
     max_depth: Option<usize>,
+}
+
+impl RpcParams for TraceParams {
+    fn validate(&self) -> Result<(), RpcError> {
+        validate_node_id("from", &self.from)?;
+        validate_node_id("to", &self.to)
+    }
 }
 
 /// Decode a Cozo `Int` value into `u64` for span fields. Returns `None`
@@ -877,43 +1141,85 @@ fn data_to_u64(v: cozo::DataValue) -> Option<u64> {
 }
 
 /// Read a `[start_byte, end_byte)` slice from `worktree_root.join(relative)`.
-/// Caps the snippet at 4 KiB to keep MCP responses bounded; clients that
-/// need the full source can `read` the file themselves. Returns `None` on
-/// any I/O error so the response simply omits the snippet.
-fn read_snippet(
-    worktree_root: &std::path::Path,
-    relative: &std::path::Path,
-    start: Option<u64>,
-    end: Option<u64>,
-) -> Option<String> {
-    read_snippet_with_cap(worktree_root, relative, start, end, 4096)
-}
-
-/// Same as [`read_snippet`] with a caller-supplied byte cap. Used by
-/// `context` / `explore` which apportion a shared output budget across
-/// many snippets.
+/// Used by `node` / `context` / `explore` which apportion output budgets
+/// across snippets. Returns `(None, false)` on any I/O error so the response
+/// simply omits the snippet.
 fn read_snippet_with_cap(
     worktree_root: &std::path::Path,
     relative: &std::path::Path,
     start: Option<u64>,
     end: Option<u64>,
     cap_bytes: usize,
-) -> Option<String> {
-    let start = start?;
-    let end = end?;
+) -> (Option<String>, bool) {
+    let Some(start) = start else {
+        return (None, false);
+    };
+    let Some(end) = end else {
+        return (None, false);
+    };
     if end <= start || cap_bytes == 0 {
-        return None;
+        return (None, false);
     }
-    let length = (end - start).min(cap_bytes as u64);
+    let full_length = end - start;
+    let length = full_length.min(cap_bytes as u64);
+    let truncated = full_length > cap_bytes as u64;
     let full = worktree_root.join(relative);
-    let bytes = std::fs::read(&full).ok()?;
-    let start_usize: usize = start.try_into().ok()?;
-    let length_usize: usize = length.try_into().ok()?;
-    let end_usize = start_usize.checked_add(length_usize)?.min(bytes.len());
+    let Ok(bytes) = std::fs::read(&full) else {
+        return (None, false);
+    };
+    let Ok(start_usize) = usize::try_from(start) else {
+        return (None, false);
+    };
+    let Ok(length_usize) = usize::try_from(length) else {
+        return (None, false);
+    };
+    let Some(end_usize) = start_usize
+        .checked_add(length_usize)
+        .map(|end| end.min(bytes.len()))
+    else {
+        return (None, false);
+    };
     if start_usize >= bytes.len() {
-        return None;
+        return (None, false);
     }
-    Some(String::from_utf8_lossy(&bytes[start_usize..end_usize]).into_owned())
+    (
+        Some(String::from_utf8_lossy(&bytes[start_usize..end_usize]).into_owned()),
+        truncated,
+    )
+}
+
+fn line_numbered_source(source: &str, start_row: Option<u64>) -> Option<String> {
+    let start_line = start_row? + 1;
+    let mut out = String::new();
+    for (i, line) in source.lines().enumerate() {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "{}\t{}", start_line + i as u64, line);
+    }
+    Some(out)
+}
+
+fn node_ids_from_summaries(nodes: &[Value]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            node.get("node_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn page_bounds(
+    total: usize,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    default_limit: usize,
+    max_limit: usize,
+) -> (usize, usize) {
+    let offset = offset.unwrap_or(0).min(total);
+    let default_limit = default_limit.min(total.saturating_sub(offset));
+    let limit = limit.unwrap_or(default_limit).min(max_limit);
+    (offset, limit)
 }
 
 /// Backward transitive closure over calls, renders, inheritance, implementations,
@@ -982,14 +1288,47 @@ struct RpcError {
     message: String,
 }
 
-fn parse_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, RpcError> {
+trait RpcParams: serde::de::DeserializeOwned {
+    fn validate(&self) -> Result<(), RpcError> {
+        Ok(())
+    }
+}
+
+fn parse_params<T: RpcParams>(request: &Request) -> Result<T, RpcError> {
     // serde_json supports deserializing from a `Value` reference via
     // `T::deserialize(&value)`, avoiding the per-request clone of the whole
     // params subtree that `from_value` would do.
-    T::deserialize(&request.params).map_err(|err| RpcError {
+    let params = T::deserialize(&request.params).map_err(|err| RpcError {
         code: -32602,
         message: format!("invalid params: {err}"),
-    })
+    })?;
+    params.validate()?;
+    Ok(params)
+}
+
+fn validate_len(label: &str, value: &str, max_bytes: usize) -> Result<(), RpcError> {
+    if value.len() > max_bytes {
+        return Err(RpcError {
+            code: -32602,
+            message: format!("invalid params: `{label}` exceeds {max_bytes} bytes"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_len(
+    label: &str,
+    value: Option<&String>,
+    max_bytes: usize,
+) -> Result<(), RpcError> {
+    if let Some(value) = value {
+        validate_len(label, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_node_id(label: &str, value: &str) -> Result<(), RpcError> {
+    validate_len(label, value, MAX_NODE_ID_BYTES)
 }
 
 #[cfg(test)]
@@ -1207,6 +1546,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_string_params_return_invalid_params() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": "node",
+            "params": { "node_id": "x".repeat(MAX_NODE_ID_BYTES + 1) }
+        })
+        .to_string();
+        let resp = run_request(indexes, status, root, store, &request).await;
+        assert_eq!(resp["id"], 91);
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("node_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_search_mode_returns_invalid_params() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":92,"method":"search","params":{"name":"User","mode":"regex"}}"#,
+        )
+        .await;
+        assert_eq!(resp["id"], 92);
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported `mode`")
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_rejects_excessive_node_id_batches() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 93,
+            "method": "explore",
+            "params": { "node_ids": vec!["h:node"; MAX_EXPLORE_NODE_IDS + 1] }
+        })
+        .to_string();
+        let resp = run_request(indexes, status, root, store, &request).await;
+        assert_eq!(resp["id"], 93);
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("node_ids")
+        );
+    }
+
+    #[tokio::test]
     async fn status_tool_reports_counts() {
         let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
@@ -1283,6 +1688,8 @@ mod tests {
         let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
         let id = NodeId::from("h:99");
+        let caller = NodeId::from("h:caller");
+        let callee = NodeId::from("h:callee");
         indexes.insert_node(NodeRecord {
             id: id.clone(),
             path: PathBuf::from("src/x.rs"),
@@ -1290,6 +1697,22 @@ mod tests {
             name: "X".to_string(),
             qname: "ns::X".to_string(),
         });
+        indexes.insert_node(NodeRecord {
+            id: caller.clone(),
+            path: PathBuf::from("src/caller.rs"),
+            kind: "function".to_string(),
+            name: "caller".to_string(),
+            qname: "caller".to_string(),
+        });
+        indexes.insert_node(NodeRecord {
+            id: callee.clone(),
+            path: PathBuf::from("src/callee.rs"),
+            kind: "function".to_string(),
+            name: "callee".to_string(),
+            qname: "callee".to_string(),
+        });
+        indexes.add_call_edge(caller, id.clone());
+        indexes.add_call_edge(id.clone(), callee);
         let resp = run_request(
             indexes,
             status,
@@ -1301,6 +1724,14 @@ mod tests {
         assert_eq!(resp["result"]["node"]["node_id"], "h:99");
         assert_eq!(resp["result"]["node"]["kind"], "class");
         assert_eq!(resp["result"]["node"]["qname"], "ns::X");
+        assert_eq!(
+            resp["result"]["node"]["caller_nodes"][0]["node_id"],
+            "h:caller"
+        );
+        assert_eq!(
+            resp["result"]["node"]["callee_nodes"][0]["node_id"],
+            "h:callee"
+        );
     }
 
     #[tokio::test]
@@ -1469,6 +1900,158 @@ mod tests {
         let caller_nodes = matches[0]["caller_nodes"].as_array().unwrap();
         assert_eq!(caller_nodes[0]["qname"], "UserController");
         assert_eq!(resp["result"]["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn callers_tool_pages_and_returns_metadata() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        populate_demo_symbols(&indexes);
+        let target = NodeId::from("h:UserService");
+        indexes.add_call_edge(NodeId::from("h:UserController"), target.clone());
+        indexes.add_call_edge(NodeId::from("h:PostController"), target);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":30,"method":"callers_of","params":{"node_id":"h:UserService","limit":1}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["total"], 2);
+        assert_eq!(resp["result"]["limit"], 1);
+        assert_eq!(resp["result"]["truncated"], true);
+        assert_eq!(resp["result"]["nodes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn class_context_includes_member_relationships() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let class = NodeId::from("h:Service");
+        let method = NodeId::from("h:Service::run");
+        let caller = NodeId::from("h:Caller");
+        let callee = NodeId::from("h:Dependency");
+        for (id, kind, name, qname, path) in [
+            (
+                class.clone(),
+                "class",
+                "Service",
+                "App\\Service",
+                "app/Service.php",
+            ),
+            (
+                method.clone(),
+                "method",
+                "run",
+                "App\\Service::run",
+                "app/Service.php",
+            ),
+            (
+                caller.clone(),
+                "method",
+                "call",
+                "App\\Caller::call",
+                "app/Caller.php",
+            ),
+            (
+                callee.clone(),
+                "method",
+                "work",
+                "App\\Dependency::work",
+                "app/Dependency.php",
+            ),
+        ] {
+            indexes.insert_node(NodeRecord {
+                id: id.clone(),
+                path: PathBuf::from(path),
+                kind: kind.to_string(),
+                name: name.to_string(),
+                qname: qname.to_string(),
+            });
+            indexes.register_symbol(
+                SymbolKey {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                },
+                id,
+            );
+        }
+        indexes.insert_file(
+            PathBuf::from("app/Service.php"),
+            vec![class.clone(), method.clone()],
+        );
+        indexes.add_call_edge(caller, method.clone());
+        indexes.add_call_edge(method, callee);
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":31,"method":"context","params":{"name":"Service"}}"#,
+        )
+        .await;
+        let first = &resp["result"]["matches"][0];
+        assert_eq!(first["member_nodes"][0]["node_id"], "h:Service::run");
+        assert_eq!(first["member_caller_nodes"][0]["node_id"], "h:Caller");
+        assert_eq!(first["member_callee_nodes"][0]["node_id"], "h:Dependency");
+    }
+
+    #[tokio::test]
+    async fn class_node_includes_member_relationships() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let class = NodeId::from("h:Service");
+        let method = NodeId::from("h:Service::run");
+        let caller = NodeId::from("h:Caller");
+        for (id, kind, name, qname, path) in [
+            (
+                class.clone(),
+                "class",
+                "Service",
+                "App\\Service",
+                "app/Service.php",
+            ),
+            (
+                method.clone(),
+                "method",
+                "run",
+                "App\\Service::run",
+                "app/Service.php",
+            ),
+            (
+                caller.clone(),
+                "method",
+                "call",
+                "App\\Caller::call",
+                "app/Caller.php",
+            ),
+        ] {
+            indexes.insert_node(NodeRecord {
+                id: id.clone(),
+                path: PathBuf::from(path),
+                kind: kind.to_string(),
+                name: name.to_string(),
+                qname: qname.to_string(),
+            });
+        }
+        indexes.insert_file(
+            PathBuf::from("app/Service.php"),
+            vec![class.clone(), method.clone()],
+        );
+        indexes.add_call_edge(caller, method);
+
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":32,"method":"node","params":{"node_id":"h:Service"}}"#,
+        )
+        .await;
+        let node = &resp["result"]["node"];
+        assert_eq!(node["member_nodes"][0]["node_id"], "h:Service::run");
+        assert_eq!(node["member_caller_nodes"][0]["node_id"], "h:Caller");
     }
 
     #[tokio::test]

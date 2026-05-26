@@ -84,7 +84,8 @@ Creates the Cozo schema, records project metadata, performs the initial scan/ind
 xgraph mcp
 ```
 
-Primary command for agents. It resolves the current Git worktree, ensures the daemon is running, then proxies MCP stdin/stdout to the daemon socket.
+Primary command for agents. It answers the MCP handshake locally, then lazily connects to or starts the worktree daemon on the first tool call that needs graph data. It supports both newline-delimited JSON and MCP `Content-Length` stdio framing. If launched outside a Git worktree, handshake still succeeds and tool calls return protocol-shaped errors without creating state.
+Malformed MCP input returns JSON-RPC parse/invalid-request errors instead of closing the process, and tool arguments are bounded before they reach the daemon indexes.
 
 ```bash
 xgraph daemon start
@@ -106,9 +107,9 @@ When a daemon is reachable, `init`, `sync`, and `reindex` are sent to that daemo
 xgraph find-symbol User --kind class
 xgraph search User --mode prefix
 xgraph search Controller --mode contains --path-prefix app/Http
-xgraph callers <node-id>
-xgraph callees <node-id>
-xgraph impact <node-id> --max-depth 3
+xgraph callers <node-id> --limit 50
+xgraph callees <node-id> --limit 50
+xgraph impact <node-id> --max-depth 3 --limit 100
 xgraph context UserService --path-prefix app/Services
 xgraph trace <from-id> <to-id>
 xgraph files --prefix app/Services --limit 50
@@ -415,18 +416,19 @@ Use in-memory indexes for hot MCP calls:
 
 - `find_symbol` — exact symbol lookup by name (+ optional kind).
 - `search` — exact / prefix / contains filtering with optional `kind` and `path_prefix`. Contains mode uses a lowercase 3-byte trigram inverted index; sub-microsecond at 50k symbols.
-- `node` — single record + bounded source snippet.
+- `node` — single record, bounded source snippet, line metadata, and a bounded caller/callee trail.
+- Class-like `node` and `context` responses include member nodes plus aggregate member caller/callee relationships, so class-level exploration does not hide method-level edges.
 - `nodes_in_file` — file scope.
-- `callers_of` / `callees_of` — call graph by node id.
-- `context` — composes symbol lookup, source, caller/callee IDs, and caller/callee node summaries; supports `path_prefix`, result limits, and related-node limits.
-- `explore` — multi-node source browsing with a shared byte budget.
+- `callers_of` / `callees_of` — call graph by node id with node metadata, totals, and pagination.
+- `context` — composes symbol lookup, source, caller/callee IDs, and caller/callee node summaries; class-like matches also include member nodes and aggregate member relationships.
+- `explore` — multi-node source browsing with a shared byte budget and optional per-node caller/callee trails.
 - `trace` — shortest call path via bidirectional BFS over the in-memory call graph.
 - `files` — sorted indexed paths with optional prefix filtering and pagination.
 - `status` — file / node / symbol / call-edge counts + RSS + reconcile state.
 
 Use Cozo Datalog for complex graph queries:
 
-- `impact` — transitive reverse closure over `calls` / `inherits` / `implements` / `references` edges, optionally depth-bounded.
+- `impact` — transitive reverse closure over `calls` / `inherits` / `implements` / `references` edges, optionally depth-bounded, with affected node metadata and pagination.
 - Cycle detection (`cycles_via_calls`).
 - Dependency cones.
 - Path queries.
@@ -466,7 +468,7 @@ TypeScript / JavaScript / TSX / Python.
   graph totals.
 - `xgraph daemon start` opens a Unix socket and serves the 12 MCP tools
   out of in-memory hot indexes loaded from the persistent graph.
-- `xgraph mcp` lazy-spawns the daemon and proxies MCP-style JSON-RPC.
+- `xgraph mcp` answers MCP handshake methods locally, then lazy-spawns the daemon for graph tool calls and proxies MCP-style JSON-RPC.
 - `xgraph init`, `xgraph sync`, and `xgraph reindex` use the live daemon when available,
   so terminal maintenance does not drop connected agent transports.
 - Per-binding TS/JS/Python import refs + container tracking + composite

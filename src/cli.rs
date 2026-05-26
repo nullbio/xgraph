@@ -66,14 +66,30 @@ pub enum Command {
         limit: usize,
     },
     /// List callers of a node id.
-    Callers { node_id: String },
+    Callers {
+        node_id: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
     /// List callees of a node id.
-    Callees { node_id: String },
+    Callees {
+        node_id: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
     /// Transitive backward closure (calls / inherits / implements / references).
     Impact {
         node_id: String,
         #[arg(long, default_value_t = 0)]
         max_depth: u32,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Task context: symbol + source + callers + callees in one call.
     Context {
@@ -230,17 +246,34 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
                 "limit": limit,
             }),
         ),
-        Command::Callers { node_id } => {
-            cmd_send_query("callers_of", serde_json::json!({ "node_id": node_id }))
-        }
-        Command::Callees { node_id } => {
-            cmd_send_query("callees_of", serde_json::json!({ "node_id": node_id }))
-        }
-        Command::Impact { node_id, max_depth } => cmd_send_query(
+        Command::Callers {
+            node_id,
+            limit,
+            offset,
+        } => cmd_send_query(
+            "callers_of",
+            serde_json::json!({ "node_id": node_id, "limit": limit, "offset": offset }),
+        ),
+        Command::Callees {
+            node_id,
+            limit,
+            offset,
+        } => cmd_send_query(
+            "callees_of",
+            serde_json::json!({ "node_id": node_id, "limit": limit, "offset": offset }),
+        ),
+        Command::Impact {
+            node_id,
+            max_depth,
+            limit,
+            offset,
+        } => cmd_send_query(
             "impact",
             serde_json::json!({
                 "node_id": node_id,
                 "max_depth": max_depth,
+                "limit": limit,
+                "offset": offset,
             }),
         ),
         Command::Context {
@@ -386,13 +419,18 @@ fn maybe_prompt_mcp_install() {
 
 fn cmd_mcp() -> Result<ExitCode, CliError> {
     let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
-    let runtime = ensure_runtime_dir(worktree.as_path())?;
-
-    let launcher = Arc::new(SubprocessLauncher {
-        worktree_root: worktree.as_path().to_path_buf(),
-    });
-    let config = crate::mcp::McpConfig::new(runtime.as_path().to_path_buf(), launcher);
+    let config = match WorktreeRoot::discover(&cwd) {
+        Ok(worktree) => {
+            let runtime = ensure_runtime_dir(worktree.as_path())?;
+            let launcher = Arc::new(SubprocessLauncher {
+                worktree_root: worktree.as_path().to_path_buf(),
+            });
+            crate::mcp::McpConfig::new(runtime.as_path().to_path_buf(), launcher)
+        }
+        Err(err) => crate::mcp::McpConfig::unavailable(format!(
+            "xgraph MCP is not attached to a Git worktree: {err}"
+        )),
+    };
 
     let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -417,15 +455,25 @@ impl crate::mcp::DaemonLauncher for SubprocessLauncher {
         let cwd = self.worktree_root.clone();
         Box::pin(async move {
             let exe_path = exe.map_err(crate::mcp::McpError::Io)?;
-            let mut child = std::process::Command::new(exe_path)
+            let mut command = std::process::Command::new(exe_path);
+            command
                 .arg("daemon")
                 .arg("start")
                 .current_dir(&cwd)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .stdin(std::process::Stdio::null())
-                .spawn()
-                .map_err(crate::mcp::McpError::Io)?;
+                .stdin(std::process::Stdio::null());
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // The daemon is intentionally longer-lived than the MCP
+                // proxy. Put it in its own process group so cleanup for a
+                // short-lived client process group cannot take it down.
+                command.process_group(0);
+            }
+
+            let mut child = command.spawn().map_err(crate::mcp::McpError::Io)?;
             let _ = std::thread::Builder::new()
                 .name("xgraph-daemon-reaper".into())
                 .spawn(move || {
@@ -486,34 +534,64 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     // Start the watcher and hand its batches to an OS thread that owns the
     // WorktreeOwner. The thread loops until batch_rx closes (when the watcher
     // handle is dropped at daemon shutdown).
-    let (watcher_handle, batch_rx) = crate::watcher::Watcher::start(
+    //
+    // Watcher startup can fail on inotify-exhausted systems (e.g. when
+    // `fs.inotify.max_user_watches` is at the Linux default 65k and a
+    // VSCode/rust-analyzer instance has eaten most of them). When that
+    // happens we serve queries against the indexed graph but skip
+    // incremental updates rather than refusing to start at all — the
+    // alternative is the MCP client hanging on startup with no useful
+    // signal.
+    let (watcher_handle, batch_rx) = match crate::watcher::Watcher::start(
         worktree.as_path(),
         watcher_matcher,
         crate::watcher::WatcherConfig::default(),
-    )
-    .map_err(|err| CliError::Io {
-        path: worktree.as_path().to_path_buf(),
-        source: std::io::Error::other(err.to_string()),
-    })?;
+    ) {
+        Ok(pair) => {
+            let (h, rx) = pair;
+            (Some(h), Some(rx))
+        }
+        Err(err) => {
+            eprintln!(
+                "xgraph: watcher failed to start: {err}\n\
+                 xgraph: serving the existing graph; incremental updates disabled.\n\
+                 xgraph: bump fs.inotify.max_user_watches (e.g. sysctl \
+                 fs.inotify.max_user_watches=524288) and restart to re-enable."
+            );
+            (None, None)
+        }
+    };
 
     let maintenance_gate_for_thread = Arc::clone(&maintenance_gate);
     let watcher_thread = std::thread::Builder::new()
         .name("xgraph-watcher-handler".into())
         .spawn(move || {
-            loop {
-                crossbeam_channel::select! {
-                    recv(batch_rx) -> msg => match msg {
-                        Ok(batch) => process_watcher_batch(&mut owner, batch),
-                        Err(_) => break,
-                    },
-                    recv(maintenance_rx) -> msg => match msg {
-                        Ok(command) => run_maintenance_command(
-                            &mut owner,
-                            &maintenance_gate_for_thread,
-                            command,
-                        ),
-                        Err(_) => break,
-                    },
+            // Two channel-pair shapes depending on whether the watcher
+            // started. With a watcher we poll both batches and
+            // maintenance commands; without one we only poll
+            // maintenance and exit when the maintenance channel
+            // closes.
+            match batch_rx {
+                Some(batch_rx) => loop {
+                    crossbeam_channel::select! {
+                        recv(batch_rx) -> msg => match msg {
+                            Ok(batch) => process_watcher_batch(&mut owner, batch),
+                            Err(_) => break,
+                        },
+                        recv(maintenance_rx) -> msg => match msg {
+                            Ok(command) => run_maintenance_command(
+                                &mut owner,
+                                &maintenance_gate_for_thread,
+                                command,
+                            ),
+                            Err(_) => break,
+                        },
+                    }
+                },
+                None => {
+                    while let Ok(command) = maintenance_rx.recv() {
+                        run_maintenance_command(&mut owner, &maintenance_gate_for_thread, command);
+                    }
                 }
             }
             let _ = owner.shutdown();
@@ -546,29 +624,10 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         let socket_path = handle.socket_path().to_path_buf();
         eprintln!("daemon listening on {}", socket_path.display());
 
-        // Wake up on either an external signal (SIGTERM/SIGINT) OR the
-        // daemon's own shutdown trigger — fired when the last client
-        // connection closes. Either way we proceed to `handle.shutdown()`
-        // which is idempotent.
-        let mut shutdown_rx = handle.shutdown_subscriber();
-        tokio::select! {
-            res = wait_for_shutdown() => {
-                if let Err(err) = res {
-                    eprintln!("failed to install signal handler: {err}; shutting down");
-                }
-            }
-            _ = async {
-                loop {
-                    if *shutdown_rx.borrow() {
-                        return;
-                    }
-                    if shutdown_rx.changed().await.is_err() {
-                        return;
-                    }
-                }
-            } => {
-                eprintln!("daemon: last client disconnected, exiting");
-            }
+        // The daemon is intentionally long-lived for the worktree. It exits
+        // only on SIGTERM/SIGINT, normally delivered by `xgraph daemon stop`.
+        if let Err(err) = wait_for_shutdown().await {
+            eprintln!("failed to install signal handler: {err}; shutting down");
         }
         handle.shutdown().await
     });
@@ -1283,18 +1342,33 @@ mod tests {
             cli.command,
             Command::Callers {
                 node_id: "h:42".to_string(),
+                limit: None,
+                offset: 0,
             }
         );
     }
 
     #[test]
     fn parses_impact_command_with_max_depth() {
-        let cli = parse(["xgraph", "impact", "h:42", "--max-depth", "5"]).expect("parses");
+        let cli = parse([
+            "xgraph",
+            "impact",
+            "h:42",
+            "--max-depth",
+            "5",
+            "--limit",
+            "10",
+            "--offset",
+            "2",
+        ])
+        .expect("parses");
         assert_eq!(
             cli.command,
             Command::Impact {
                 node_id: "h:42".to_string(),
                 max_depth: 5,
+                limit: Some(10),
+                offset: 2,
             }
         );
     }

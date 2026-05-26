@@ -20,8 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fs2::{FileExt, lock_contended_error};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{Instant, sleep, timeout};
 
 /// Default file name for the daemon's Unix domain socket.
@@ -34,7 +37,7 @@ pub const STARTUP_LOCK_NAME: &str = "startup.lock";
 pub const PID_FILE_NAME: &str = "daemon.pid";
 
 /// Total time the proxy is willing to wait for a daemon to start serving.
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum time to wait when probing the socket to see if a daemon is alive.
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -61,6 +64,8 @@ pub enum McpError {
     StartupTimeout,
     /// The runtime directory did not exist when the proxy started.
     MissingRuntimeDir(PathBuf),
+    /// The MCP process was launched outside a supported Git worktree.
+    Unavailable(String),
 }
 
 impl fmt::Display for McpError {
@@ -73,6 +78,7 @@ impl fmt::Display for McpError {
             Self::MissingRuntimeDir(path) => {
                 write!(f, "runtime directory missing: {}", path.display())
             }
+            Self::Unavailable(msg) => f.write_str(msg),
         }
     }
 }
@@ -112,30 +118,102 @@ pub trait DaemonLauncher: Send + Sync {
 /// Configuration for an `McpProxy` invocation.
 #[derive(Clone)]
 pub struct McpConfig {
-    pub runtime_dir: PathBuf,
-    pub socket_name: &'static str,
-    pub daemon_launcher: Arc<dyn DaemonLauncher>,
+    daemon: DaemonConnection,
+}
+
+#[derive(Clone)]
+enum DaemonConnection {
+    Worktree {
+        runtime_dir: PathBuf,
+        socket_name: &'static str,
+        daemon_launcher: Arc<dyn DaemonLauncher>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl DaemonConnection {
+    fn runtime_dir(&self) -> Result<&Path, McpError> {
+        match self {
+            Self::Worktree { runtime_dir, .. } => Ok(runtime_dir.as_path()),
+            Self::Unavailable { reason } => Err(McpError::Unavailable(reason.clone())),
+        }
+    }
+
+    fn socket_name(&self) -> Result<&'static str, McpError> {
+        match self {
+            Self::Worktree { socket_name, .. } => Ok(socket_name),
+            Self::Unavailable { reason } => Err(McpError::Unavailable(reason.clone())),
+        }
+    }
+
+    fn daemon_launcher(&self) -> Result<&Arc<dyn DaemonLauncher>, McpError> {
+        match self {
+            Self::Worktree {
+                daemon_launcher, ..
+            } => Ok(daemon_launcher),
+            Self::Unavailable { reason } => Err(McpError::Unavailable(reason.clone())),
+        }
+    }
+}
+
+pub struct DaemonConnectionState {
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdioFraming {
+    Line,
+    ContentLength,
+}
+
+#[derive(Debug)]
+struct ClientMessage {
+    body: String,
+    framing: StdioFraming,
+}
+
+impl DaemonConnectionState {
+    fn new(stream: UnixStream) -> Self {
+        let (reader, writer) = stream.into_split();
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+        }
+    }
 }
 
 impl McpConfig {
     pub fn new(runtime_dir: PathBuf, daemon_launcher: Arc<dyn DaemonLauncher>) -> Self {
         Self {
-            runtime_dir,
-            socket_name: DEFAULT_SOCKET_NAME,
-            daemon_launcher,
+            daemon: DaemonConnection::Worktree {
+                runtime_dir,
+                socket_name: DEFAULT_SOCKET_NAME,
+                daemon_launcher,
+            },
         }
     }
 
-    pub fn socket_path(&self) -> PathBuf {
-        self.runtime_dir.join(self.socket_name)
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            daemon: DaemonConnection::Unavailable {
+                reason: reason.into(),
+            },
+        }
     }
 
-    pub fn startup_lock_path(&self) -> PathBuf {
-        self.runtime_dir.join(STARTUP_LOCK_NAME)
+    pub fn socket_path(&self) -> Result<PathBuf, McpError> {
+        Ok(self.daemon.runtime_dir()?.join(self.daemon.socket_name()?))
     }
 
-    pub fn pid_path(&self) -> PathBuf {
-        self.runtime_dir.join(PID_FILE_NAME)
+    pub fn startup_lock_path(&self) -> Result<PathBuf, McpError> {
+        Ok(self.daemon.runtime_dir()?.join(STARTUP_LOCK_NAME))
+    }
+
+    pub fn pid_path(&self) -> Result<PathBuf, McpError> {
+        Ok(self.daemon.runtime_dir()?.join(PID_FILE_NAME))
     }
 }
 
@@ -151,14 +229,14 @@ impl McpProxy {
 
     /// Connect to the daemon, starting it lazily if necessary.
     pub async fn connect(&self) -> Result<UnixStream, McpError> {
-        ensure_runtime_dir(&self.config.runtime_dir)?;
-        let socket_path = self.config.socket_path();
+        ensure_runtime_dir(self.config.daemon.runtime_dir()?)?;
+        let socket_path = self.config.socket_path()?;
 
         if let Some(stream) = try_ping(&socket_path).await {
             return Ok(stream);
         }
 
-        let lock_path = self.config.startup_lock_path();
+        let lock_path = self.config.startup_lock_path()?;
         match StartupLockGuard::try_acquire(&lock_path)? {
             Some(_guard) => {
                 if let Some(stream) = try_ping(&socket_path).await {
@@ -166,9 +244,9 @@ impl McpProxy {
                 }
 
                 remove_if_exists(&socket_path)?;
-                remove_if_exists(&self.config.pid_path())?;
+                remove_if_exists(&self.config.pid_path()?)?;
 
-                self.config.daemon_launcher.spawn_daemon().await?;
+                self.config.daemon.daemon_launcher()?.spawn_daemon().await?;
                 wait_for_socket(&socket_path, DAEMON_STARTUP_TIMEOUT).await
             }
             None => wait_for_socket(&socket_path, DAEMON_STARTUP_TIMEOUT).await,
@@ -177,10 +255,11 @@ impl McpProxy {
 
     /// Run the full proxy lifecycle against the supplied stdio streams.
     ///
-    /// Sessions are bounded by the daemon connection. If the daemon
-    /// dies mid-session, the proxy lazy-spawns a fresh daemon and
-    /// resumes pumping rather than propagating the closure up to the
-    /// LLM CLI as "Transport closed".
+    /// Local MCP envelope messages (`initialize`, `tools/list`, ping, and
+    /// notifications) are served before the daemon is contacted. This keeps
+    /// client startup independent of daemon startup/reconcile time and means
+    /// launching from a non-Git cwd can still produce a protocol-shaped error
+    /// for tool calls instead of closing during handshake.
     pub async fn proxy<R, W>(&self, stdin: R, stdout: W) -> Result<(), McpError>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -188,29 +267,75 @@ impl McpProxy {
     {
         let mut stdin = BufReader::new(stdin);
         let mut stdout = stdout;
+        let mut daemon: Option<DaemonConnectionState> = None;
         loop {
-            let stream = self.connect().await?;
-            let (socket_reader, socket_writer) = stream.into_split();
-            match mcp_pump_session(&mut stdin, &mut stdout, socket_reader, socket_writer).await? {
-                PumpOutcome::ClientClosed => return Ok(()),
-                PumpOutcome::DaemonClosed => {
-                    eprintln!("xgraph mcp: daemon socket closed, reconnecting…");
+            let Some(message) = read_client_message(&mut stdin).await? else {
+                if let Some(mut daemon) = daemon.take() {
+                    let _ = daemon.writer.shutdown().await;
+                }
+                return Ok(());
+            };
+
+            match crate::mcp_protocol::classify_request(&message.body) {
+                crate::mcp_protocol::Action::NoReply => continue,
+                crate::mcp_protocol::Action::Drop => {
+                    eprintln!("xgraph mcp: dropped malformed JSON-RPC line");
                     continue;
+                }
+                crate::mcp_protocol::Action::LocalReply(out_line) => {
+                    write_client_message(&mut stdout, &out_line, message.framing).await?;
+                }
+                crate::mcp_protocol::Action::Forward { line, wrap_in_mcp } => {
+                    let out_line = self
+                        .forward_with_reconnect(&line, wrap_in_mcp, &mut daemon)
+                        .await;
+                    write_client_message(&mut stdout, &out_line, message.framing).await?;
                 }
             }
         }
     }
-}
 
-/// Why a [`mcp_pump_session`] returned. Used by [`McpProxy::proxy`] to
-/// decide whether to reconnect (daemon went away) or exit (client
-/// closed stdin).
-enum PumpOutcome {
-    /// stdin reached EOF — the LLM CLI is done with us, exit cleanly.
-    ClientClosed,
-    /// The daemon socket closed mid-session. The outer loop should
-    /// lazy-spawn a fresh daemon and start a new session.
-    DaemonClosed,
+    async fn forward_with_reconnect(
+        &self,
+        line: &str,
+        wrap_in_mcp: bool,
+        daemon: &mut Option<DaemonConnectionState>,
+    ) -> String {
+        for attempt in 0..=1 {
+            if daemon.is_none() {
+                match self.connect().await {
+                    Ok(stream) => *daemon = Some(DaemonConnectionState::new(stream)),
+                    Err(err) => {
+                        return crate::mcp_protocol::shape_forward_error(
+                            line,
+                            wrap_in_mcp,
+                            &err.to_string(),
+                        );
+                    }
+                }
+            }
+
+            let Some(state) = daemon.as_mut() else {
+                continue;
+            };
+            match forward_once(state, line, wrap_in_mcp).await {
+                Ok(out_line) => return out_line,
+                Err(err) => {
+                    eprintln!("xgraph mcp: daemon socket error: {err}");
+                    *daemon = None;
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return crate::mcp_protocol::shape_forward_error(
+                        line,
+                        wrap_in_mcp,
+                        &format!("daemon socket error: {err}"),
+                    );
+                }
+            }
+        }
+        crate::mcp_protocol::shape_forward_error(line, wrap_in_mcp, "daemon socket unavailable")
+    }
 }
 
 /// Top-level entry point invoked by the CLI.
@@ -296,6 +421,99 @@ fn is_contended(err: &io::Error) -> bool {
     err.kind() == canonical.kind() && err.raw_os_error() == canonical.raw_os_error()
 }
 
+async fn read_client_message<R>(reader: &mut R) -> io::Result<Option<ClientMessage>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let mut first_line = String::new();
+        let bytes = reader.read_line(&mut first_line).await?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let header_line = first_line.trim_end_matches(['\r', '\n']);
+        if header_line.is_empty() {
+            continue;
+        }
+        if let Some(length) = parse_content_length_header(header_line)? {
+            read_until_header_end(reader).await?;
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).await?;
+            let body = String::from_utf8(body).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("MCP frame body is not UTF-8: {err}"),
+                )
+            })?;
+            return Ok(Some(ClientMessage {
+                body,
+                framing: StdioFraming::ContentLength,
+            }));
+        }
+        return Ok(Some(ClientMessage {
+            body: first_line,
+            framing: StdioFraming::Line,
+        }));
+    }
+}
+
+fn parse_content_length_header(line: &str) -> io::Result<Option<usize>> {
+    let Some((name, value)) = line.split_once(':') else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("content-length") {
+        return Ok(None);
+    }
+    let length = value.trim().parse::<usize>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Content-Length header: {err}"),
+        )
+    })?;
+    Ok(Some(length))
+}
+
+async fn read_until_header_end<R>(reader: &mut R) -> io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).await?;
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF before MCP frame header terminator",
+            ));
+        }
+        if line == "\r\n" || line == "\n" {
+            return Ok(());
+        }
+    }
+}
+
+async fn write_client_message<W>(
+    writer: &mut W,
+    line: &str,
+    framing: StdioFraming,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match framing {
+        StdioFraming::Line => {
+            writer.write_all(line.as_bytes()).await?;
+        }
+        StdioFraming::ContentLength => {
+            let payload = line.trim_end_matches(['\r', '\n']);
+            let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+            writer.write_all(header.as_bytes()).await?;
+            writer.write_all(payload.as_bytes()).await?;
+        }
+    }
+    writer.flush().await
+}
+
 impl Drop for StartupLockGuard {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
@@ -304,90 +522,26 @@ impl Drop for StartupLockGuard {
     }
 }
 
-/// Newline-delimited JSON pump with MCP protocol translation.
-///
-/// Reads one JSON-RPC line from the client (LLM CLI), classifies it via
-/// [`crate::mcp_protocol::classify_request`], and either answers
-/// locally (initialize / tools/list / ping / notification ack) or
-/// forwards a translated payload to the daemon and writes back the
-/// (possibly MCP-wrapped) response.
-///
-/// Sequential — one outstanding daemon request at a time. That matches
-/// how every MCP client we care about (Claude, Codex) drives a server,
-/// and it lets us skip a request-id correlation table.
-/// Run a single proxy session bound to a particular daemon socket.
-/// Returns when either stdin closes (`ClientClosed`) or the daemon
-/// socket closes (`DaemonClosed`). The caller — [`McpProxy::proxy`] —
-/// handles reconnect on the daemon-close case.
-async fn mcp_pump_session<R, W, SR, SW>(
-    stdin_reader: &mut BufReader<R>,
-    stdout: &mut W,
-    socket_reader: SR,
-    socket_writer: SW,
-) -> Result<PumpOutcome, McpError>
-where
-    R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
-    SR: AsyncRead + Unpin + Send + 'static,
-    SW: AsyncWrite + Unpin + Send + 'static,
-{
-    use crate::mcp_protocol::{Action, classify_request, shape_outgoing};
-    let mut socket_reader = BufReader::new(socket_reader);
-    let mut socket_writer = socket_writer;
+async fn forward_once(
+    state: &mut DaemonConnectionState,
+    line: &str,
+    wrap_in_mcp: bool,
+) -> Result<String, McpError> {
+    state.writer.write_all(line.as_bytes()).await?;
+    state.writer.flush().await?;
 
-    let mut request_line = String::new();
     let mut daemon_response_line = String::new();
-    loop {
-        request_line.clear();
-        // Race stdin against the daemon socket. While we're idle (no
-        // pending forwarded request), the daemon should not send any
-        // unsolicited bytes — so `fill_buf` only resolves on EOF or
-        // unexpected data, both of which mean the daemon connection is
-        // unusable.
-        tokio::select! {
-            biased;
-            res = stdin_reader.read_line(&mut request_line) => {
-                let bytes = res?;
-                if bytes == 0 {
-                    // Client closed stdin → tear the daemon connection
-                    // down so the daemon's last-disconnect logic can fire.
-                    let _ = socket_writer.shutdown().await;
-                    return Ok(PumpOutcome::ClientClosed);
-                }
-            }
-            _ = socket_reader.fill_buf() => {
-                // Daemon closed (or sent unsolicited data, treated the
-                // same — the protocol doesn't permit it).
-                return Ok(PumpOutcome::DaemonClosed);
-            }
-        }
-        match classify_request(&request_line) {
-            Action::NoReply => continue,
-            Action::Drop => {
-                eprintln!("xgraph mcp: dropped malformed JSON-RPC line");
-                continue;
-            }
-            Action::LocalReply(out_line) => {
-                stdout.write_all(out_line.as_bytes()).await?;
-                stdout.flush().await?;
-            }
-            Action::Forward { line, wrap_in_mcp } => {
-                socket_writer.write_all(line.as_bytes()).await?;
-                socket_writer.flush().await?;
-                daemon_response_line.clear();
-                let bytes = socket_reader.read_line(&mut daemon_response_line).await?;
-                if bytes == 0 {
-                    // Daemon closed mid-request. Treat as DaemonClosed
-                    // so the outer loop reconnects and the LLM can
-                    // retry the request against the fresh daemon.
-                    return Ok(PumpOutcome::DaemonClosed);
-                }
-                let out_line = shape_outgoing(&daemon_response_line, wrap_in_mcp);
-                stdout.write_all(out_line.as_bytes()).await?;
-                stdout.flush().await?;
-            }
-        }
+    let bytes = state.reader.read_line(&mut daemon_response_line).await?;
+    if bytes == 0 {
+        return Err(McpError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "daemon socket closed before replying",
+        )));
     }
+    Ok(crate::mcp_protocol::shape_outgoing(
+        &daemon_response_line,
+        wrap_in_mcp,
+    ))
 }
 
 #[cfg(test)]
@@ -526,6 +680,36 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &str) {
+        let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+        writer.write_all(header.as_bytes()).await.unwrap();
+        writer.write_all(payload.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> serde_json::Value {
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let length = parse_content_length_header(line.trim_end_matches(['\r', '\n']))
+            .unwrap()
+            .expect("content length header");
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(line == "\r\n" || line == "\n");
+        let mut body = vec![0; length];
+        timeout(Duration::from_secs(2), reader.read_exact(&mut body))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     #[tokio::test]
@@ -797,6 +981,141 @@ mod tests {
             .unwrap()
             .unwrap();
         daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn framed_initialize_returns_framed_response_without_daemon() {
+        let dir = TempDir::new("framed-init");
+        let socket_path = dir.path.join(DEFAULT_SOCKET_NAME);
+        let launcher = CountingLauncher::new(socket_path, Duration::from_secs(10));
+
+        let config = McpConfig::new(dir.path.clone(), launcher.clone());
+        let proxy = McpProxy::new(config);
+
+        let (stdin_writer, stdin_reader) = duplex(4096);
+        let (stdout_writer, stdout_reader) = duplex(4096);
+        let proxy_task =
+            tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
+
+        let mut stdin_writer = stdin_writer;
+        write_frame(
+            &mut stdin_writer,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .await;
+
+        let mut reader = BufReader::new(stdout_reader);
+        let response = read_frame(&mut reader).await;
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["serverInfo"]["name"], "xgraph");
+        assert_eq!(
+            launcher.call_count(),
+            0,
+            "framed initialize must not spawn the daemon"
+        );
+
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_does_not_require_daemon_connection() {
+        let dir = TempDir::new("local-handshake");
+        let socket_path = dir.path.join(DEFAULT_SOCKET_NAME);
+        let launcher = CountingLauncher::new(socket_path, Duration::from_secs(10));
+
+        let config = McpConfig::new(dir.path.clone(), launcher.clone());
+        let proxy = McpProxy::new(config);
+
+        let (stdin_writer, stdin_reader) = duplex(4096);
+        let (stdout_writer, mut stdout_reader) = duplex(4096);
+        let proxy_task =
+            tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
+
+        let mut stdin_writer = stdin_writer;
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stdout_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["serverInfo"]["name"], "xgraph");
+        assert_eq!(
+            launcher.call_count(),
+            0,
+            "initialize must not spawn the daemon"
+        );
+
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_worktree_still_answers_initialize() {
+        let config = McpConfig::unavailable("xgraph MCP is not attached to a Git worktree");
+        let proxy = McpProxy::new(config);
+
+        let (stdin_writer, stdin_reader) = duplex(8192);
+        let (stdout_writer, mut stdout_reader) = duplex(8192);
+        let proxy_task =
+            tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
+
+        let mut stdin_writer = stdin_writer;
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        stdin_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n")
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stdout_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let init: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(init["id"], 1);
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let call: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(call["id"], 2);
+        assert_eq!(call["result"]["isError"], true);
+        assert!(
+            call["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not attached to a Git worktree")
+        );
+
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

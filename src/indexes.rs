@@ -145,6 +145,8 @@ impl HotIndexes {
     }
 
     pub fn reload_from_cozo(&self, store: &CozoStore) -> Result<(), CozoError> {
+        self.clear();
+
         // active_node[node_id] => path, content_hash, local_node_id, kind, name, qname, span
         let rows = store.run_read(
             "?[node_id, path, kind, name, qname] := \
@@ -215,35 +217,16 @@ impl HotIndexes {
     /// Call this when `WriterHandle::submit` returns Ok; the writer thread
     /// performs the durable commit in parallel.
     ///
-    /// **Consistency:** the remove-then-insert sequence is NOT atomic across
-    /// the whole operation; a concurrent reader may briefly observe a path
-    /// with no nodes between the old set being removed and the new set
-    /// being inserted. This is acceptable for MCP read paths where a brief
-    /// "0 results" answer self-heals on retry. If stronger atomicity becomes
-    /// required, wrap the body in a single write barrier (e.g., move every
-    /// field under one `RwLock`).
+    /// The active file membership is swapped only after old node references
+    /// have been removed and new nodes have been installed, keeping stale
+    /// symbol and edge indexes from surviving long-lived daemon updates.
     pub fn apply_file_update(&self, update: &FileUpdate) {
         let path = PathBuf::from(&update.path);
 
         // Remove any prior active nodes for this path.
         let prior = self.files.write().remove(&path).unwrap_or_default();
         for id in &prior {
-            self.nodes.remove(id);
-            self.callees.write().remove(id);
-            // Remove this node as a target from any callers map.
-            let callers = self.callers.write().remove(id);
-            if let Some(srcs) = callers {
-                for src in srcs {
-                    if let Some(targets) = self.callees.write().get_mut(&src) {
-                        targets.retain(|t| t != id);
-                    }
-                }
-            }
-            // Drop symbol entries that reference this id.
-            self.symbols.retain(|_, ids| {
-                ids.retain(|x| x != id);
-                !ids.is_empty()
-            });
+            self.remove_node_references(id);
         }
 
         // Insert new active nodes.
@@ -296,20 +279,7 @@ impl HotIndexes {
     pub fn remove_path(&self, path: &Path) {
         let prior = self.files.write().remove(path).unwrap_or_default();
         for id in &prior {
-            self.nodes.remove(id);
-            self.callees.write().remove(id);
-            let callers = self.callers.write().remove(id);
-            if let Some(srcs) = callers {
-                for src in srcs {
-                    if let Some(targets) = self.callees.write().get_mut(&src) {
-                        targets.retain(|t| t != id);
-                    }
-                }
-            }
-            self.symbols.retain(|_, ids| {
-                ids.retain(|x| x != id);
-                !ids.is_empty()
-            });
+            self.remove_node_references(id);
         }
     }
 
@@ -688,6 +658,57 @@ impl HotIndexes {
             }
         }
     }
+
+    fn remove_node_references(&self, id: &NodeId) {
+        self.nodes.remove(id);
+        self.remove_edges_for_node(id);
+        self.remove_symbol_references(id);
+    }
+
+    fn remove_edges_for_node(&self, id: &NodeId) {
+        let outgoing = self.callees.write().remove(id);
+        if let Some(targets) = outgoing {
+            let mut callers = self.callers.write();
+            for target in targets {
+                if let Some(sources) = callers.get_mut(&target) {
+                    sources.retain(|source| source != id);
+                }
+            }
+            callers.retain(|_, sources| !sources.is_empty());
+        }
+
+        let incoming = self.callers.write().remove(id);
+        if let Some(sources) = incoming {
+            let mut callees = self.callees.write();
+            for source in sources {
+                if let Some(targets) = callees.get_mut(&source) {
+                    targets.retain(|target| target != id);
+                }
+            }
+            callees.retain(|_, targets| !targets.is_empty());
+        }
+    }
+
+    fn remove_symbol_references(&self, id: &NodeId) {
+        let mut emptied_keys = Vec::new();
+        for mut entry in self.symbols.iter_mut() {
+            entry.retain(|candidate| candidate != id);
+            if entry.is_empty() {
+                emptied_keys.push(entry.key().clone());
+            }
+        }
+        for key in emptied_keys {
+            self.symbols.remove(&key);
+            let mut should_drop_name = false;
+            if let Some(mut keys) = self.symbols_by_name.get_mut(&key.name) {
+                keys.retain(|candidate| candidate != &key);
+                should_drop_name = keys.is_empty();
+            }
+            if should_drop_name {
+                self.symbols_by_name.remove(&key.name);
+            }
+        }
+    }
 }
 
 fn is_hot_traversal_edge(kind: &str) -> bool {
@@ -710,6 +731,7 @@ fn data_to_string(value: Option<DataValue>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cozo::{ContentHash, EdgeFact, NodeFact, Span};
 
     fn sample_record(id: &str, path: &str, name: &str) -> NodeRecord {
         NodeRecord {
@@ -718,6 +740,42 @@ mod tests {
             kind: "function".to_string(),
             name: name.to_string(),
             qname: name.to_string(),
+        }
+    }
+
+    fn sample_update(
+        path: &str,
+        hash_byte: u8,
+        nodes: Vec<NodeFact>,
+        edges: Vec<EdgeFact>,
+    ) -> FileUpdate {
+        FileUpdate {
+            path: path.to_string(),
+            content_hash: ContentHash([hash_byte; crate::cozo::CONTENT_HASH_LEN]),
+            language: "rust".to_string(),
+            parser_version: 1,
+            mtime: 0,
+            size: 0,
+            generation: 1,
+            diagnostics: Vec::new(),
+            nodes,
+            refs: Vec::new(),
+            edges,
+        }
+    }
+
+    fn sample_node(local_node_id: u32, name: &str) -> NodeFact {
+        NodeFact {
+            local_node_id,
+            kind: "function".to_string(),
+            name: name.to_string(),
+            qname: name.to_string(),
+            span: Span {
+                start_byte: 0,
+                end_byte: 1,
+                start_row: 0,
+                start_col: 0,
+            },
         }
     }
 
@@ -753,6 +811,68 @@ mod tests {
         idx.remove_call_edge(&caller, &callee);
         assert!(idx.callees_of(&caller).is_empty());
         assert!(idx.callers_of(&callee).is_empty());
+    }
+
+    #[test]
+    fn apply_file_update_removes_stale_outgoing_edges_and_symbol_indexes() {
+        let idx = HotIndexes::new();
+        let first_hash = ContentHash([1; crate::cozo::CONTENT_HASH_LEN]);
+        let old_id = NodeId::from(active_node_id(&first_hash, 0));
+        let target = NodeId::from("h:target");
+
+        idx.apply_file_update(&sample_update(
+            "src/a.rs",
+            1,
+            vec![sample_node(0, "old_name")],
+            vec![EdgeFact {
+                source_node_id: old_id.as_str().to_string(),
+                kind: "calls".to_string(),
+                target_node_id: target.as_str().to_string(),
+                provenance: "test".to_string(),
+                confidence: 100,
+            }],
+        ));
+        assert_eq!(idx.callers_of(&target), vec![old_id.clone()]);
+        assert_eq!(idx.lookup_symbol_by_name("old_name"), vec![old_id]);
+
+        idx.apply_file_update(&sample_update(
+            "src/a.rs",
+            2,
+            vec![sample_node(0, "new_name")],
+            Vec::new(),
+        ));
+
+        assert!(idx.callers_of(&target).is_empty());
+        assert!(idx.lookup_symbol_by_name("old_name").is_empty());
+        assert!(!idx.symbols_by_name.contains_key("old_name"));
+        assert_eq!(idx.lookup_symbol_by_name("new_name").len(), 1);
+    }
+
+    #[test]
+    fn remove_path_cleans_outgoing_edges_and_symbol_secondary_index() {
+        let idx = HotIndexes::new();
+        let hash = ContentHash([3; crate::cozo::CONTENT_HASH_LEN]);
+        let id = NodeId::from(active_node_id(&hash, 0));
+        let target = NodeId::from("h:target");
+
+        idx.apply_file_update(&sample_update(
+            "src/remove.rs",
+            3,
+            vec![sample_node(0, "gone")],
+            vec![EdgeFact {
+                source_node_id: id.as_str().to_string(),
+                kind: "calls".to_string(),
+                target_node_id: target.as_str().to_string(),
+                provenance: "test".to_string(),
+                confidence: 100,
+            }],
+        ));
+        idx.remove_path(Path::new("src/remove.rs"));
+
+        assert!(idx.nodes_in_file(Path::new("src/remove.rs")).is_empty());
+        assert!(idx.callers_of(&target).is_empty());
+        assert!(idx.lookup_symbol_by_name("gone").is_empty());
+        assert!(!idx.symbols_by_name.contains_key("gone"));
     }
 
     #[test]

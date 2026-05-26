@@ -72,22 +72,26 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "callers_of",
-        description: "List node ids that call the given node id.",
+        description: "List nodes that call the given node id, with metadata and pagination.",
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "node_id": { "type": "string", "description": "Target node id" }
+                "node_id": { "type": "string", "description": "Target node id" },
+                "limit": { "type": "integer", "description": "Maximum callers to return (default 200, max 1000)" },
+                "offset": { "type": "integer", "description": "Number of callers to skip" }
             },
             "required": ["node_id"]
         }"#,
     },
     ToolDef {
         name: "callees_of",
-        description: "List node ids called by the given node id.",
+        description: "List nodes called by the given node id, with metadata and pagination.",
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "node_id": { "type": "string", "description": "Source node id" }
+                "node_id": { "type": "string", "description": "Source node id" },
+                "limit": { "type": "integer", "description": "Maximum callees to return (default 200, max 1000)" },
+                "offset": { "type": "integer", "description": "Number of callees to skip" }
             },
             "required": ["node_id"]
         }"#,
@@ -105,11 +109,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "node",
-        description: "Fetch a single node by id with kind, qname, path, span, and a bounded source snippet.",
+        description: "Fetch a single node by id with source, line metadata, and a bounded caller/callee trail.",
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "node_id": { "type": "string", "description": "Node id to fetch" }
+                "node_id": { "type": "string", "description": "Node id to fetch" },
+                "related_limit": { "type": "integer", "description": "Maximum caller/callee summaries to include (default 20, max 200)" },
+                "snippet_bytes": { "type": "integer", "description": "Source snippet byte cap (default 4096, max 16384)" }
             },
             "required": ["node_id"]
         }"#,
@@ -133,12 +139,14 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "impact",
-        description: "Transitive backward closure over Calls / Renders / Inherits / Implements / References edges. 'What changes if this changes?' Optionally bounded by depth.",
+        description: "Transitive backward closure over Calls / Renders / Inherits / Implements / References edges. Returns affected node ids plus node metadata.",
         input_schema: r#"{
             "type": "object",
             "properties": {
                 "node_id": { "type": "string", "description": "Target whose impact is being asked about" },
-                "max_depth": { "type": "integer", "description": "Optional bound on transitive depth (0 = unbounded)" }
+                "max_depth": { "type": "integer", "description": "Optional bound on transitive depth (0 = unbounded)" },
+                "limit": { "type": "integer", "description": "Maximum affected nodes to return (default 500, max 5000)" },
+                "offset": { "type": "integer", "description": "Number of affected nodes to skip" }
             },
             "required": ["node_id"]
         }"#,
@@ -161,13 +169,14 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "explore",
-        description: "Read source snippets for a batch of node ids, partitioning a shared byte budget across them.",
+        description: "Read source snippets and optional caller/callee trails for a batch of node ids, partitioning a shared byte budget across them.",
         input_schema: r#"{
             "type": "object",
             "properties": {
                 "node_ids": { "type": "array", "items": { "type": "string" }, "description": "Node ids to expand" },
                 "byte_budget": { "type": "integer", "description": "Total byte budget across all snippets (default 32 KiB, max 128 KiB)" },
-                "per_snippet_bytes": { "type": "integer", "description": "Per-snippet cap (default 4 KiB, max 16 KiB)" }
+                "per_snippet_bytes": { "type": "integer", "description": "Per-snippet cap (default 4 KiB, max 16 KiB)" },
+                "related_limit": { "type": "integer", "description": "Maximum caller/callee summaries per item (default 0, max 50)" }
             },
             "required": ["node_ids"]
         }"#,
@@ -220,6 +229,18 @@ pub fn tools_list_result() -> Value {
     json!({ "tools": tools })
 }
 
+pub fn prompts_list_result() -> Value {
+    json!({ "prompts": [] })
+}
+
+pub fn resources_list_result() -> Value {
+    json!({ "resources": [] })
+}
+
+pub fn resource_templates_list_result() -> Value {
+    json!({ "resourceTemplates": [] })
+}
+
 /// Wrap a daemon response into the MCP `tools/call` result shape. The
 /// daemon returns `{"jsonrpc":"2.0","id":N,"result":<x>}` or an `error`
 /// object. We surface `<x>` (or the error string) as the text content
@@ -246,6 +267,28 @@ pub fn wrap_tool_response(daemon_response: &Value) -> Value {
         "content": [{ "type": "text", "text": text }],
         "isError": false,
     })
+}
+
+/// Build a local failure response for a forwarded request that could not
+/// reach the daemon. For MCP `tools/call` we keep the protocol-level request
+/// successful and mark the tool result as `isError`; legacy direct callers get
+/// a normal JSON-RPC error.
+pub fn shape_forward_error(forwarded_line: &str, wrap_in_mcp: bool, message: &str) -> String {
+    let parsed: Value = serde_json::from_str(forwarded_line.trim()).unwrap_or(Value::Null);
+    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+    if wrap_in_mcp {
+        return build_response_line(
+            id,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": message,
+                }],
+                "isError": true,
+            }),
+        );
+    }
+    build_error_line(id, -32000, message)
 }
 
 /// Minimal JSON-RPC request parsing. The proxy reads one line of JSON
@@ -303,8 +346,9 @@ pub enum Action {
     /// true, the daemon's reply is wrapped in the MCP `tools/call`
     /// shape before being sent to the client.
     Forward { line: String, wrap_in_mcp: bool },
-    /// The message wasn't valid JSON-RPC at all. The proxy logs and
-    /// drops it.
+    /// The message wasn't valid JSON-RPC at all. Retained for callers
+    /// that choose to ignore a message explicitly; protocol parse failures
+    /// are answered with JSON-RPC errors by `classify_request`.
     Drop,
 }
 
@@ -312,9 +356,46 @@ pub enum Action {
 /// message. Pure function — easy to unit-test the MCP handshake without
 /// running a real daemon.
 pub fn classify_request(raw_line: &str) -> Action {
-    let parsed: RpcRequest = match serde_json::from_str(raw_line.trim()) {
+    let raw = raw_line.trim();
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(err) => {
+            return Action::LocalReply(build_error_line(
+                Value::Null,
+                -32700,
+                &format!("parse error: {err}"),
+            ));
+        }
+    };
+    if !value.is_object() {
+        return Action::LocalReply(build_error_line(
+            Value::Null,
+            -32600,
+            "invalid request: JSON-RPC request must be an object",
+        ));
+    }
+    if value
+        .get("jsonrpc")
+        .and_then(|version| version.as_str())
+        .is_some_and(|version| version != "2.0")
+    {
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        return Action::LocalReply(build_error_line(
+            id,
+            -32600,
+            "invalid request: jsonrpc must be \"2.0\"",
+        ));
+    }
+    let parsed: RpcRequest = match serde_json::from_value(value.clone()) {
         Ok(p) => p,
-        Err(_) => return Action::Drop,
+        Err(err) => {
+            let id = value.get("id").cloned().unwrap_or(Value::Null);
+            return Action::LocalReply(build_error_line(
+                id,
+                -32600,
+                &format!("invalid request: {err}"),
+            ));
+        }
     };
     match parsed.method.as_str() {
         // ------------------------------------------------------------
@@ -328,6 +409,18 @@ pub fn classify_request(raw_line: &str) -> Action {
             let id = parsed.id.unwrap_or(Value::Null);
             Action::LocalReply(build_response_line(id, tools_list_result()))
         }
+        "prompts/list" => {
+            let id = parsed.id.unwrap_or(Value::Null);
+            Action::LocalReply(build_response_line(id, prompts_list_result()))
+        }
+        "resources/list" => {
+            let id = parsed.id.unwrap_or(Value::Null);
+            Action::LocalReply(build_response_line(id, resources_list_result()))
+        }
+        "resources/templates/list" => {
+            let id = parsed.id.unwrap_or(Value::Null);
+            Action::LocalReply(build_response_line(id, resource_templates_list_result()))
+        }
         "ping" => {
             // MCP defines `ping` as an empty-result request used for
             // keepalive. Some clients send it after `initialize` to
@@ -335,7 +428,10 @@ pub fn classify_request(raw_line: &str) -> Action {
             let id = parsed.id.unwrap_or(Value::Null);
             Action::LocalReply(build_response_line(id, json!({})))
         }
-        "notifications/initialized" | "notifications/cancelled" => Action::NoReply,
+        "initialized"
+        | "notifications/initialized"
+        | "notifications/cancelled"
+        | "notifications/roots/list_changed" => Action::NoReply,
         // ------------------------------------------------------------
         // Tool invocation — translate to the daemon's native method.
         // ------------------------------------------------------------
@@ -468,8 +564,29 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_capability_lists_are_empty_local_replies() {
+        for (method, result_key) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+        ] {
+            let action = classify_request(&format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"{method}"}}"#
+            ));
+            let Action::LocalReply(line) = action else {
+                panic!("expected LocalReply for {method}");
+            };
+            let v: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(v["id"], 10);
+            assert_eq!(v["result"][result_key].as_array().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
     fn initialized_notification_yields_no_reply() {
         let action = classify_request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        assert!(matches!(action, Action::NoReply));
+        let action = classify_request(r#"{"jsonrpc":"2.0","method":"initialized"}"#);
         assert!(matches!(action, Action::NoReply));
     }
 
@@ -519,9 +636,25 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_is_dropped() {
+    fn malformed_json_returns_parse_error() {
         let action = classify_request("not json at all");
-        assert!(matches!(action, Action::Drop));
+        let Action::LocalReply(line) = action else {
+            panic!("expected LocalReply parse error");
+        };
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], Value::Null);
+        assert_eq!(v["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn invalid_jsonrpc_version_returns_invalid_request() {
+        let action = classify_request(r#"{"jsonrpc":"1.0","id":55,"method":"initialize"}"#);
+        let Action::LocalReply(line) = action else {
+            panic!("expected LocalReply invalid request");
+        };
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 55);
+        assert_eq!(v["error"]["code"], -32600);
     }
 
     #[test]
@@ -558,5 +691,24 @@ mod tests {
         let daemon = r#"{"jsonrpc":"2.0","id":7,"result":{"hits":[]}}"#;
         let out = shape_outgoing(daemon, false);
         assert_eq!(out.trim_end_matches('\n'), daemon);
+    }
+
+    #[test]
+    fn shape_forward_error_uses_mcp_tool_error_shape() {
+        let forwarded = r#"{"jsonrpc":"2.0","id":8,"method":"search","params":{}}"#;
+        let out = shape_forward_error(forwarded, true, "daemon unavailable");
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["id"], 8);
+        assert_eq!(v["result"]["isError"], true);
+        assert_eq!(v["result"]["content"][0]["text"], "daemon unavailable");
+    }
+
+    #[test]
+    fn shape_forward_error_uses_jsonrpc_error_for_direct_calls() {
+        let forwarded = r#"{"jsonrpc":"2.0","id":9,"method":"search","params":{}}"#;
+        let out = shape_forward_error(forwarded, false, "daemon unavailable");
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32000);
     }
 }
