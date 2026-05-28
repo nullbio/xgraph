@@ -1,107 +1,131 @@
 # xgraph
 
-xgraph is a Linux-only, Rust-native code graph service for large local Git worktrees. It indexes source code into a durable embedded [CozoDB](https://docs.cozodb.org/en/latest/stored.html) graph, keeps that graph fresh through a single long-lived daemon, and exposes fast code-intelligence queries to many agent clients through lightweight MCP proxy processes.
+xgraph is a Linux-only, Rust-native code graph service for large local Git
+worktrees. It indexes source code into an embedded
+[CozoDB](https://docs.cozodb.org/en/latest/stored.html) graph, keeps that graph
+fresh through a long-lived daemon, and exposes fast code-intelligence queries to
+agent clients through lightweight MCP proxy processes.
 
-The project is inspired by [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph), but it is not a direct port. xgraph uses a different runtime model: one daemon owns file watching, parsing, graph updates, Cozo writes, hot indexes, and request dispatch for each Git worktree.
+The project is inspired by
+[`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph) and uses a
+different runtime model: one daemon owns file watching, parsing, graph updates,
+Cozo writes, hot indexes, and request dispatch for each Git worktree.
 
-## Goals
+## What works today
 
-- Better Linux compatibility than the original project.
-- Rust implementation with aggressive attention to latency, throughput, and memory use.
-- Embedded CozoDB as the durable per-worktree graph database.
-- One daemon per worktree, shared by many MCP clients.
-- Native, statically linked Tree-sitter grammars on the parsing hot path.
-- Fast incremental updates from filesystem events plus manifest reconciliation.
-- Correct behavior across branch checkouts and Git worktrees.
-- Initial language focus:
-  - PHP
-  - Laravel framework conventions, including Blade
-  - TypeScript / JavaScript / TSX (with React-aware resolver)
-  - Python
+xgraph runs end-to-end with cross-file linking across PHP, Blade, TypeScript,
+JavaScript, TSX, and Python.
 
-## Non-goals
-
-- Non-Linux support.
-- SQLite support.
-- One database shared by multiple worktrees.
-- Multiple independent watchers or DB writers for the same worktree.
-- Treating Git branch name as the graph identity.
-- Supporting projects without a `.git` directory.
-- Shelling out to the Tree-sitter CLI on the hot path.
-- WASM parsers on the hot path.
+- `xgraph init` indexes a Git worktree into Cozo and reports progress plus graph
+  totals.
+- `xgraph daemon start` opens a Unix socket and serves MCP/query requests from
+  in-memory hot indexes loaded from the persistent graph.
+- `xgraph mcp` answers MCP handshake methods locally, lazy-starts the daemon for
+  graph tool calls, and proxies MCP-style JSON-RPC.
+- `xgraph init`, `xgraph sync`, and `xgraph reindex` use the live daemon when it
+  is available, so terminal maintenance keeps connected MCP clients on the same
+  transport.
+- Filesystem watching keeps the active graph current after edits, deletes,
+  renames, ignore-file changes, and branch checkouts.
+- Changed files are currently parsed as whole files. Incremental graph updates,
+  content-hash skipping, and batched Cozo writes are active; Tree-sitter
+  old-tree incremental parsing remains a benchmarked optimization path.
+- Laravel framework resolution covers routes, Eloquent relationships, facades,
+  service container bindings, events, jobs, controller-to-model edges, and Blade
+  references.
+- React framework resolution covers function components, class components,
+  custom hooks, builtin hook calls, `memo`, and `forwardRef`.
+- Python support uses the native `tree-sitter-python` grammar and resolves
+  package-relative imports for cross-file calls.
 
 ## Core decisions
 
 | Concern | Decision |
 | --- | --- |
+| Platform | Linux |
 | Database | Embedded CozoDB |
-| Scope | One DB per Git worktree |
+| Project type | Git worktrees |
+| Scope | One database per Git worktree |
 | Runtime owner | One daemon per worktree |
 | Agent access | Many `xgraph mcp` proxy processes |
 | Update source | Filesystem watcher plus manifest reconciliation |
-| Branch model | DB represents current files on disk, not a branch name |
-| Git dependency | Required for project discovery/storage; not required for freshness after startup |
+| Branch model | Graph represents current files on disk, with branch name as metadata |
 | Persistent state | Worktree-private Git path from `git rev-parse --git-path xgraph` |
 | Runtime files | Short path under `${XDG_RUNTIME_DIR:-/tmp}/xgraph/<hash-of-worktree-root>/` |
-| Parser API | Rust `tree-sitter` crate directly |
+| Parser API | Rust `tree-sitter` crate |
 | Parser deployment | Native, statically linked grammar crates |
-| Parser workers | Fixed daemon-owned worker pool |
-| Parser cache | Content-hash skip cache keyed by parser version |
 | Indexed file set | Current non-ignored worktree files after Git ignore rules and `.xgraphignore` |
 
-CozoDB is responsible for durable graph facts, transactions, snapshots, and complex Datalog queries. xgraph owns file watching, daemon lifecycle, worktree discovery, parser scheduling, hot indexes, socket/proxy transport, and agent coordination.
+CozoDB provides durable graph facts, transactions, snapshots, and complex Datalog
+queries. xgraph owns file watching, daemon lifecycle, worktree discovery, parser
+scheduling, hot indexes, socket/proxy transport, and agent coordination.
 
 ## Install
 
 ```bash
-# One-shot install / upgrade. Works on Linux with GCC 12+.
-git clone https://github.com/nullbio/xgraph && cd xgraph && ./install.sh
+git clone https://github.com/nullbio/xgraph
+cd xgraph
+./install.sh
 ```
 
-The script wraps `cargo install --git . --force` and injects
-`CXXFLAGS="-include cstdint"`. That flag works around a build failure
-on GCC 13+ where the RocksDB headers bundled by `cozo` 0.7's
-`cozorocks` crate forget to `#include <cstdint>`. Without it the build
-fails with hundreds of `uint64_t does not name a type` errors. With it,
-compilation succeeds. Re-run `./install.sh` any time to pull the latest
-master.
+The install script wraps `cargo install --git . --force` and sets the compiler
+flag needed by the current Cozo/RocksDB dependency stack on newer GCC releases.
+Run it again any time to install the latest `master`.
 
-If you'd rather invoke `cargo` directly:
+You can also install directly with Cargo:
 
 ```bash
 CXXFLAGS="-include cstdint" cargo install --git https://github.com/nullbio/xgraph --force
 ```
 
-## Command model
+## Quick start
+
+Run xgraph from inside a Git worktree:
 
 ```bash
 xgraph init
+xgraph status
 ```
 
-Creates the Cozo schema, records project metadata, performs the initial scan/index, and writes config. It exits when initialization is complete. If a daemon is already reachable, it asks that daemon to reconcile the graph instead of opening the store directly.
+Then connect agents through MCP:
 
 ```bash
 xgraph mcp
 ```
 
-Primary command for agents. It answers the MCP handshake locally, then lazily connects to or starts the worktree daemon on the first tool call that needs graph data. It supports both newline-delimited JSON and MCP `Content-Length` stdio framing. If launched outside a Git worktree, handshake still succeeds and tool calls return protocol-shaped errors without creating state.
-Malformed MCP input returns JSON-RPC parse/invalid-request errors instead of closing the process, and tool arguments are bounded before they reach the daemon indexes.
+For a warm daemon before agents connect:
 
 ```bash
 xgraph daemon start
 ```
 
-Manually starts the daemon. Useful for debugging or for keeping the graph warm before agents connect.
+## Commands
+
+### Maintenance
 
 ```bash
+xgraph init
 xgraph status
-xgraph daemon stop
 xgraph sync
 xgraph reindex
+xgraph daemon start
+xgraph daemon stop
 ```
 
-Operational commands for inspecting state, stopping the daemon, reconciling the manifest with disk, and rebuilding the graph.
-When a daemon is reachable, `init`, `sync`, and `reindex` are sent to that daemon so connected MCP clients keep their socket transport. If no daemon is reachable, they fall back to direct store maintenance after clearing stale runtime state.
+- `init` creates the Cozo schema, records project metadata, performs the initial
+  scan/index, and writes config.
+- `status` reports indexed file, node, symbol, and edge counts plus daemon
+  health.
+- `sync` reconciles the manifest with the current files on disk.
+- `reindex` rebuilds the graph.
+- `daemon start` and `daemon stop` manage the per-worktree daemon.
+
+When a daemon is reachable, `init`, `sync`, and `reindex` are sent to that daemon
+so connected MCP clients keep their socket transport. When no daemon is
+reachable, those commands perform direct store maintenance after clearing stale
+runtime state.
+
+### Queries
 
 ```bash
 xgraph find-symbol User --kind class
@@ -115,237 +139,44 @@ xgraph trace <from-id> <to-id>
 xgraph files --prefix app/Services --limit 50
 ```
 
-Query subcommands: thin clients that send a JSON-RPC request to the daemon socket and pretty-print the response. The daemon is the source of truth — these commands do no extraction or graph work themselves. They mirror the MCP tools an agent would invoke.
+Query subcommands are thin clients. They send JSON-RPC requests to the daemon
+socket and pretty-print the response. The daemon is the source of truth for
+extraction, graph updates, and indexes.
 
-## Project discovery
+The same capabilities are exposed through MCP tools for agents:
 
-xgraph only supports Git projects. Commands run outside a Git worktree should exit cleanly with an explanation and should not create local state.
+- `find_symbol`
+- `search`
+- `node`
+- `nodes_in_file`
+- `callers_of`
+- `callees_of`
+- `context`
+- `explore`
+- `impact`
+- `trace`
+- `files`
+- `status`
 
-A supported invocation resolves:
+Every response includes metadata such as catch-up state, daemon memory usage,
+queued paths, and warnings. While a branch checkout, edit burst, or startup
+reconcile is still being processed, queries can surface `catching_up` so clients
+know the graph is still converging.
 
-1. The canonical Git worktree root.
-2. The worktree-private Git storage path:
-   ```bash
-   git rev-parse --git-path xgraph
-   ```
-3. The short runtime path derived from the canonical worktree root hash.
+## Branch checkouts and Git worktrees
 
-Git is used for discovery and private storage placement. Freshness is maintained by xgraph through filesystem watching and manifest reconciliation, not by polling branch names.
+xgraph supports both ordinary branch checkouts in one directory and linked Git
+worktrees.
 
-## Ignore policy
+An ordinary branch checkout keeps the same worktree directory:
 
-xgraph indexes the current non-ignored files in the Git worktree. Initial scan, watcher ingestion, `xgraph sync`, `xgraph reindex`, and startup crash recovery must all use the same ignore matcher.
-
-The ignore matcher combines:
-
-1. Built-in exclusions for `.git`, xgraph persistent state, dependency directories, build outputs, and disposable runtime paths.
-2. Git ignore rules, including worktree `.gitignore` files and Git exclude sources.
-3. Optional `.xgraphignore` files using Gitignore-compatible syntax for xgraph-only exclusions.
-
-`.xgraphignore` is project input, not xgraph state. xgraph may read it whether the project chooses to track it or keep it local, but xgraph must not create it as part of normal operation.
-
-Ignored paths are out of the graph: they are not part of the manifest, are not hashed, are not parsed, and are not written to Cozo. The watcher may observe events for ignored paths because it watches directories, but the debounce queue must filter those events before file reads or parser work. If an ignore file changes, the daemon rebuilds the matcher and reconciles the manifest; files that became ignored are removed from active graph rows transactionally just like deletions.
-
-## Storage layout
-
-Persistent state lives in the worktree's private Git directory, never in tracked project files:
-
-```text
-$(git rev-parse --git-path xgraph)/
-  config.toml
-  graph.cozo/
-  schema.version
+```bash
+cd repo
+git checkout feature
 ```
 
-Runtime files use a short path to avoid Linux Unix socket length limits:
-
-```text
-${XDG_RUNTIME_DIR:-/tmp}/xgraph/<hash-of-worktree-root>/
-  xgraph.sock
-  startup.lock
-  daemon.lock
-  daemon.pid
-```
-
-Runtime files are disposable and may be recreated. PID files are diagnostic only. Correct ownership is enforced with OS-level locks.
-
-## Daemon startup
-
-`xgraph mcp` lazily starts the daemon:
-
-1. Resolve the Git worktree root.
-2. Compute the short runtime directory.
-3. Ping `xgraph.sock`.
-4. If alive, connect.
-5. Acquire `startup.lock`.
-6. Ping the socket again.
-7. If still dead, remove stale socket and PID files.
-8. Spawn the daemon.
-9. Wait for socket ping.
-10. Proxy MCP traffic.
-
-The daemon holds `daemon.lock` for its entire lifetime. If the daemon crashes, the OS releases the lock, so there is no permanent stale lockout.
-
-## Runtime ownership
-
-The daemon owns:
-
-- Filesystem watcher.
-- Debounce and batch queue.
-- Fixed parser worker pool.
-- Language registry.
-- Shared compiled `Arc<Query>` values per language/extractor.
-- Embedded Cozo connection.
-- Single writer queue.
-- In-memory hot indexes.
-- MCP request dispatcher.
-- Maintenance command channel for daemon-owned `sync` / `reindex`.
-
-Each parser worker owns:
-
-- A `Parser` per language.
-- A `QueryCursor` per language or request.
-- Scratch buffers.
-
-All agents for a worktree share that daemon. There must not be multiple watchers, parser pools, or database writers for the same worktree.
-
-## Parser architecture
-
-The hot path is:
-
-```text
-Rust daemon
-  -> native statically linked Tree-sitter grammars
-  -> parser worker pool
-  -> per-language compiled queries/extractors
-  -> content-hash skip cache
-  -> incremental parse only when old text + old tree are available
-  -> Cozo write queue
-```
-
-Use the Rust `tree-sitter` crate directly. Do not shell out to the `tree-sitter` CLI, and do not use WASM parsers on the hot path.
-
-Initial grammar decisions:
-
-```toml
-tree-sitter = "0.26"
-tree-sitter-javascript = "0.25"
-tree-sitter-typescript = "0.23"
-tree-sitter-php = "0.24"
-```
-
-Python remains a required core language, but its native grammar crate/version must be selected and pinned before Python extractor implementation.
-
-Blade should use a vendored native [`tree-sitter-blade`](https://github.com/EmranMR/tree-sitter-blade) grammar. Treating `.blade.php` as plain PHP is not good enough for Laravel support.
-
-## Initial indexing
-
-Initial scan should be embarrassingly parallel:
-
-1. Walk non-ignored files with the shared Git/`.xgraphignore` matcher.
-2. Detect language by path and extension.
-3. Hash file bytes.
-4. If the content hash and parser version are already extracted, reuse facts.
-5. Otherwise parse in the worker pool.
-6. Extract nodes, refs, imports, calls, framework facts, and diagnostics.
-7. Batch Cozo writes through the single writer queue.
-
-The fastest parse is no parse. Content hashing matters more than micro-optimizing Tree-sitter when switching branches or worktrees.
-
-## Realtime edits
-
-For file changes:
-
-1. Recheck the path with the shared ignore matcher after debounce.
-2. If the path is ignored, remove any active rows for that path and skip file reads.
-3. If an ignore file changed, rebuild the matcher and enqueue manifest reconciliation.
-4. Read final file bytes.
-5. Hash bytes.
-6. If the hash is unchanged, skip.
-7. If old bytes and old tree are available:
-   - Compute the smallest single replacement range.
-   - Apply `old_tree.edit(...)`.
-   - Parse with `parser.parse(new_bytes, Some(&old_tree))`.
-   - Use `changed_ranges` to limit re-extraction where it is safe.
-8. Otherwise, perform a full-file parse.
-
-Filesystem watchers do not provide reliable text edit ranges. Incremental parsing only works when xgraph keeps old bytes and computes the diff itself. Branch checkouts and formatter rewrites will often be full-file parses, which is acceptable when content hashing and batching are correct.
-
-## Extraction strategy
-
-Tree-sitter provides syntax. Language and framework meaning comes from xgraph extractors and resolver passes.
-
-Use small precise queries for:
-
-- Definitions.
-- Imports.
-- Exports.
-- Classes, interfaces, traits, and enums.
-- Route declarations.
-
-Use manual cursor traversal for:
-
-- Call expressions.
-- Member and property chains.
-- Nested scopes.
-- Laravel-specific heuristics.
-
-Avoid broad "match everything" queries. Use byte-range-limited queries for incremental extraction. Avoid repeated `node.utf8_text()` calls; slice bytes directly and intern common names.
-
-## Laravel and PHP
-
-Parsing choices:
-
-- `.php` uses the PHP/PHP-only grammar.
-- `.blade.php` uses the Blade grammar, plus embedded PHP/HTML/JS ranges where useful.
-- Laravel-significant paths get resolver attention:
-  - `routes/*.php`
-  - `app/Http/Controllers`
-  - `app/Models`
-  - `database/migrations`
-
-Laravel-specific resolution should model:
-
-- `Route::get(..., [Controller::class, 'method'])` and related route forms.
-- Controller method to model calls.
-- Eloquent relationships.
-- Facades.
-- Service container bindings.
-- Events, listeners, and jobs.
-- Blade view references.
-
-Tree-sitter gets syntax nodes. Laravel meaning comes from a framework resolver pass. Framework-derived edges must carry explicit provenance and confidence.
-
-Generic PHP method-call edges favor precision over guesses. Calls with a known
-receiver type, such as `$this->service->run()`, `$this->ownMethod()`, typed
-parameters, and `ClassName::method()`, resolve to `ClassName::method`. Untyped
-member calls do not fall back to every method with the same bare name.
-
-Framework-edge node IDs use the synthetic `lh:` prefix (e.g. `lh:route:get /users`, `lh:UserController::index`, `lh:react.component`, `lh:react.hook.useState`) so they cannot collide with parser-extracted IDs (which always start with a 64-character content hash). MCP clients reading framework edges via `callers_of`/`callees_of` should treat `lh:*` IDs as synthesis points: they do not appear in `active_node` and are not directly queryable by `nodes_in_file`. Edge provenance is `"laravel_heuristic"` and confidence ranges 40 (low) — 70 (medium) — 90 (high) depending on the pattern.
-
-The same resolver path serves the React resolver (`src/react.rs`): JSX-producing PascalCase functions and class components are tagged `lh:react.component`; functions matching `use[A-Z]...` are tagged `lh:react.hook`; calls to React's built-in hooks (the 18 hooks shipped with React 19) from inside a component or hook produce `react_uses_hook` edges to `lh:react.hook.<name>`.
-
-## Language growth
-
-Core languages should be native/static and reproducible. Add long-tail languages later behind feature-gated grammar crates or language packs only after the initial languages work well.
-
-The plugin boundary should look like:
-
-```rust
-trait LanguagePlugin {
-    fn id(&self) -> LanguageId;
-    fn extensions(&self) -> &[&str];
-    fn tree_sitter_language(&self) -> Language;
-    fn queries(&self) -> &'static LanguageQueries;
-    fn extract(&self, tree: &Tree, source: &[u8]) -> ExtractedFile;
-}
-```
-
-Keep language-specific extraction separate from active graph materialization and cross-file resolution.
-
-## Branch and worktree behavior
-
-A branch checkout in the same worktree is a large filesystem change, not a new database identity.
+xgraph treats that as a large filesystem change in the existing worktree, using
+the same database and daemon identity:
 
 ```text
 checkout branch
@@ -357,9 +188,11 @@ checkout branch
   -> active graph rows are replaced transactionally
 ```
 
-The branch name is metadata. The graph identity is the current worktree root plus the current file manifest.
+The branch name is metadata. The graph identity is the current worktree root plus
+the current file manifest. Checking out `master` or another branch in the same
+directory reconciles the same graph to the files currently on disk.
 
-A new Git worktree gets a new database:
+A linked Git worktree gives another branch its own directory:
 
 ```bash
 git worktree add ../repo-feature feature
@@ -367,82 +200,140 @@ cd ../repo-feature
 xgraph init
 ```
 
-Cross-worktree reuse can be added later through an optional global content cache. The first version prioritizes isolation and correctness.
+Each linked worktree gets its own database and long-lived daemon. Use linked
+worktrees when two branches need to be queryable at the same time.
 
-## Cozo schema shape
+## Project discovery and storage
 
-Parsed content is separate from active workspace state.
+xgraph runs inside Git worktrees. A supported invocation resolves:
+
+1. The canonical Git worktree root.
+2. The worktree-private Git storage path:
+
+   ```bash
+   git rev-parse --git-path xgraph
+   ```
+
+3. The short runtime path derived from the canonical worktree root hash.
+
+Persistent state lives in the worktree's private Git directory:
 
 ```text
-content_file[content_hash] => language, parser_version, diagnostics
-content_node[content_hash, local_node_id] => kind, name, qname, span
-content_ref[content_hash, local_ref_id] => kind, name, span
-
-active_file[path] => content_hash, mtime, size, generation
-active_node[node_id] => path, content_hash, local_node_id, kind, name, qname, span
-
-edge[source_node_id, kind, target_node_id] => provenance, confidence
-symbol[name, kind, node_id] => qname, path
+$(git rev-parse --git-path xgraph)/
+  config.toml
+  graph.cozo/
+  schema.version
 ```
 
-A file update is one transaction:
+Runtime files use a short disposable path to avoid Linux Unix socket length
+limits:
 
-1. Remove active rows for the path.
-2. Insert the new active file row.
-3. Materialize active nodes from content facts.
-4. Resolve references.
-5. Insert edges.
-6. Commit.
+```text
+${XDG_RUNTIME_DIR:-/tmp}/xgraph/<hash-of-worktree-root>/
+  xgraph.sock
+  startup.lock
+  daemon.lock
+  daemon.pid
+```
 
-Readers see either the old committed graph or the new committed graph, never a half-updated mixture.
+Git is used for discovery and private storage placement. Freshness is maintained
+through filesystem watching and manifest reconciliation.
 
-## Crash recovery
+## Ignore policy
 
-On daemon startup:
+xgraph indexes the current non-ignored files in the Git worktree. Initial scan,
+watcher ingestion, `xgraph sync`, `xgraph reindex`, and startup crash recovery
+all use the same ignore matcher.
 
-1. Open Cozo.
-2. Load the manifest.
-3. Scan current non-ignored files cheaply.
-4. Compare path, hash, mtime, and size.
-5. Enqueue dirty, missing, and deleted files.
-6. Serve reads with `status = catching_up`.
-7. Commit repairs incrementally.
+The ignore matcher combines:
 
-If a crash happens during an update, Cozo rolls back the incomplete transaction. The next startup scan catches stale paths.
+1. Built-in exclusions for `.git`, xgraph persistent state, dependency
+   directories, build outputs, and disposable runtime paths.
+2. Git ignore rules, including worktree `.gitignore` files and Git exclude
+   sources.
+3. Optional `.xgraphignore` files using Gitignore-compatible syntax for
+   xgraph-only exclusions.
+
+Ignored paths stay out of the graph: they are outside the manifest, hashing,
+parsing, and Cozo writes. When an ignore file changes, the daemon rebuilds the
+matcher and reconciles the manifest.
+
+## Runtime model
+
+Each worktree daemon owns:
+
+- Filesystem watcher.
+- Debounce and batch queue.
+- Parser workers.
+- Language registry.
+- Shared compiled `Arc<Query>` values per language/extractor.
+- Embedded Cozo connection.
+- Single writer queue.
+- In-memory hot indexes.
+- MCP request dispatcher.
+- Maintenance command channel for daemon-owned `sync` and `reindex`.
+
+MCP proxy processes are intentionally lightweight. They answer the initial MCP
+handshake locally, lazy-connect to the worktree daemon when graph data is needed,
+and proxy requests over the daemon socket.
+
+## Language support
+
+Core language support is focused on:
+
+- PHP.
+- Laravel framework conventions, including Blade.
+- TypeScript, JavaScript, and TSX.
+- Python.
+
+Tree-sitter provides syntax. xgraph extractors and resolver passes add language
+and framework meaning: definitions, imports, exports, classes, traits, enums,
+route declarations, call expressions, member/property chains, framework-derived
+edges, and diagnostics.
+
+Framework-derived edges carry provenance and confidence. Synthetic framework
+nodes use the `lh:` prefix, such as `lh:route:get /users`,
+`lh:UserController::index`, `lh:react.component`, and
+`lh:react.hook.useState`.
 
 ## Query strategy
 
-Use in-memory indexes for hot MCP calls:
+Hot MCP calls use in-memory indexes:
 
-- `find_symbol` — exact symbol lookup by name (+ optional kind).
-- `search` — exact / prefix / contains filtering with optional `kind` and `path_prefix`. Contains mode uses a lowercase 3-byte trigram inverted index; sub-microsecond at 50k symbols.
-- `node` — single record, bounded source snippet, line metadata, and a bounded caller/callee trail.
-- Class-like `node` and `context` responses include member nodes plus aggregate member caller/callee relationships, so class-level exploration does not hide method-level edges.
-- `nodes_in_file` — file scope.
-- `callers_of` / `callees_of` — call graph by node id with node metadata, totals, and pagination.
-- `context` — composes symbol lookup, source, caller/callee IDs, and caller/callee node summaries; class-like matches also include member nodes and aggregate member relationships.
-- `explore` — multi-node source browsing with a shared byte budget and optional per-node caller/callee trails.
-- `trace` — shortest call path via bidirectional BFS over the in-memory call graph.
-- `files` — sorted indexed paths with optional prefix filtering and pagination.
-- `status` — file / node / symbol / call-edge counts + RSS + reconcile state.
+- Exact symbol lookup.
+- Prefix and contains search.
+- File-scoped node lookup.
+- Caller and callee lookup by node ID.
+- Focused context for a symbol or path.
+- Multi-node source exploration.
+- Shortest call-path tracing.
+- Indexed file listing.
+- Daemon status.
 
-Use Cozo Datalog for complex graph queries:
+Cozo Datalog is used for broader graph analysis such as transitive impact,
+cycle detection, dependency cones, path queries, module boundary checks, and
+"what changes if X changes?" workflows.
 
-- `impact` — transitive reverse closure over `calls` / `inherits` / `implements` / `references` edges, optionally depth-bounded, with affected node metadata and pagination.
-- Cycle detection (`cycles_via_calls`).
-- Dependency cones.
-- Path queries.
-- Module boundary checks.
-- "What changes if X changes?"
+Simple lookups stay in memory. Broad analysis uses the durable graph.
 
-Simple requests should not pay for the general graph query engine. Complex graph analysis should use Cozo instead of being hand-rolled in ad hoc indexes.
+## Development
 
-Every response carries a `meta` envelope with:
+For local verification, run:
 
-- `catching_up` — whether the daemon's view of the requested scope may be incomplete (initial reconcile still running, or a relevant path is mid-flight from the watcher). File-scoped queries (`nodes_in_file`, `node`) get a precise per-path answer; graph-scoped queries get a conservative answer (any pending or pre-reconcile).
-- `rss_bytes` — daemon process resident-set size at response time, read from `/proc/self/statm` (cheap, one syscall).
-- `pending_paths` — count of paths the watcher has queued but not yet finished processing.
-- `warnings` — populated when the daemon notices a pressure signal worth surfacing (e.g. `high_memory_usage` when RSS exceeds the threshold).
+```bash
+just check
+```
+
+If `just` is unavailable, run the underlying commands directly:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+```
+
+Benchmarks live under `benches/` and cover parsing, initial indexing,
+content-hash skipping, hot-index loading, and per-phase index timing.
 
 ## References
 
@@ -454,71 +345,5 @@ Every response carries a `meta` envelope with:
 - JavaScript grammar crate: <https://docs.rs/tree-sitter-javascript/latest/tree_sitter_javascript/>
 - TypeScript/TSX grammar crate: <https://docs.rs/tree-sitter-typescript/latest/tree_sitter_typescript/>
 - PHP grammar crate: <https://docs.rs/tree-sitter-php/latest/tree_sitter_php/>
+- Python grammar crate: <https://docs.rs/tree-sitter-python/latest/tree_sitter_python/>
 - Blade grammar: <https://github.com/EmranMR/tree-sitter-blade>
-
-## Project status
-
-xgraph runs end-to-end with full cross-file linking across PHP / Blade /
-TypeScript / JavaScript / TSX / Python.
-
-**What works:**
-
-- `xgraph init` indexes a worktree into Cozo, prints a colored
-  shimmer-bar progress UX, and reports both changed-file work and current
-  graph totals.
-- `xgraph daemon start` opens a Unix socket and serves the 12 MCP tools
-  out of in-memory hot indexes loaded from the persistent graph.
-- `xgraph mcp` answers MCP handshake methods locally, then lazy-spawns the daemon for graph tool calls and proxies MCP-style JSON-RPC.
-- `xgraph init`, `xgraph sync`, and `xgraph reindex` use the live daemon when available,
-  so terminal maintenance does not drop connected agent transports.
-- Per-binding TS/JS/Python import refs + container tracking + composite
-  path-scoped symbol-table keys: `import { helper } from './b'` in file
-  A produces a real `calls` edge to the `helper` function in file B.
-- Laravel framework resolver (routes, Eloquent relationships, facades,
-  service container bindings, events, jobs, controller-to-model) +
-  Blade resolver (`@extends`, `@include`, `<x-foo>`, `@component`).
-- React framework resolver (function components, custom hooks, builtin
-  hook calls, `memo`/`forwardRef` wrappers, class components).
-- Filesystem watcher with debounce + incremental processing, including
-  reconciliation when an ignore file changes.
-- Thread-local parser caches, rayon-parallelized scanner *and* parse
-  phase (`prepare_file` runs concurrently per file), content-hash skip
-  cache, FTS trigram index for sub-µs contains search at 50k symbols,
-  batched-and-indexed Cozo transactions (up to 64 files per commit, via
-  secondary indexes on `active_node.path` and `symbol.path`).
-- Criterion benchmark harness with per-phase timing (`bench_index_phases`).
-  500-file initial index ≈ 116 ms wall time on a recent laptop; the
-  store phase is the only one over 10 ms.
-
-**Deferred:**
-
-- Incremental Tree-sitter parsing (`old_tree.edit + parse(new, Some(&old))`).
-  Full-file parse is always used today; the benchmark fixture in
-  `benches/parse.rs` is the baseline against which incremental would be
-  compared. Needs the memory cost (retain old bytes + old tree per file)
-  weighed against the speedup before it lands.
-- Framework resolvers beyond Laravel / Blade / React (Vue, Svelte,
-  Express, NestJS, Django, Flask, FastAPI). The resolver pattern is
-  well-established; each is ~1-2 hours of work plus integration test.
-- Wiring `src/parser.rs::ParserPool`. The `thread_local!` pattern gives
-  equivalent parser-reuse properties for now; the pool would matter if
-  the parse phase becomes the bottleneck after rayon-parallelizing
-  extraction.
-
-See [`AGENTS.md`](./AGENTS.md) for engineering rules and
-[`IMPLEMENTATION_GUIDE.md`](./IMPLEMENTATION_GUIDE.md) for the full phase
-checklist.
-
-For local verification, run:
-
-```bash
-just check
-```
-
-If `just` is not installed, run the underlying commands directly:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-```
