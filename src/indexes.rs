@@ -6,7 +6,7 @@
 //! kept in sync incrementally as `WorktreeOwner` applies file updates via
 //! `apply_file_update` / `remove_path`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -166,31 +166,17 @@ impl HotIndexes {
             let record = NodeRecord {
                 id: id.clone(),
                 path: PathBuf::from(&path),
-                kind,
-                name,
-                qname,
+                kind: kind.clone(),
+                name: name.clone(),
+                qname: qname.clone(),
             };
             self.nodes.insert(id.clone(), record);
             self.files
                 .write()
                 .entry(PathBuf::from(&path))
                 .or_default()
-                .push(id);
-        }
-
-        // symbol[name, kind, node_id] => qname, path
-        let rows = store.run_read(
-            "?[name, kind, node_id] := *symbol[name, kind, node_id, _qname, _path]",
-            BTreeMap::new(),
-        )?;
-        for row in rows.rows {
-            let mut iter = row.into_iter();
-            let name = data_to_string(iter.next()).unwrap_or_default();
-            let kind = data_to_string(iter.next()).unwrap_or_default();
-            let Some(node_id) = data_to_string(iter.next()) else {
-                continue;
-            };
-            self.register_symbol(SymbolKey { name, kind }, NodeId::from(node_id));
+                .push(id.clone());
+            self.register_node_symbols(&name, &qname, &kind, id);
         }
 
         // edge[source, kind, target] => provenance, confidence — wire hot
@@ -241,23 +227,7 @@ impl HotIndexes {
                 qname: node.qname.clone(),
             };
             self.nodes.insert(global_id.clone(), record);
-            // Register by name and qname so unqualified callers also resolve.
-            self.register_symbol(
-                SymbolKey {
-                    name: node.name.clone(),
-                    kind: node.kind.clone(),
-                },
-                global_id.clone(),
-            );
-            if node.qname != node.name {
-                self.register_symbol(
-                    SymbolKey {
-                        name: node.qname.clone(),
-                        kind: node.kind.clone(),
-                    },
-                    global_id.clone(),
-                );
-            }
+            self.register_node_symbols(&node.name, &node.qname, &node.kind, global_id.clone());
             new_ids.push(global_id);
         }
         if !new_ids.is_empty() {
@@ -345,6 +315,7 @@ impl HotIndexes {
     /// iteration so even pathological queries stay bounded.
     pub fn search(&self, query: &SearchQuery) -> Vec<NodeId> {
         let mut results: Vec<NodeId> = Vec::with_capacity(query.limit.min(64));
+        let mut seen: HashSet<NodeId> = HashSet::with_capacity(query.limit.min(64));
 
         // Fast path: exact match goes directly through the primary index.
         if matches!(query.mode, SearchMode::Exact) {
@@ -359,7 +330,9 @@ impl HotIndexes {
                 if results.len() >= query.limit {
                     break;
                 }
-                if !self.path_filter_passes(&id, query.path_prefix.as_deref()) {
+                if !seen.insert(id.clone())
+                    || !self.path_filter_passes(&id, query.path_prefix.as_deref())
+                {
                     continue;
                 }
                 results.push(id);
@@ -410,7 +383,9 @@ impl HotIndexes {
                     if results.len() >= query.limit {
                         break;
                     }
-                    if !self.path_filter_passes(id, query.path_prefix.as_deref()) {
+                    if !seen.insert(id.clone())
+                        || !self.path_filter_passes(id, query.path_prefix.as_deref())
+                    {
                         continue;
                     }
                     results.push(id.clone());
@@ -451,6 +426,7 @@ impl HotIndexes {
 
     fn collect_contains_hits(&self, query: &SearchQuery, candidate_ids: &[u32]) -> Vec<NodeId> {
         let mut results: Vec<NodeId> = Vec::with_capacity(query.limit.min(64));
+        let mut seen: HashSet<NodeId> = HashSet::with_capacity(query.limit.min(64));
         let needle = query.name.as_str();
         let names = self.names.read();
         for &name_id in candidate_ids {
@@ -481,7 +457,9 @@ impl HotIndexes {
                     if results.len() >= query.limit {
                         break;
                     }
-                    if !self.path_filter_passes(id, query.path_prefix.as_deref()) {
+                    if !seen.insert(id.clone())
+                        || !self.path_filter_passes(id, query.path_prefix.as_deref())
+                    {
                         continue;
                     }
                     results.push(id.clone());
@@ -571,6 +549,25 @@ impl HotIndexes {
         self.index_name_trigrams(name);
     }
 
+    fn register_node_symbols(&self, name: &str, qname: &str, kind: &str, node_id: NodeId) {
+        self.register_symbol(
+            SymbolKey {
+                name: name.to_string(),
+                kind: kind.to_string(),
+            },
+            node_id.clone(),
+        );
+        if qname != name {
+            self.register_symbol(
+                SymbolKey {
+                    name: qname.to_string(),
+                    kind: kind.to_string(),
+                },
+                node_id,
+            );
+        }
+    }
+
     /// Tokenize `name` into lowercase 3-byte windows and append a single
     /// id to each trigram's posting list. Idempotent for previously-seen
     /// names. Names shorter than 3 bytes are stored in `names` but not
@@ -600,8 +597,7 @@ impl HotIndexes {
         // through bytewise which is still correct for trigram matching
         // because the query uses the same bytewise lowering.
         let lower: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
-        let mut seen: std::collections::HashSet<[u8; 3]> =
-            std::collections::HashSet::with_capacity(bytes.len());
+        let mut seen: HashSet<[u8; 3]> = HashSet::with_capacity(bytes.len());
         for window in lower.windows(3) {
             let tg = [window[0], window[1], window[2]];
             // Dedupe within a single name so a name like "aaaa" doesn't
@@ -731,7 +727,7 @@ fn data_to_string(value: Option<DataValue>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cozo::{ContentHash, EdgeFact, NodeFact, Span};
+    use crate::cozo::{ContentHash, CozoStore, EdgeFact, NodeFact, Span, WriterQueue};
 
     fn sample_record(id: &str, path: &str, name: &str) -> NodeRecord {
         NodeRecord {
@@ -909,6 +905,56 @@ mod tests {
         let mut hits = idx.lookup_symbol_by_name("Foo");
         hits.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(hits, vec![NodeId::from("h:1"), NodeId::from("h:2")]);
+    }
+
+    #[test]
+    fn reload_from_cozo_registers_name_and_qname_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("graph.cozo");
+        let store = CozoStore::open(&store_path).expect("open store");
+        let reader = store.clone();
+        let mut handle = WriterQueue::start(store).expect("start writer");
+        let hash = ContentHash([8; crate::cozo::CONTENT_HASH_LEN]);
+        let node_id = NodeId::from(active_node_id(&hash, 3));
+
+        handle
+            .submit(sample_update(
+                "app/Services/NavResolver.php",
+                8,
+                vec![NodeFact {
+                    local_node_id: 3,
+                    kind: "method".to_string(),
+                    name: "resolve".to_string(),
+                    qname: "App\\Services\\NavResolver::resolve".to_string(),
+                    span: Span {
+                        start_byte: 0,
+                        end_byte: 1,
+                        start_row: 0,
+                        start_col: 0,
+                    },
+                }],
+                Vec::new(),
+            ))
+            .expect("submit");
+        handle.shutdown();
+
+        let idx = HotIndexes::load_from_cozo(&reader).expect("reload");
+
+        assert_eq!(idx.lookup_symbol_by_name("resolve"), vec![node_id.clone()]);
+        assert_eq!(
+            idx.lookup_symbol_by_name("App\\Services\\NavResolver::resolve"),
+            vec![node_id.clone()]
+        );
+        assert_eq!(
+            idx.search(&SearchQuery {
+                name: "NavResolver::resolve".to_string(),
+                mode: SearchMode::Contains,
+                kind: Some("method".to_string()),
+                path_prefix: Some("app/Services".to_string()),
+                limit: 10,
+            }),
+            vec![node_id]
+        );
     }
 
     fn populate_search_corpus(idx: &HotIndexes) {

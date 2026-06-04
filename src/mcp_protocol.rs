@@ -158,6 +158,7 @@ pub const TOOLS: &[ToolDef] = &[
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Symbol name to look up" },
+                "mode": { "type": "string", "enum": ["exact", "prefix", "contains"], "description": "Match mode (default: exact)" },
                 "kind": { "type": "string", "description": "Optional kind filter" },
                 "path_prefix": { "type": "string", "description": "Optional path-prefix filter" },
                 "limit": { "type": "integer", "description": "Maximum matching symbols to expand (default 20, max 200)" },
@@ -270,7 +271,9 @@ pub fn wrap_tool_response(daemon_response: &Value, tool: Option<&ToolCall>) -> V
         .unwrap_or(Value::Null);
     let meta = daemon_response.get("meta").cloned().unwrap_or(Value::Null);
     let text = match tool {
-        Some(call) => crate::render::render_tool_result(&call.name, &call.arguments, &result, &meta),
+        Some(call) => {
+            crate::render::render_tool_result(&call.name, &call.arguments, &result, &meta)
+        }
         None => serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string()),
     };
     json!({

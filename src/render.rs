@@ -7,8 +7,7 @@
 //!
 //! The rendered Markdown is lossless relative to the JSON: every field in
 //! `result` and `meta` either appears inline, in a table, or in a short-ref
-//! + full-ID appendix. Empty-result branches always include a hint on what
-//! to try next.
+//! + full-ID appendix. Empty-result branches include a hint on what to try next.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -117,7 +116,11 @@ fn render_files(args: &Value, result: &Value) -> String {
 
     let returned = files.len();
     let truncated = offset.saturating_add(returned) < total;
-    let _ = writeln!(out, "{}", pagination_line(offset, returned, total, truncated));
+    let _ = writeln!(
+        out,
+        "{}",
+        pagination_line(offset, returned, total, truncated)
+    );
     let _ = writeln!(
         out,
         "Page: offset {offset}, limit {limit} (returned {returned}, total {total}, truncated {truncated})."
@@ -326,7 +329,11 @@ fn render_related_nodes(title: &str, col_title: &str, args: &Value, result: &Val
     }
 
     let returned = nodes.len();
-    let _ = writeln!(out, "{}", pagination_line(offset, returned, total, truncated));
+    let _ = writeln!(
+        out,
+        "{}",
+        pagination_line(offset, returned, total, truncated)
+    );
     let _ = writeln!(
         out,
         "Page: offset {offset}, limit {limit} (returned {returned}, total {total}, truncated {truncated})."
@@ -377,7 +384,11 @@ fn render_impact(args: &Value, result: &Value) -> String {
     );
     let returned = nodes.len();
     if total > 0 {
-        let _ = writeln!(out, "{}", pagination_line(offset, returned, total, truncated));
+        let _ = writeln!(
+            out,
+            "{}",
+            pagination_line(offset, returned, total, truncated)
+        );
         let _ = writeln!(
             out,
             "Page: offset {offset}, limit {limit} (returned {returned}, total {total}, truncated {truncated})."
@@ -406,7 +417,11 @@ fn render_impact(args: &Value, result: &Value) -> String {
     }
 
     for (path, items) in &by_path {
-        let label = if path.is_empty() { "(unknown path)" } else { path };
+        let label = if path.is_empty() {
+            "(unknown path)"
+        } else {
+            path
+        };
         let _ = writeln!(out, "\n{label}");
         for n in items {
             let display = display_name(n);
@@ -420,6 +435,7 @@ fn render_impact(args: &Value, result: &Value) -> String {
 
 fn render_context(args: &Value, result: &Value) -> String {
     let query = args["name"].as_str().unwrap_or("");
+    let mode = args["mode"].as_str().unwrap_or("exact");
     let kind_filter = args["kind"].as_str().filter(|s| !s.is_empty());
     let path_filter = args["path_prefix"].as_str().filter(|s| !s.is_empty());
     let matches = result["matches"].as_array().cloned().unwrap_or_default();
@@ -428,6 +444,7 @@ fn render_context(args: &Value, result: &Value) -> String {
 
     let mut out = String::from("## Code Context\n");
     let _ = writeln!(out, "Query: {query}");
+    let _ = writeln!(out, "Mode: {mode}");
     if let Some(k) = kind_filter {
         let _ = writeln!(out, "Kind filter: {k}");
     }
@@ -439,7 +456,7 @@ fn render_context(args: &Value, result: &Value) -> String {
     if matches.is_empty() {
         let _ = writeln!(
             out,
-            "No matches for `{query}`. Try `search mode=contains`, drop filters, or check `status` for pending paths."
+            "No matches for `{query}`. Try `context` with `mode=contains`, drop filters, or check `status` for pending paths."
         );
         return out;
     }
@@ -451,7 +468,10 @@ fn render_context(args: &Value, result: &Value) -> String {
             "{total} total matches; expanded first {returned} (limit {limit})."
         );
     } else {
-        let _ = writeln!(out, "{returned} of {total} matches expanded (limit {limit}).");
+        let _ = writeln!(
+            out,
+            "{returned} of {total} matches expanded (limit {limit})."
+        );
     }
 
     let mut ids = IdAppendix::new();
@@ -687,11 +707,7 @@ fn render_trace(args: &Value, result: &Value) -> String {
     } else {
         from_label
     };
-    let to_label = if to_label.is_empty() {
-        to_id
-    } else {
-        to_label
-    };
+    let to_label = if to_label.is_empty() { to_id } else { to_label };
 
     let _ = writeln!(out, "## Trace: {from_label} → {to_label}");
     let hop_count = length.unwrap_or((hops.len() as u64).saturating_sub(1));
@@ -981,7 +997,7 @@ fn format_thousands(n: u64) -> String {
     let len = chars.len();
     let mut out = String::with_capacity(len + len / 3);
     for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*c);
@@ -1194,6 +1210,16 @@ mod tests {
         let out = render_tool_result("search", &args, &result, &meta_current());
         assert!(out.contains("0 hits"));
         assert!(out.contains("mode=contains"));
+    }
+
+    #[test]
+    fn context_empty_includes_mode_and_actionable_guidance() {
+        let args = json!({"name":"NavResolver", "mode":"exact"});
+        let result = json!({"matches":[], "total_matches":0, "limit":20});
+        let out = render_tool_result("context", &args, &result, &meta_current());
+        assert!(out.contains("Query: NavResolver"));
+        assert!(out.contains("Mode: exact"));
+        assert!(out.contains("Try `context` with `mode=contains`"));
     }
 
     #[test]

@@ -446,28 +446,23 @@ impl WorktreeHandler {
         let snippet_bytes = params.snippet_bytes.unwrap_or(2048).min(8192);
         let match_limit = params.limit.unwrap_or(20).min(200);
 
-        let ids = match &params.kind {
-            Some(k) => self.indexes.lookup_symbol(&SymbolKey {
-                name: params.name.clone(),
-                kind: k.clone(),
-            }),
-            None => self.indexes.lookup_symbol_by_name(&params.name),
-        };
+        let ids = self.indexes.search(&SearchQuery {
+            name: params.name.clone(),
+            mode: match params.mode.as_deref() {
+                Some("prefix") => SearchMode::Prefix,
+                Some("contains") => SearchMode::Contains,
+                _ => SearchMode::Exact,
+            },
+            kind: params.kind.clone(),
+            path_prefix: params.path_prefix.clone(),
+            limit: 200,
+        });
 
         let mut matches: Vec<Value> = Vec::with_capacity(ids.len().min(match_limit));
-        let mut total_matches = 0usize;
         for id in &ids {
             let Some(record) = self.indexes.get_node(id) else {
                 continue;
             };
-            if params
-                .path_prefix
-                .as_deref()
-                .is_some_and(|prefix| !record.path.to_string_lossy().starts_with(prefix))
-            {
-                continue;
-            }
-            total_matches += 1;
             if matches.len() >= match_limit {
                 continue;
             }
@@ -526,7 +521,7 @@ impl WorktreeHandler {
 
         let catching_up = !self.status.is_reconcile_done() || self.status.any_pending();
         (
-            json!({ "matches": matches, "total_matches": total_matches, "limit": match_limit }),
+            json!({ "matches": matches, "total_matches": ids.len(), "limit": match_limit }),
             catching_up,
         )
     }
@@ -1049,6 +1044,8 @@ struct ContextParams {
     /// Search query for the symbol that frames the context.
     name: String,
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
     path_prefix: Option<String>,
@@ -1070,7 +1067,16 @@ impl RpcParams for ContextParams {
             "path_prefix",
             self.path_prefix.as_ref(),
             MAX_PATH_PARAM_BYTES,
-        )
+        )?;
+        if let Some(mode) = &self.mode
+            && !matches!(mode.as_str(), "exact" | "prefix" | "contains")
+        {
+            return Err(RpcError {
+                code: -32602,
+                message: format!("invalid params: unsupported `mode`: {mode}"),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1590,6 +1596,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_context_mode_returns_invalid_params() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":94,"method":"context","params":{"name":"User","mode":"regex"}}"#,
+        )
+        .await;
+        assert_eq!(resp["id"], 94);
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported `mode`")
+        );
+    }
+
+    #[tokio::test]
     async fn explore_rejects_excessive_node_id_batches() {
         let (indexes, status, root, store) = empty_setup();
         status.mark_reconcile_done();
@@ -1782,6 +1810,27 @@ mod tests {
         }
     }
 
+    fn insert_qualified_resolve_method(indexes: &HotIndexes) -> NodeId {
+        let id = NodeId::from("h:NavResolver::resolve");
+        indexes.insert_node(NodeRecord {
+            id: id.clone(),
+            path: PathBuf::from("app/Services/NavResolver.php"),
+            kind: "method".to_string(),
+            name: "resolve".to_string(),
+            qname: "App\\Services\\NavResolver::resolve".to_string(),
+        });
+        for name in ["resolve", "App\\Services\\NavResolver::resolve"] {
+            indexes.register_symbol(
+                SymbolKey {
+                    name: name.to_string(),
+                    kind: "method".to_string(),
+                },
+                id.clone(),
+            );
+        }
+        id
+    }
+
     #[tokio::test]
     async fn search_exact_returns_only_matching_symbol() {
         let (indexes, status, root, store) = empty_setup();
@@ -1899,6 +1948,49 @@ mod tests {
         assert_eq!(callers[0], "h:UserController");
         let caller_nodes = matches[0]["caller_nodes"].as_array().unwrap();
         assert_eq!(caller_nodes[0]["qname"], "UserController");
+        assert_eq!(resp["result"]["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn context_tool_exact_matches_qualified_name() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let id = insert_qualified_resolve_method(&indexes);
+
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":33,"method":"context","params":{"name":"App\\Services\\NavResolver::resolve"}}"#,
+        )
+        .await;
+
+        let matches = resp["result"]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["node_id"], id.as_str());
+        assert_eq!(matches[0]["qname"], "App\\Services\\NavResolver::resolve");
+        assert_eq!(resp["result"]["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn context_tool_contains_mode_deduplicates_name_and_qname_hits() {
+        let (indexes, status, root, store) = empty_setup();
+        status.mark_reconcile_done();
+        let id = insert_qualified_resolve_method(&indexes);
+
+        let resp = run_request(
+            indexes,
+            status,
+            root,
+            store,
+            r#"{"jsonrpc":"2.0","id":34,"method":"context","params":{"name":"resolve","mode":"contains"}}"#,
+        )
+        .await;
+
+        let matches = resp["result"]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["node_id"], id.as_str());
         assert_eq!(resp["result"]["total_matches"], 1);
     }
 
