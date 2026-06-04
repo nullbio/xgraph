@@ -2,7 +2,7 @@
 
 A Rust-native code graph for large Git worktrees, built for agent clients.
 xgraph indexes your repo into an embedded [CozoDB](https://docs.cozodb.org/en/latest/stored.html)
-graph, keeps it fresh through a long-lived daemon, and serves fast structural
+graph, keeps it fresh through an on-demand daemon, and serves fast structural
 queries — symbols, callers, callees, impact, traces — over MCP.
 
 Linux only. PHP, Laravel/Blade, TypeScript, JavaScript, TSX, and Python.
@@ -39,7 +39,8 @@ xgraph init
 
 `init` indexes the repo and — if Claude Code or Codex is installed — offers to
 register xgraph as a global MCP server for you. Accept the prompt and you're
-done: the daemon lazy-starts the next time an agent makes a query.
+done: the right worktree daemon lazy-starts the next time an agent makes a
+query.
 
 ## Features
 
@@ -61,7 +62,9 @@ done: the daemon lazy-starts the next time an agent makes a query.
 
 ## MCP tools
 
-Once registered, agents get these tools:
+Once registered, agents get these tools. Every tool call includes a
+`project_root`; the MCP proxy resolves that path to a canonical Git worktree
+and routes the request to that worktree's daemon.
 
 | Tool | Purpose |
 | --- | --- |
@@ -77,8 +80,9 @@ Once registered, agents get these tools:
 | `files` | Indexed file listing. |
 | `status` | Graph totals and daemon health. |
 
-Every response carries metadata — catch-up state, daemon memory, queued paths,
-warnings — so clients can tell when the graph is still converging.
+Every response starts with the routed xgraph project path and carries metadata
+— catch-up state, daemon memory, queued paths, warnings — so clients can tell
+which worktree answered and whether the graph is still converging.
 
 ## CLI
 
@@ -95,12 +99,19 @@ xgraph reindex     # rebuild the graph
 xgraph daemon stop # stop the per-worktree daemon
 ```
 
-`init`, `sync`, and `reindex` use the live daemon when one is reachable so
-connected MCP clients keep their socket transport. With no daemon running, they
-fall back to direct store maintenance.
+All commands default to the current directory's Git worktree. Pass
+`--project-root <path>` before the subcommand to operate on another worktree
+without changing directories.
 
-The daemon starts automatically when the first MCP request arrives.
-`xgraph daemon start` exists if you want to warm it up explicitly.
+`init` uses the live daemon when one is reachable so connected MCP clients keep
+their socket transport; with no daemon running, it performs direct store
+maintenance. `status`, `sync`, `reindex`, and query commands start the
+worktree daemon on demand when no reachable daemon socket exists.
+
+The daemon starts automatically when the first CLI or MCP graph request arrives.
+`xgraph daemon start` exists if you want to warm it up explicitly. Daemons exit
+after 15 minutes without received commands and no in-flight command, and also
+exit when their worktree root or persistent xgraph store path disappears.
 
 ### Queries
 
@@ -140,7 +151,10 @@ cd ../repo-feature
 xgraph init
 ```
 
-Each linked worktree gets its own database and daemon.
+Each linked worktree gets its own database and daemon. A single `xgraph mcp`
+proxy can query multiple linked worktrees by sending different `project_root`
+values in different tool calls; the proxy keeps separate daemon connections and
+reconnects if a cached socket goes stale.
 
 ## How it works
 
@@ -153,8 +167,10 @@ One daemon per worktree owns:
 - MCP request dispatch and maintenance commands
 
 `xgraph mcp` proxies are intentionally lightweight: they answer the MCP
-handshake locally, lazy-connect to the daemon when graph data is needed, and
-proxy JSON-RPC over the daemon socket.
+handshake locally, resolve each tool call's `project_root`, lazy-connect to
+that worktree's daemon when graph data is needed, and proxy JSON-RPC over the
+daemon socket. If a cached daemon connection is stale, the proxy reconnects and
+retries the request once.
 
 ### Storage
 
@@ -185,7 +201,7 @@ ${XDG_RUNTIME_DIR:-/tmp}/xgraph/<hash-of-worktree-root>/
 | Platform | Linux |
 | Database | Embedded CozoDB |
 | Scope | One database per Git worktree |
-| Runtime owner | One daemon per worktree |
+| Runtime owner | One on-demand, self-reaping daemon per worktree |
 | Agent access | Many `xgraph mcp` proxy processes |
 | Update source | Filesystem watcher plus manifest reconciliation |
 | Branch model | Graph = current files on disk; branch name is metadata |

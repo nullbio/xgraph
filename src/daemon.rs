@@ -3,7 +3,8 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fs2::FileExt;
 use tokio::io::AsyncWriteExt;
@@ -19,17 +20,93 @@ pub const DEFAULT_SOCKET_NAME: &str = "xgraph.sock";
 /// The accept loop does not await the returned handle, so handlers may run
 /// indefinitely.
 pub trait ConnectionHandler: Send + Sync {
-    fn handle(&self, conn: UnixStream) -> JoinHandle<()>;
+    fn handle(&self, conn: UnixStream, activity: ActivityTracker) -> JoinHandle<()>;
 }
 
 pub struct EchoHandler;
 
 impl ConnectionHandler for EchoHandler {
-    fn handle(&self, mut conn: UnixStream) -> JoinHandle<()> {
+    fn handle(&self, mut conn: UnixStream, activity: ActivityTracker) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let _request = activity.begin_request();
             let _ = conn.write_all(b"ok\n").await;
             let _ = conn.shutdown().await;
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct ActivityTracker {
+    inner: Arc<Mutex<ActivityState>>,
+}
+
+struct ActivityState {
+    active_requests: usize,
+    last_activity: tokio::time::Instant,
+}
+
+impl ActivityTracker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ActivityState {
+                active_requests: 0,
+                last_activity: tokio::time::Instant::now(),
+            })),
+        }
+    }
+
+    pub fn begin_request(&self) -> ActivityGuard {
+        let mut state = self.inner.lock().expect("activity tracker poisoned");
+        state.active_requests += 1;
+        state.last_activity = tokio::time::Instant::now();
+        ActivityGuard {
+            tracker: self.clone(),
+        }
+    }
+
+    fn is_idle_for(&self, timeout: Duration) -> bool {
+        let state = self.inner.lock().expect("activity tracker poisoned");
+        state.active_requests == 0 && state.last_activity.elapsed() >= timeout
+    }
+}
+
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct ActivityGuard {
+    tracker: ActivityTracker,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .inner
+            .lock()
+            .expect("activity tracker poisoned");
+        state.active_requests = state.active_requests.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DaemonLifecycleConfig {
+    pub idle_timeout: Option<Duration>,
+    pub health_check_interval: Duration,
+    pub worktree_root: Option<PathBuf>,
+    pub persistent_root: Option<PathBuf>,
+}
+
+impl Default for DaemonLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Some(Duration::from_secs(15 * 60)),
+            health_check_interval: Duration::from_secs(30),
+            worktree_root: None,
+            persistent_root: None,
+        }
     }
 }
 
@@ -37,6 +114,7 @@ pub struct DaemonConfig {
     pub runtime_dir: PathBuf,
     pub socket_name: &'static str,
     pub handler: Arc<dyn ConnectionHandler>,
+    pub lifecycle: DaemonLifecycleConfig,
 }
 
 impl DaemonConfig {
@@ -45,6 +123,7 @@ impl DaemonConfig {
             runtime_dir,
             socket_name: DEFAULT_SOCKET_NAME,
             handler,
+            lifecycle: DaemonLifecycleConfig::default(),
         }
     }
 }
@@ -101,6 +180,7 @@ impl From<io::Error> for DaemonError {
 pub struct DaemonHandle {
     daemon: Daemon,
     accept_task: Option<JoinHandle<()>>,
+    lifecycle_task: Option<JoinHandle<()>>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -142,6 +222,19 @@ impl DaemonHandle {
             }
         }
 
+        if let Some(task) = self.lifecycle_task.take() {
+            task.abort();
+            match task.await {
+                Ok(()) => {}
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => {
+                    return Err(DaemonError::Io(io::Error::other(format!(
+                        "daemon lifecycle task failed: {err}"
+                    ))));
+                }
+            }
+        }
+
         let _ = std::fs::remove_file(self.daemon.socket_path());
         let _ = std::fs::remove_file(self.daemon.pid_path());
 
@@ -159,6 +252,7 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         runtime_dir,
         socket_name,
         handler,
+        lifecycle,
     } = config;
 
     std::fs::create_dir_all(&runtime_dir)?;
@@ -206,7 +300,14 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let accept_task = tokio::spawn(accept_loop(listener, handler, shutdown_rx));
+    let activity = ActivityTracker::new();
+    let accept_task = tokio::spawn(accept_loop(
+        listener,
+        handler,
+        activity.clone(),
+        shutdown_rx,
+    ));
+    let lifecycle_task = tokio::spawn(lifecycle_loop(lifecycle, activity, shutdown_tx.clone()));
 
     Ok(DaemonHandle {
         daemon: Daemon {
@@ -216,6 +317,7 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             lock_file,
         },
         accept_task: Some(accept_task),
+        lifecycle_task: Some(lifecycle_task),
         shutdown_tx,
     })
 }
@@ -223,6 +325,7 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
 async fn accept_loop(
     listener: UnixListener,
     handler: Arc<dyn ConnectionHandler>,
+    activity: ActivityTracker,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -235,9 +338,37 @@ async fn accept_loop(
             }
             accept = listener.accept() => {
                 if let Ok((stream, _addr)) = accept {
-                    std::mem::drop(handler.handle(stream));
+                    std::mem::drop(handler.handle(stream, activity.clone()));
                 }
             }
+        }
+    }
+}
+
+async fn lifecycle_loop(
+    config: DaemonLifecycleConfig,
+    activity: ActivityTracker,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    loop {
+        tokio::time::sleep(config.health_check_interval).await;
+        if *shutdown_tx.borrow() {
+            return;
+        }
+        if config
+            .worktree_root
+            .as_deref()
+            .is_some_and(|path| !path.exists())
+            || config
+                .persistent_root
+                .as_deref()
+                .is_some_and(|path| !path.exists())
+            || config
+                .idle_timeout
+                .is_some_and(|timeout| activity.is_idle_for(timeout))
+        {
+            let _ = shutdown_tx.send(true);
+            return;
         }
     }
 }
@@ -364,6 +495,113 @@ mod tests {
         );
 
         handle.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn daemon_shuts_down_after_idle_timeout_without_inflight_work() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.lifecycle.idle_timeout = Some(std::time::Duration::from_millis(50));
+        cfg.lifecycle.health_check_interval = std::time::Duration::from_millis(10);
+        let handle = start(cfg).await.expect("daemon should start");
+
+        let mut shutdown_rx = handle.shutdown_subscriber();
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_rx.changed())
+            .await
+            .expect("idle timeout should stop daemon")
+            .expect("shutdown signal");
+    }
+
+    struct BlockingHandler {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ConnectionHandler for BlockingHandler {
+        fn handle(&self, mut conn: ClientStream, activity: ActivityTracker) -> JoinHandle<()> {
+            let release = Arc::clone(&self.release);
+            tokio::spawn(async move {
+                let _request = activity.begin_request();
+                release.notified().await;
+                let _ = conn.write_all(b"ok\n").await;
+                let _ = conn.shutdown().await;
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_does_not_idle_shutdown_while_request_is_in_flight() {
+        let dir = TempDir::new().expect("tempdir");
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut cfg = DaemonConfig::new(
+            dir.path().to_path_buf(),
+            Arc::new(BlockingHandler {
+                release: Arc::clone(&release),
+            }),
+        );
+        cfg.lifecycle.idle_timeout = Some(std::time::Duration::from_millis(50));
+        cfg.lifecycle.health_check_interval = std::time::Duration::from_millis(10);
+        let handle = start(cfg).await.expect("daemon should start");
+        let mut shutdown_rx = handle.shutdown_subscriber();
+        let _client = ClientStream::connect(handle.socket_path())
+            .await
+            .expect("connect");
+
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            shutdown_rx.changed().await
+        })
+        .await;
+        assert!(
+            observed.is_err(),
+            "daemon must not idle-timeout while a request is active"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_rx.changed())
+            .await
+            .expect("idle timeout should fire after request completes")
+            .expect("shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn daemon_shuts_down_when_worktree_root_disappears() {
+        let runtime = TempDir::new().expect("runtime tempdir");
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let persistent = worktree.path().join(".git").join("xgraph");
+        std::fs::create_dir_all(&persistent).expect("persistent dir");
+        let mut cfg = config(runtime.path().to_path_buf());
+        cfg.lifecycle.worktree_root = Some(worktree.path().to_path_buf());
+        cfg.lifecycle.persistent_root = Some(persistent);
+        cfg.lifecycle.health_check_interval = std::time::Duration::from_millis(10);
+        let handle = start(cfg).await.expect("daemon should start");
+        let mut shutdown_rx = handle.shutdown_subscriber();
+
+        std::fs::remove_dir_all(worktree.path()).expect("delete worktree root");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_rx.changed())
+            .await
+            .expect("missing worktree should stop daemon")
+            .expect("shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn daemon_shuts_down_when_persistent_root_disappears() {
+        let runtime = TempDir::new().expect("runtime tempdir");
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let persistent = worktree.path().join(".git").join("xgraph");
+        std::fs::create_dir_all(&persistent).expect("persistent dir");
+        let mut cfg = config(runtime.path().to_path_buf());
+        cfg.lifecycle.worktree_root = Some(worktree.path().to_path_buf());
+        cfg.lifecycle.persistent_root = Some(persistent.clone());
+        cfg.lifecycle.health_check_interval = std::time::Duration::from_millis(10);
+        let handle = start(cfg).await.expect("daemon should start");
+        let mut shutdown_rx = handle.shutdown_subscriber();
+
+        std::fs::remove_dir_all(persistent).expect("delete persistent root");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_rx.changed())
+            .await
+            .expect("missing persistent root should stop daemon")
+            .expect("shutdown signal");
     }
 
     #[tokio::test]

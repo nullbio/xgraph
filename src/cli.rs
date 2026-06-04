@@ -26,6 +26,9 @@ use crate::storage::{PersistentPaths, PersistentPathsError};
 #[derive(Debug, Parser)]
 #[command(name = "xgraph", version = VERSION, about = "Linux-native code graph daemon for Git worktrees")]
 pub struct Cli {
+    /// Path inside the Git worktree to operate on. Defaults to the current directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub project_root: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -207,19 +210,21 @@ where
 }
 
 pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
+    let project_root = cli.project_root;
     match cli.command {
-        Command::Init => cmd_init(),
+        Command::Init => cmd_init(project_root.as_deref()),
         Command::Mcp => cmd_mcp(),
         Command::Daemon {
             action: DaemonAction::Start,
-        } => cmd_daemon_start(),
+        } => cmd_daemon_start(project_root.as_deref()),
         Command::Daemon {
             action: DaemonAction::Stop { force },
-        } => cmd_daemon_stop(force),
-        Command::Status => cmd_status(),
-        Command::Sync => cmd_sync(),
-        Command::Reindex => cmd_reindex(),
+        } => cmd_daemon_stop(project_root.as_deref(), force),
+        Command::Status => cmd_status(project_root.as_deref()),
+        Command::Sync => cmd_sync(project_root.as_deref()),
+        Command::Reindex => cmd_reindex(project_root.as_deref()),
         Command::FindSymbol { name, kind } => cmd_send_query(
+            project_root.as_deref(),
             "find_symbol",
             serde_json::json!({
                 "name": name,
@@ -233,6 +238,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             path_prefix,
             limit,
         } => cmd_send_query(
+            project_root.as_deref(),
             "search",
             serde_json::json!({
                 "name": name,
@@ -251,6 +257,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             limit,
             offset,
         } => cmd_send_query(
+            project_root.as_deref(),
             "callers_of",
             serde_json::json!({ "node_id": node_id, "limit": limit, "offset": offset }),
         ),
@@ -259,6 +266,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             limit,
             offset,
         } => cmd_send_query(
+            project_root.as_deref(),
             "callees_of",
             serde_json::json!({ "node_id": node_id, "limit": limit, "offset": offset }),
         ),
@@ -268,6 +276,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             limit,
             offset,
         } => cmd_send_query(
+            project_root.as_deref(),
             "impact",
             serde_json::json!({
                 "node_id": node_id,
@@ -283,6 +292,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             limit,
             related_limit,
         } => cmd_send_query(
+            project_root.as_deref(),
             "context",
             serde_json::json!({
                 "name": name,
@@ -297,6 +307,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             to,
             max_depth,
         } => cmd_send_query(
+            project_root.as_deref(),
             "trace",
             serde_json::json!({
                 "from": from,
@@ -309,6 +320,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             limit,
             offset,
         } => cmd_send_query(
+            project_root.as_deref(),
             "files",
             serde_json::json!({
                 "prefix": prefix,
@@ -319,32 +331,53 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
     }
 }
 
-fn cmd_init() -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    cmd_init_at(&cwd)
+fn requested_worktree(project_root: Option<&Path>) -> Result<WorktreeRoot, CliError> {
+    match project_root {
+        Some(path) => Ok(WorktreeRoot::discover(path)?),
+        None => {
+            let cwd = env::current_dir().map_err(CliError::Cwd)?;
+            Ok(WorktreeRoot::discover(&cwd)?)
+        }
+    }
 }
 
+fn cmd_init(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
+    let worktree = requested_worktree(project_root)?;
+    cmd_init_at_worktree(&worktree)
+}
+
+#[cfg(test)]
 fn cmd_init_at(start: &Path) -> Result<ExitCode, CliError> {
     let worktree = WorktreeRoot::discover(start)?;
-    let persistent = PersistentPaths::for_worktree(&worktree)?;
+    cmd_init_at_worktree(&worktree)
+}
+
+fn cmd_init_at_worktree(worktree: &WorktreeRoot) -> Result<ExitCode, CliError> {
+    let persistent = PersistentPaths::for_worktree(worktree)?;
     if let Some(response) =
-        send_daemon_request_if_reachable(&worktree, "sync", serde_json::json!({}))?
+        send_daemon_request_if_reachable(worktree, "sync", serde_json::json!({}))?
     {
         if print_daemon_error_if_any(&response) {
             return Ok(ExitCode::FAILURE);
         }
         let result = response.get("result").unwrap_or(&response);
-        print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
+        print_daemon_index_summary(worktree, result, persistent.root_dir())?;
         maybe_prompt_mcp_install();
         return Ok(ExitCode::SUCCESS);
     }
-    init_at_worktree(&worktree, &persistent)
+    init_at_worktree(worktree, &persistent)
 }
 
 pub fn init_at(start: &Path) -> Result<ExitCode, CliError> {
     let worktree = WorktreeRoot::discover(start)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
     init_at_worktree(&worktree, &persistent)
+}
+
+pub fn reindex_at(start: &Path) -> Result<ExitCode, CliError> {
+    let worktree = WorktreeRoot::discover(start)?;
+    let persistent = PersistentPaths::for_worktree(&worktree)?;
+    reindex_at_worktree(&worktree, &persistent)
 }
 
 fn init_at_worktree(
@@ -408,6 +441,55 @@ fn init_at_locked(
     Ok(ExitCode::SUCCESS)
 }
 
+fn reindex_at_worktree(
+    worktree: &WorktreeRoot,
+    persistent: &PersistentPaths,
+) -> Result<ExitCode, CliError> {
+    persistent.ensure_created()?;
+    let runtime = ensure_runtime_dir(worktree.as_path())?;
+    let _startup_guard =
+        acquire_startup_lock_with_retry(&runtime, std::time::Duration::from_secs(60))?;
+    ensure_no_running_daemon(worktree.as_path())?;
+
+    let store = open_store_with_lock_retry(
+        &persistent.cozo_db_path(),
+        std::time::Duration::from_secs(60),
+    )?;
+    let store_for_counts = store.clone();
+    let matcher = IgnoreMatcher::new(worktree.as_path())?;
+    let registry = LanguageRegistry::with_all();
+    let indexes = Arc::new(crate::indexes::HotIndexes::new());
+    let status = Arc::new(crate::daemon_status::DaemonStatus::new());
+    let mut owner = WorktreeOwner::new(
+        worktree.as_path().to_path_buf(),
+        matcher,
+        registry,
+        store,
+        indexes,
+        status,
+    )?;
+
+    let progress = crate::progress::Progress::start();
+    let summary = owner.reindex_all_with_progress(&progress)?;
+    progress.stop();
+    let errors = owner.shutdown();
+    if let Some(first) = errors.into_iter().next() {
+        return Err(CliError::Writer(first));
+    }
+    let graph_counts = GraphCounts::from_indexes(&crate::indexes::HotIndexes::load_from_cozo(
+        &store_for_counts,
+    )?);
+    print_index_summary_parts(
+        summary.files_scanned as u64,
+        summary.files_indexed as u64,
+        summary.nodes_created,
+        summary.edges_created,
+        Some(graph_counts),
+        persistent.root_dir(),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn maybe_prompt_mcp_install() {
     let candidates = crate::mcp_install::clients_needing_install();
     if !candidates.is_empty()
@@ -418,19 +500,7 @@ fn maybe_prompt_mcp_install() {
 }
 
 fn cmd_mcp() -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let config = match WorktreeRoot::discover(&cwd) {
-        Ok(worktree) => {
-            let runtime = ensure_runtime_dir(worktree.as_path())?;
-            let launcher = Arc::new(SubprocessLauncher {
-                worktree_root: worktree.as_path().to_path_buf(),
-            });
-            crate::mcp::McpConfig::new(runtime.as_path().to_path_buf(), launcher)
-        }
-        Err(err) => crate::mcp::McpConfig::unavailable(format!(
-            "xgraph MCP is not attached to a Git worktree: {err}"
-        )),
-    };
+    let config = crate::mcp::McpConfig::with_router(Arc::new(GitProjectRouter));
 
     let runtime_tokio = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -443,6 +513,27 @@ fn cmd_mcp() -> Result<ExitCode, CliError> {
         .block_on(crate::mcp::run(config))
         .map_err(CliError::Mcp)?;
     Ok(exit_code)
+}
+
+struct GitProjectRouter;
+
+impl crate::mcp::ProjectRouter for GitProjectRouter {
+    fn route(
+        &self,
+        project_root: &str,
+    ) -> Result<crate::mcp::DaemonEndpoint, crate::mcp::McpError> {
+        let worktree = WorktreeRoot::discover(Path::new(project_root))
+            .map_err(|err| crate::mcp::McpError::Unavailable(err.to_string()))?;
+        let runtime = ensure_runtime_dir(worktree.as_path())
+            .map_err(|err| crate::mcp::McpError::Unavailable(err.to_string()))?;
+        Ok(crate::mcp::DaemonEndpoint {
+            project_root: worktree.as_path().to_path_buf(),
+            runtime_dir: runtime.as_path().to_path_buf(),
+            daemon_launcher: Arc::new(SubprocessLauncher {
+                worktree_root: worktree.as_path().to_path_buf(),
+            }),
+        })
+    }
 }
 
 struct SubprocessLauncher {
@@ -484,9 +575,8 @@ impl crate::mcp::DaemonLauncher for SubprocessLauncher {
     }
 }
 
-fn cmd_daemon_start() -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
+fn cmd_daemon_start(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
+    let worktree = requested_worktree(project_root)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
     persistent.ensure_created()?;
     let runtime = ensure_runtime_dir(worktree.as_path())?;
@@ -610,6 +700,7 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
         })?;
 
     let worktree_root_for_handler = worktree.as_path().to_path_buf();
+    let worktree_root_for_lifecycle = worktree_root_for_handler.clone();
     let result: Result<(), DaemonError> = runtime_tokio.block_on(async move {
         let handler = Arc::new(WorktreeHandler::with_maintenance(
             indexes,
@@ -619,14 +710,14 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
             maintenance_tx,
             maintenance_gate,
         ));
-        let config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
+        let mut config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
+        config.lifecycle.worktree_root = Some(worktree_root_for_lifecycle);
+        config.lifecycle.persistent_root = Some(persistent.root_dir().to_path_buf());
         let handle = crate::daemon::start(config).await?;
         let socket_path = handle.socket_path().to_path_buf();
         eprintln!("daemon listening on {}", socket_path.display());
 
-        // The daemon is intentionally long-lived for the worktree. It exits
-        // only on SIGTERM/SIGINT, normally delivered by `xgraph daemon stop`.
-        if let Err(err) = wait_for_shutdown().await {
+        if let Err(err) = wait_for_shutdown(handle.shutdown_subscriber()).await {
             eprintln!("failed to install signal handler: {err}; shutting down");
         }
         handle.shutdown().await
@@ -641,12 +732,17 @@ fn cmd_daemon_start() -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn wait_for_shutdown() -> Result<(), std::io::Error> {
+async fn wait_for_shutdown(
+    mut daemon_shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
+        changed = daemon_shutdown.changed() => {
+            let _ = changed;
+        }
     }
     Ok(())
 }
@@ -765,9 +861,8 @@ fn stop_daemon(worktree: &Path, force: bool) -> Result<DaemonStopOutcome, CliErr
     }
 }
 
-fn cmd_daemon_stop(force: bool) -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
+fn cmd_daemon_stop(project_root: Option<&Path>, force: bool) -> Result<ExitCode, CliError> {
+    let worktree = requested_worktree(project_root)?;
     match stop_daemon(worktree.as_path(), force)? {
         DaemonStopOutcome::NotRunning => println!("no daemon running for this worktree"),
         DaemonStopOutcome::Stopped { pid, forced } => {
@@ -781,10 +876,10 @@ fn cmd_daemon_stop(force: bool) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_status() -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
+fn cmd_status(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
+    let worktree = requested_worktree(project_root)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
+    ensure_daemon_running(&worktree)?;
     let runtime = runtime_dir(worktree.as_path())?;
     let cozo_present = persistent.cozo_db_path().exists();
     let socket_path = runtime.socket_path();
@@ -826,52 +921,45 @@ fn cmd_status() -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_sync() -> Result<ExitCode, CliError> {
+fn cmd_sync(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
     // Sync is idempotent: every file is re-hashed and the hash-skip cache
     // (introduced in Phase P3) keeps untouched files from being re-extracted.
     // Drift between disk and the active manifest is healed by the same
     // pipeline as init.
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
+    let worktree = requested_worktree(project_root)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
-    if let Some(response) =
+    ensure_daemon_running(&worktree)?;
+    let Some(response) =
         send_daemon_request_if_reachable(&worktree, "sync", serde_json::json!({}))?
-    {
-        if print_daemon_error_if_any(&response) {
-            return Ok(ExitCode::FAILURE);
-        }
-        let result = response.get("result").unwrap_or(&response);
-        print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
-        return Ok(ExitCode::SUCCESS);
+    else {
+        eprintln!("xgraph: daemon unavailable after startup");
+        return Ok(ExitCode::FAILURE);
+    };
+    if print_daemon_error_if_any(&response) {
+        return Ok(ExitCode::FAILURE);
     }
-    init_at(&cwd)
+    let result = response.get("result").unwrap_or(&response);
+    print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
+    Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_reindex() -> Result<ExitCode, CliError> {
+fn cmd_reindex(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
     // Reindex truncates the graph relations and runs a full fresh scan.
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
+    let worktree = requested_worktree(project_root)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
-    if let Some(response) =
+    ensure_daemon_running(&worktree)?;
+    let Some(response) =
         send_daemon_request_if_reachable(&worktree, "reindex", serde_json::json!({}))?
-    {
-        if print_daemon_error_if_any(&response) {
-            return Ok(ExitCode::FAILURE);
-        }
-        let result = response.get("result").unwrap_or(&response);
-        print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
-        return Ok(ExitCode::SUCCESS);
+    else {
+        eprintln!("xgraph: daemon unavailable after startup");
+        return Ok(ExitCode::FAILURE);
+    };
+    if print_daemon_error_if_any(&response) {
+        return Ok(ExitCode::FAILURE);
     }
-
-    persistent.ensure_created()?;
-    let runtime = ensure_runtime_dir(worktree.as_path())?;
-    let _startup_guard =
-        acquire_startup_lock_with_retry(&runtime, std::time::Duration::from_secs(60))?;
-    ensure_no_running_daemon(worktree.as_path())?;
-    let store = CozoStore::open(&persistent.cozo_db_path())?;
-    store.truncate_graph()?;
-    drop(store);
-    init_at_locked(&worktree, &persistent)
+    let result = response.get("result").unwrap_or(&response);
+    print_daemon_index_summary(&worktree, result, persistent.root_dir())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Stop any daemon running for this worktree and wait for the process
@@ -1006,22 +1094,35 @@ fn is_lock_contention(err: &crate::cozo::CozoError) -> bool {
 /// The daemon is the source of truth — running a query via CLI is just a
 /// thin client over the same socket the MCP transport uses. No language
 /// extractors are loaded in this process; all the work happens daemon-side.
-fn cmd_send_query(method: &str, params: serde_json::Value) -> Result<ExitCode, CliError> {
-    let cwd = env::current_dir().map_err(CliError::Cwd)?;
-    let worktree = WorktreeRoot::discover(&cwd)?;
-    let Some(parsed) = send_daemon_request_if_reachable(&worktree, method, params)? else {
-        let runtime = runtime_dir(worktree.as_path())?;
-        eprintln!(
-            "xgraph: daemon socket not found at {}. Start the daemon with `xgraph daemon start`.",
-            runtime.socket_path().display()
-        );
-        return Ok(ExitCode::FAILURE);
+fn cmd_send_query(
+    project_root: Option<&Path>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<ExitCode, CliError> {
+    let worktree = requested_worktree(project_root)?;
+    ensure_daemon_running(&worktree)?;
+    let parsed = match send_daemon_request_if_reachable(&worktree, method, params.clone())? {
+        Some(parsed) => parsed,
+        None => {
+            ensure_daemon_running(&worktree)?;
+            let Some(parsed) = send_daemon_request_if_reachable(&worktree, method, params)? else {
+                let runtime = runtime_dir(worktree.as_path())?;
+                eprintln!(
+                    "xgraph: daemon socket not found at {} after startup.",
+                    runtime.socket_path().display()
+                );
+                return Ok(ExitCode::FAILURE);
+            };
+            parsed
+        }
     };
     if print_daemon_error_if_any(&parsed) {
         return Ok(ExitCode::FAILURE);
     }
     let pretty = serde_json::to_string_pretty(&parsed.get("result").unwrap_or(&parsed))
         .unwrap_or_else(|_| parsed.to_string());
+    println!("xgraph project: {}", worktree.as_path().display());
+    println!();
     println!("{pretty}");
     if let Some(meta) = parsed.get("meta")
         && let Some(catching_up) = meta.get("catching_up").and_then(|v| v.as_bool())
@@ -1030,6 +1131,69 @@ fn cmd_send_query(method: &str, params: serde_json::Value) -> Result<ExitCode, C
         eprintln!("note: daemon is catching up — result may be stale");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn ensure_daemon_running(worktree: &WorktreeRoot) -> Result<(), CliError> {
+    use std::time::{Duration, Instant};
+
+    let runtime = ensure_runtime_dir(worktree.as_path())?;
+    if socket_connects(&runtime.socket_path()) {
+        return Ok(());
+    }
+    let _startup_guard = acquire_startup_lock_with_retry(&runtime, Duration::from_secs(60))?;
+    if socket_connects(&runtime.socket_path()) {
+        return Ok(());
+    }
+    let _ = fs::remove_file(runtime.socket_path());
+    let _ = fs::remove_file(runtime.pid_file_path());
+    spawn_daemon_process(worktree)?;
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        if socket_connects(&runtime.socket_path()) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(CliError::Mcp(crate::mcp::McpError::StartupTimeout))
+}
+
+fn socket_connects(socket_path: &Path) -> bool {
+    socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
+fn spawn_daemon_process(worktree: &WorktreeRoot) -> Result<(), CliError> {
+    let exe_path = env::current_exe().map_err(|source| CliError::Io {
+        path: PathBuf::from("<current executable>"),
+        source,
+    })?;
+    let mut command = std::process::Command::new(exe_path);
+    command
+        .arg("--project-root")
+        .arg(worktree.as_path())
+        .arg("daemon")
+        .arg("start")
+        .current_dir(worktree.as_path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = command.spawn().map_err(|source| CliError::Io {
+        path: worktree.as_path().to_path_buf(),
+        source,
+    })?;
+    let _ = std::thread::Builder::new()
+        .name("xgraph-cli-daemon-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
 }
 
 fn send_daemon_request_if_reachable(
@@ -1293,6 +1457,14 @@ mod tests {
     #[test]
     fn parses_status_command() {
         let cli = parse(["xgraph", "status"]).expect("status should parse");
+        assert_eq!(cli.command, Command::Status);
+    }
+
+    #[test]
+    fn parses_project_root_global_flag() {
+        let cli = parse(["xgraph", "--project-root", "/tmp/project-a", "status"])
+            .expect("project root flag should parse");
+        assert_eq!(cli.project_root, Some(PathBuf::from("/tmp/project-a")));
         assert_eq!(cli.command, Command::Status);
     }
 

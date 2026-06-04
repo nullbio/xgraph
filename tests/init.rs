@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 use tempfile::TempDir;
-use xgraph::cli::init_at;
+use xgraph::cli::{init_at, reindex_at};
 use xgraph::cozo::CozoStore;
 use xgraph::indexes::{HotIndexes, NodeId};
 
@@ -516,12 +516,11 @@ fn blade_template_emits_extends_and_include_edges() {
     );
 }
 
-/// Deleting a file on disk and re-running init must remove its active rows
-/// from Cozo. Proxies the watcher's process_delete path via cmd_reindex
-/// (which truncates then re-indexes).
+/// Deleting a file on disk and reindexing must remove its active rows
+/// from Cozo. This proxies the watcher's process_delete path through the
+/// maintenance reindex path, which truncates then re-indexes.
 #[test]
 fn reindex_drops_facts_for_deleted_files() {
-    use std::env;
     let tmp = TempDir::new().expect("tempdir");
     init_git_repo(tmp.path());
     fs::write(tmp.path().join("kept.py"), "def kept_fn():\n    return 1\n").unwrap();
@@ -540,10 +539,8 @@ fn reindex_drops_facts_for_deleted_files() {
 
     // Delete one file, run reindex (which truncates first).
     fs::remove_file(tmp.path().join("gone.py")).unwrap();
-    let original = env::current_dir().expect("cwd");
-    env::set_current_dir(tmp.path()).unwrap();
-    let _ = xgraph::cli::run(["xgraph", "reindex"].into_iter().map(String::from));
-    env::set_current_dir(original).unwrap();
+    let exit = reindex_at(tmp.path()).expect("reindex");
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
 
     let store = CozoStore::open(&cozo_path).expect("reopen");
     let idx = HotIndexes::load_from_cozo(&store).expect("load2");

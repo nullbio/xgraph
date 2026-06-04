@@ -10,7 +10,7 @@ xgraph is a Linux-only, Rust-native successor to `codegraph` with these fixed de
 - Linux only.
 - Embedded CozoDB, not SQLite.
 - One database per Git worktree.
-- One long-lived daemon per worktree.
+- One on-demand, self-reaping daemon per worktree.
 - Many lightweight `xgraph mcp` proxy processes connect to that daemon.
 - Only Git projects are supported; projects without `.git` are ignored.
 - The database represents current files on disk, not a Git branch name.
@@ -28,6 +28,8 @@ Do not violate these without updating `README.md` and `IMPLEMENTATION_GUIDE.md` 
 - PID files are diagnostic only. Correct daemon ownership must use OS-level locks.
 - `startup.lock` prevents duplicate lazy starts.
 - `daemon.lock` is held for the daemon lifetime.
+- Daemons must exit after 15 minutes with no received commands and no in-flight command.
+- Daemons must exit when their worktree root or persistent xgraph store path disappears.
 - There must be exactly one writer queue per worktree daemon.
 - There must not be multiple watchers or parser pools for the same worktree.
 - MCP proxy processes must not parse source files or write Cozo directly.
@@ -133,6 +135,7 @@ Expected test coverage:
 - Unit tests for path resolution, hashing, manifest comparison, schema helpers, parser utilities, query builders, diff ranges, and language registry behavior.
 - Integration tests using temporary Git repositories for `init`, `mcp` lazy startup, daemon locks, branch checkout reconciliation, deletion handling, and crash recovery.
 - Concurrency tests for many MCP proxies sharing one daemon.
+- Lifecycle tests for idle timeout, in-flight command protection, deleted worktrees, stale sockets, and reconnect after daemon restart.
 - Parser fixtures for PHP, Blade/Laravel, TypeScript/JavaScript, and Python.
 - Incremental parsing tests that compare full parse extraction with incremental extraction for the same edit.
 

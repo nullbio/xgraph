@@ -9,6 +9,7 @@
 //! `Content-Length` framing can be added later without changing the
 //! orchestration logic in this module.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -115,47 +116,49 @@ pub trait DaemonLauncher: Send + Sync {
     fn spawn_daemon(&self) -> SpawnFuture<'_>;
 }
 
+#[derive(Clone)]
+pub struct DaemonEndpoint {
+    pub project_root: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub daemon_launcher: Arc<dyn DaemonLauncher>,
+}
+
+pub trait ProjectRouter: Send + Sync {
+    fn route(&self, project_root: &str) -> Result<DaemonEndpoint, McpError>;
+}
+
+#[derive(Clone)]
+struct StaticProjectRouter {
+    endpoint: DaemonEndpoint,
+}
+
+impl ProjectRouter for StaticProjectRouter {
+    fn route(&self, project_root: &str) -> Result<DaemonEndpoint, McpError> {
+        if project_root == self.endpoint.project_root.to_string_lossy() {
+            Ok(self.endpoint.clone())
+        } else {
+            Err(McpError::Unavailable(format!(
+                "xgraph MCP has no daemon route for project root {project_root}"
+            )))
+        }
+    }
+}
+
+struct UnavailableProjectRouter {
+    reason: String,
+}
+
+impl ProjectRouter for UnavailableProjectRouter {
+    fn route(&self, _project_root: &str) -> Result<DaemonEndpoint, McpError> {
+        Err(McpError::Unavailable(self.reason.clone()))
+    }
+}
+
 /// Configuration for an `McpProxy` invocation.
 #[derive(Clone)]
 pub struct McpConfig {
-    daemon: DaemonConnection,
-}
-
-#[derive(Clone)]
-enum DaemonConnection {
-    Worktree {
-        runtime_dir: PathBuf,
-        socket_name: &'static str,
-        daemon_launcher: Arc<dyn DaemonLauncher>,
-    },
-    Unavailable {
-        reason: String,
-    },
-}
-
-impl DaemonConnection {
-    fn runtime_dir(&self) -> Result<&Path, McpError> {
-        match self {
-            Self::Worktree { runtime_dir, .. } => Ok(runtime_dir.as_path()),
-            Self::Unavailable { reason } => Err(McpError::Unavailable(reason.clone())),
-        }
-    }
-
-    fn socket_name(&self) -> Result<&'static str, McpError> {
-        match self {
-            Self::Worktree { socket_name, .. } => Ok(socket_name),
-            Self::Unavailable { reason } => Err(McpError::Unavailable(reason.clone())),
-        }
-    }
-
-    fn daemon_launcher(&self) -> Result<&Arc<dyn DaemonLauncher>, McpError> {
-        match self {
-            Self::Worktree {
-                daemon_launcher, ..
-            } => Ok(daemon_launcher),
-            Self::Unavailable { reason } => Err(McpError::Unavailable(reason.clone())),
-        }
-    }
+    router: Arc<dyn ProjectRouter>,
+    default_endpoint: Option<DaemonEndpoint>,
 }
 
 pub struct DaemonConnectionState {
@@ -187,33 +190,43 @@ impl DaemonConnectionState {
 
 impl McpConfig {
     pub fn new(runtime_dir: PathBuf, daemon_launcher: Arc<dyn DaemonLauncher>) -> Self {
+        let endpoint = DaemonEndpoint {
+            project_root: runtime_dir.clone(),
+            runtime_dir,
+            daemon_launcher,
+        };
         Self {
-            daemon: DaemonConnection::Worktree {
-                runtime_dir,
-                socket_name: DEFAULT_SOCKET_NAME,
-                daemon_launcher,
-            },
+            router: Arc::new(StaticProjectRouter {
+                endpoint: endpoint.clone(),
+            }),
+            default_endpoint: Some(endpoint),
+        }
+    }
+
+    pub fn with_router(router: Arc<dyn ProjectRouter>) -> Self {
+        Self {
+            router,
+            default_endpoint: None,
         }
     }
 
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
-            daemon: DaemonConnection::Unavailable {
+            router: Arc::new(UnavailableProjectRouter {
                 reason: reason.into(),
-            },
+            }),
+            default_endpoint: None,
         }
     }
 
-    pub fn socket_path(&self) -> Result<PathBuf, McpError> {
-        Ok(self.daemon.runtime_dir()?.join(self.daemon.socket_name()?))
+    fn route(&self, project_root: &str) -> Result<DaemonEndpoint, McpError> {
+        self.router.route(project_root)
     }
 
-    pub fn startup_lock_path(&self) -> Result<PathBuf, McpError> {
-        Ok(self.daemon.runtime_dir()?.join(STARTUP_LOCK_NAME))
-    }
-
-    pub fn pid_path(&self) -> Result<PathBuf, McpError> {
-        Ok(self.daemon.runtime_dir()?.join(PID_FILE_NAME))
+    fn default_endpoint(&self) -> Result<DaemonEndpoint, McpError> {
+        self.default_endpoint.clone().ok_or_else(|| {
+            McpError::Unavailable("xgraph request did not specify project_root".to_string())
+        })
     }
 }
 
@@ -229,14 +242,23 @@ impl McpProxy {
 
     /// Connect to the daemon, starting it lazily if necessary.
     pub async fn connect(&self) -> Result<UnixStream, McpError> {
-        ensure_runtime_dir(self.config.daemon.runtime_dir()?)?;
-        let socket_path = self.config.socket_path()?;
+        let endpoint = self.config.default_endpoint()?;
+        self.connect_endpoint(&endpoint).await
+    }
 
+    pub async fn connect_for_project(&self, project_root: &str) -> Result<UnixStream, McpError> {
+        let endpoint = self.config.route(project_root)?;
+        self.connect_endpoint(&endpoint).await
+    }
+
+    async fn connect_endpoint(&self, endpoint: &DaemonEndpoint) -> Result<UnixStream, McpError> {
+        ensure_runtime_dir(&endpoint.runtime_dir)?;
+        let socket_path = socket_path(endpoint);
         if let Some(stream) = try_ping(&socket_path).await {
             return Ok(stream);
         }
 
-        let lock_path = self.config.startup_lock_path()?;
+        let lock_path = startup_lock_path(endpoint);
         match StartupLockGuard::try_acquire(&lock_path)? {
             Some(_guard) => {
                 if let Some(stream) = try_ping(&socket_path).await {
@@ -244,9 +266,9 @@ impl McpProxy {
                 }
 
                 remove_if_exists(&socket_path)?;
-                remove_if_exists(&self.config.pid_path()?)?;
+                remove_if_exists(&pid_path(endpoint))?;
 
-                self.config.daemon.daemon_launcher()?.spawn_daemon().await?;
+                endpoint.daemon_launcher.spawn_daemon().await?;
                 wait_for_socket(&socket_path, DAEMON_STARTUP_TIMEOUT).await
             }
             None => wait_for_socket(&socket_path, DAEMON_STARTUP_TIMEOUT).await,
@@ -267,10 +289,10 @@ impl McpProxy {
     {
         let mut stdin = BufReader::new(stdin);
         let mut stdout = stdout;
-        let mut daemon: Option<DaemonConnectionState> = None;
+        let mut daemons: HashMap<PathBuf, DaemonConnectionState> = HashMap::new();
         loop {
             let Some(message) = read_client_message(&mut stdin).await? else {
-                if let Some(mut daemon) = daemon.take() {
+                for (_project, mut daemon) in daemons {
                     let _ = daemon.writer.shutdown().await;
                 }
                 return Ok(());
@@ -289,9 +311,16 @@ impl McpProxy {
                     line,
                     wrap_in_mcp,
                     tool,
+                    project_root,
                 } => {
                     let out_line = self
-                        .forward_with_reconnect(&line, wrap_in_mcp, tool.as_ref(), &mut daemon)
+                        .forward_with_reconnect(
+                            &line,
+                            wrap_in_mcp,
+                            tool.as_ref(),
+                            project_root.as_deref(),
+                            &mut daemons,
+                        )
                         .await;
                     write_client_message(&mut stdout, &out_line, message.framing).await?;
                 }
@@ -304,12 +333,40 @@ impl McpProxy {
         line: &str,
         wrap_in_mcp: bool,
         tool: Option<&crate::mcp_protocol::ToolCall>,
-        daemon: &mut Option<DaemonConnectionState>,
+        project_root: Option<&str>,
+        daemons: &mut HashMap<PathBuf, DaemonConnectionState>,
     ) -> String {
+        let endpoint = match project_root {
+            Some(root) => match self.config.route(root) {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    return crate::mcp_protocol::shape_forward_error(
+                        line,
+                        wrap_in_mcp,
+                        tool,
+                        &err.to_string(),
+                    );
+                }
+            },
+            None => match self.config.default_endpoint() {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    return crate::mcp_protocol::shape_forward_error(
+                        line,
+                        wrap_in_mcp,
+                        tool,
+                        &err.to_string(),
+                    );
+                }
+            },
+        };
+        let key = endpoint.project_root.clone();
         for attempt in 0..=1 {
-            if daemon.is_none() {
-                match self.connect().await {
-                    Ok(stream) => *daemon = Some(DaemonConnectionState::new(stream)),
+            if !daemons.contains_key(&key) {
+                match self.connect_endpoint(&endpoint).await {
+                    Ok(stream) => {
+                        daemons.insert(key.clone(), DaemonConnectionState::new(stream));
+                    }
                     Err(err) => {
                         return crate::mcp_protocol::shape_forward_error(
                             line,
@@ -321,14 +378,14 @@ impl McpProxy {
                 }
             }
 
-            let Some(state) = daemon.as_mut() else {
+            let Some(state) = daemons.get_mut(&key) else {
                 continue;
             };
             match forward_once(state, line, wrap_in_mcp, tool).await {
                 Ok(out_line) => return out_line,
                 Err(err) => {
                     eprintln!("xgraph mcp: daemon socket error: {err}");
-                    *daemon = None;
+                    daemons.remove(&key);
                     if attempt == 0 {
                         continue;
                     }
@@ -348,6 +405,18 @@ impl McpProxy {
             "daemon socket unavailable",
         )
     }
+}
+
+fn socket_path(endpoint: &DaemonEndpoint) -> PathBuf {
+    endpoint.runtime_dir.join(DEFAULT_SOCKET_NAME)
+}
+
+fn startup_lock_path(endpoint: &DaemonEndpoint) -> PathBuf {
+    endpoint.runtime_dir.join(STARTUP_LOCK_NAME)
+}
+
+fn pid_path(endpoint: &DaemonEndpoint) -> PathBuf {
+    endpoint.runtime_dir.join(PID_FILE_NAME)
 }
 
 /// Top-level entry point invoked by the CLI.
@@ -561,6 +630,7 @@ async fn forward_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -648,6 +718,68 @@ mod tests {
         }
     }
 
+    struct FilesDaemon {
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl FilesDaemon {
+        async fn bind(socket_path: &Path, file_name: &'static str) -> Self {
+            let listener = UnixListener::bind(socket_path).expect("bind listener");
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(serve_files(stream, file_name));
+                }
+            });
+            Self { handle }
+        }
+
+        fn abort(self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn serve_files(stream: UnixStream, file_name: &'static str) {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let id = serde_json::from_str::<serde_json::Value>(line.trim())
+                .ok()
+                .and_then(|value| value.get("id").cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "files": [file_name],
+                    "total": 1,
+                    "offset": 0,
+                    "limit": 1
+                },
+                "meta": {
+                    "catching_up": false,
+                    "rss_bytes": 1024,
+                    "pending_paths": 0,
+                    "warnings": []
+                }
+            });
+            writer
+                .write_all(payload.to_string().as_bytes())
+                .await
+                .expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+            writer.flush().await.expect("flush response");
+        }
+    }
+
     struct NoopLauncher;
 
     impl DaemonLauncher for NoopLauncher {
@@ -692,6 +824,50 @@ mod tests {
                 let daemon = EchoDaemon::bind(&socket_path).await;
                 *self.daemon.lock().await = Some(daemon);
                 Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticRouter {
+        endpoints: HashMap<String, DaemonEndpoint>,
+    }
+
+    impl StaticRouter {
+        fn single(
+            project_root: PathBuf,
+            runtime_dir: PathBuf,
+            launcher: Arc<dyn DaemonLauncher>,
+        ) -> Self {
+            let endpoint = DaemonEndpoint {
+                project_root: project_root.clone(),
+                runtime_dir,
+                daemon_launcher: launcher,
+            };
+            Self {
+                endpoints: HashMap::from([(project_root.to_string_lossy().into_owned(), endpoint)]),
+            }
+        }
+
+        fn with(endpoints: Vec<DaemonEndpoint>) -> Self {
+            Self {
+                endpoints: endpoints
+                    .into_iter()
+                    .map(|endpoint| {
+                        (
+                            endpoint.project_root.to_string_lossy().into_owned(),
+                            endpoint,
+                        )
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl ProjectRouter for StaticRouter {
+        fn route(&self, project_root: &str) -> Result<DaemonEndpoint, McpError> {
+            self.endpoints.get(project_root).cloned().ok_or_else(|| {
+                McpError::Unavailable(format!("unknown test project root: {project_root}"))
             })
         }
     }
@@ -808,6 +984,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_calls_route_to_each_project_root() {
+        let project_a = TempDir::new("project-a");
+        let runtime_a = TempDir::new("runtime-a");
+        let socket_a = runtime_a.path.join(DEFAULT_SOCKET_NAME);
+        let daemon_a = FilesDaemon::bind(&socket_a, "a.php").await;
+        let project_b = TempDir::new("project-b");
+        let runtime_b = TempDir::new("runtime-b");
+        let socket_b = runtime_b.path.join(DEFAULT_SOCKET_NAME);
+        let daemon_b = FilesDaemon::bind(&socket_b, "b.php").await;
+
+        let router = StaticRouter::with(vec![
+            DaemonEndpoint {
+                project_root: project_a.path.clone(),
+                runtime_dir: runtime_a.path.clone(),
+                daemon_launcher: Arc::new(NoopLauncher),
+            },
+            DaemonEndpoint {
+                project_root: project_b.path.clone(),
+                runtime_dir: runtime_b.path.clone(),
+                daemon_launcher: Arc::new(NoopLauncher),
+            },
+        ]);
+        let proxy = McpProxy::new(McpConfig::with_router(Arc::new(router)));
+
+        let (stdin_writer, stdin_reader) = duplex(8192);
+        let (stdout_writer, mut stdout_reader) = duplex(8192);
+        let proxy_task =
+            tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
+        let mut stdin_writer = stdin_writer;
+
+        let request_a = format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{{"name":"files","arguments":{{"project_root":"{}"}}}}}}"#,
+            project_a.path.display()
+        );
+        stdin_writer.write_all(request_a.as_bytes()).await.unwrap();
+        stdin_writer.write_all(b"\n").await.unwrap();
+        let request_b = format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{{"name":"files","arguments":{{"project_root":"{}"}}}}}}"#,
+            project_b.path.display()
+        );
+        stdin_writer.write_all(request_b.as_bytes()).await.unwrap();
+        stdin_writer.write_all(b"\n").await.unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stdout_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let first_text = first["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(first_text.contains(&format!("xgraph project: {}", project_a.path.display())));
+        assert!(first_text.contains("- a.php"));
+
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let second_text = second["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(second_text.contains(&format!("xgraph project: {}", project_b.path.display())));
+        assert!(second_text.contains("- b.php"));
+
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        daemon_a.abort();
+        daemon_b.abort();
+    }
+
+    #[tokio::test]
     async fn concurrent_proxies_spawn_daemon_once() {
         let dir = TempDir::new("once");
         let socket_path = dir.path.join(DEFAULT_SOCKET_NAME);
@@ -913,6 +1165,67 @@ mod tests {
         }
     }
 
+    struct OneShotFilesLauncher {
+        socket_path: PathBuf,
+        daemon: tokio::sync::Mutex<Option<FilesDaemon>>,
+    }
+
+    impl DaemonLauncher for OneShotFilesLauncher {
+        fn spawn_daemon(&self) -> SpawnFuture<'_> {
+            let socket_path = self.socket_path.clone();
+            Box::pin(async move {
+                let _ = std::fs::remove_file(&socket_path);
+                let daemon = FilesDaemon::bind(&socket_path, "fresh.php").await;
+                *self.daemon.lock().await = Some(daemon);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_reconnects_to_project_daemon_after_cached_socket_closes() {
+        let project = TempDir::new("reconnect-project");
+        let runtime = TempDir::new("reconnect-runtime");
+        let socket_path = runtime.path.join(DEFAULT_SOCKET_NAME);
+        let _closing_daemon = bind_close_after_accept(&socket_path).await;
+        let launcher: Arc<dyn DaemonLauncher> = Arc::new(OneShotFilesLauncher {
+            socket_path: socket_path.clone(),
+            daemon: tokio::sync::Mutex::new(None),
+        });
+        let router = StaticRouter::single(project.path.clone(), runtime.path.clone(), launcher);
+        let proxy = McpProxy::new(McpConfig::with_router(Arc::new(router)));
+
+        let (stdin_writer, stdin_reader) = duplex(8192);
+        let (stdout_writer, mut stdout_reader) = duplex(8192);
+        let proxy_task =
+            tokio::spawn(async move { proxy.proxy(stdin_reader, stdout_writer).await });
+        let mut stdin_writer = stdin_writer;
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{{"name":"files","arguments":{{"project_root":"{}"}}}}}}"#,
+            project.path.display()
+        );
+        stdin_writer.write_all(request.as_bytes()).await.unwrap();
+        stdin_writer.write_all(b"\n").await.unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stdout_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("- fresh.php"), "got: {text}");
+
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     /// End-to-end MCP handshake: the proxy must answer `initialize`
     /// locally (without round-tripping to the daemon), then answer
     /// `tools/list`, and finally forward `tools/call` to the daemon
@@ -969,10 +1282,12 @@ mod tests {
 
         // 3) tools/call → forwarded to daemon, daemon echoes back with
         //    echo_id, proxy wraps in MCP content shape.
-        stdin_writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"find_symbol\",\"arguments\":{\"name\":\"User\"}}}\n")
-            .await
-            .unwrap();
+        let tool_call = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"find_symbol","arguments":{{"project_root":"{}","name":"User"}}}}}}"#,
+            dir.path.display()
+        );
+        stdin_writer.write_all(tool_call.as_bytes()).await.unwrap();
+        stdin_writer.write_all(b"\n").await.unwrap();
         stdin_writer.flush().await.unwrap();
         line.clear();
         timeout(Duration::from_secs(2), reader.read_line(&mut line))
@@ -1096,7 +1411,7 @@ mod tests {
             .await
             .unwrap();
         stdin_writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"project_root\":\"/tmp/project-a\"}}}\n")
             .await
             .unwrap();
         stdin_writer.flush().await.unwrap();

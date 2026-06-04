@@ -39,6 +39,13 @@ pub fn render_tool_result(tool: &str, args: &Value, result: &Value, meta: &Value
         "sync" | "reindex" => render_maintenance(result),
         other => render_unknown(other, result),
     };
+    let body = match args["project_root"]
+        .as_str()
+        .filter(|root| !root.is_empty())
+    {
+        Some(root) => format!("xgraph project: {root}\n\n{body}"),
+        None => body,
+    };
     let footer = render_index_state(meta);
     if footer.is_empty() {
         body
@@ -1172,7 +1179,13 @@ mod tests {
             "pending_paths": 0,
             "reconcile_done": true,
         });
-        let out = render_tool_result("status", &json!({}), &result, &meta_current());
+        let out = render_tool_result(
+            "status",
+            &json!({"project_root": "/home/pat/projects/xrai"}),
+            &result,
+            &meta_current(),
+        );
+        assert!(out.starts_with("xgraph project: /home/pat/projects/xrai"));
         assert!(out.contains("## xgraph Status"));
         assert!(out.contains("Ready: yes."));
         assert!(out.contains("│ Files"));

@@ -30,7 +30,7 @@ use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
 use crate::cozo::CozoStore;
-use crate::daemon::ConnectionHandler;
+use crate::daemon::{ActivityTracker, ConnectionHandler};
 use crate::daemon_status::{DaemonStatus, RSS_WARNING_THRESHOLD_BYTES};
 use crate::indexes::{HotIndexes, NodeId, SearchMode, SearchQuery, SymbolKey};
 use crate::owner::{IndexSummary, MaintenanceCommand, MaintenanceSender};
@@ -831,7 +831,7 @@ impl WorktreeHandler {
 }
 
 impl ConnectionHandler for WorktreeHandler {
-    fn handle(&self, conn: UnixStream) -> JoinHandle<()> {
+    fn handle(&self, conn: UnixStream, activity: ActivityTracker) -> JoinHandle<()> {
         let indexes = Arc::clone(&self.indexes);
         let status = Arc::clone(&self.status);
         let worktree_root = self.worktree_root.clone();
@@ -847,7 +847,7 @@ impl ConnectionHandler for WorktreeHandler {
                 maintenance,
                 maintenance_gate,
             };
-            let _ = serve_connection(&handler, conn).await;
+            let _ = serve_connection(&handler, conn, activity).await;
         })
     }
 }
@@ -858,7 +858,11 @@ enum MaintenanceOp {
     Reindex,
 }
 
-async fn serve_connection(handler: &WorktreeHandler, conn: UnixStream) -> std::io::Result<()> {
+async fn serve_connection(
+    handler: &WorktreeHandler,
+    conn: UnixStream,
+    activity: ActivityTracker,
+) -> std::io::Result<()> {
     let (read_half, mut write_half) = conn.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -872,6 +876,7 @@ async fn serve_connection(handler: &WorktreeHandler, conn: UnixStream) -> std::i
         if trimmed.is_empty() {
             continue;
         }
+        let _request_activity = activity.begin_request();
         let response = match serde_json::from_str::<Request>(trimmed) {
             Ok(req) => match handler.dispatch(&req) {
                 Ok((result, catching_up)) => json!({
@@ -1381,7 +1386,9 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (conn, _) = listener.accept().await.unwrap();
-            serve_connection(&handler, conn).await.unwrap();
+            serve_connection(&handler, conn, ActivityTracker::new())
+                .await
+                .unwrap();
         });
 
         let client = UnixStream::connect(&socket_path).await.unwrap();

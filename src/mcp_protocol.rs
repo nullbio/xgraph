@@ -49,10 +49,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "name": { "type": "string", "description": "Exact symbol name to find" },
                 "kind": { "type": "string", "description": "Optional symbol kind filter (class, function, method, ...)" }
             },
-            "required": ["name"]
+            "required": ["project_root", "name"]
         }"#,
     },
     ToolDef {
@@ -61,13 +62,14 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "name": { "type": "string", "description": "Search needle" },
                 "mode": { "type": "string", "enum": ["exact", "prefix", "contains"], "description": "Match mode (default: exact)" },
                 "kind": { "type": "string", "description": "Optional symbol kind filter" },
                 "path_prefix": { "type": "string", "description": "Optional path-prefix filter" },
                 "limit": { "type": "integer", "description": "Hard cap on hits (default 64, max 1024)" }
             },
-            "required": ["name"]
+            "required": ["project_root", "name"]
         }"#,
     },
     ToolDef {
@@ -76,11 +78,12 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "node_id": { "type": "string", "description": "Target node id" },
                 "limit": { "type": "integer", "description": "Maximum callers to return (default 200, max 1000)" },
                 "offset": { "type": "integer", "description": "Number of callers to skip" }
             },
-            "required": ["node_id"]
+            "required": ["project_root", "node_id"]
         }"#,
     },
     ToolDef {
@@ -89,11 +92,12 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "node_id": { "type": "string", "description": "Source node id" },
                 "limit": { "type": "integer", "description": "Maximum callees to return (default 200, max 1000)" },
                 "offset": { "type": "integer", "description": "Number of callees to skip" }
             },
-            "required": ["node_id"]
+            "required": ["project_root", "node_id"]
         }"#,
     },
     ToolDef {
@@ -102,9 +106,10 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "path": { "type": "string", "description": "Worktree-relative file path" }
             },
-            "required": ["path"]
+            "required": ["project_root", "path"]
         }"#,
     },
     ToolDef {
@@ -113,11 +118,12 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "node_id": { "type": "string", "description": "Node id to fetch" },
                 "related_limit": { "type": "integer", "description": "Maximum caller/callee summaries to include (default 20, max 200)" },
                 "snippet_bytes": { "type": "integer", "description": "Source snippet byte cap (default 4096, max 16384)" }
             },
-            "required": ["node_id"]
+            "required": ["project_root", "node_id"]
         }"#,
     },
     ToolDef {
@@ -126,16 +132,25 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "prefix": { "type": "string", "description": "Optional path prefix such as app/Services" },
                 "limit": { "type": "integer", "description": "Maximum paths to return" },
                 "offset": { "type": "integer", "description": "Number of matching paths to skip" }
-            }
+            },
+            "required": ["project_root"]
         }"#,
     },
     ToolDef {
         name: "status",
         description: "Graph health stats: file/node/symbol/call-edge counts, daemon RSS, pending paths, reconcile state.",
-        input_schema: r#"{ "type": "object", "properties": {}, "additionalProperties": false }"#,
+        input_schema: r#"{
+            "type": "object",
+            "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" }
+            },
+            "required": ["project_root"],
+            "additionalProperties": false
+        }"#,
     },
     ToolDef {
         name: "impact",
@@ -143,12 +158,13 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "node_id": { "type": "string", "description": "Target whose impact is being asked about" },
                 "max_depth": { "type": "integer", "description": "Optional bound on transitive depth (0 = unbounded)" },
                 "limit": { "type": "integer", "description": "Maximum affected nodes to return (default 500, max 5000)" },
                 "offset": { "type": "integer", "description": "Number of affected nodes to skip" }
             },
-            "required": ["node_id"]
+            "required": ["project_root", "node_id"]
         }"#,
     },
     ToolDef {
@@ -157,6 +173,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "name": { "type": "string", "description": "Symbol name to look up" },
                 "mode": { "type": "string", "enum": ["exact", "prefix", "contains"], "description": "Match mode (default: exact)" },
                 "kind": { "type": "string", "description": "Optional kind filter" },
@@ -165,7 +182,7 @@ pub const TOOLS: &[ToolDef] = &[
                 "related_limit": { "type": "integer", "description": "Cap on callers/callees per direction (default 20, max 200)" },
                 "snippet_bytes": { "type": "integer", "description": "Source snippet byte cap (default 2048, max 8192)" }
             },
-            "required": ["name"]
+            "required": ["project_root", "name"]
         }"#,
     },
     ToolDef {
@@ -174,12 +191,13 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "node_ids": { "type": "array", "items": { "type": "string" }, "description": "Node ids to expand" },
                 "byte_budget": { "type": "integer", "description": "Total byte budget across all snippets (default 32 KiB, max 128 KiB)" },
                 "per_snippet_bytes": { "type": "integer", "description": "Per-snippet cap (default 4 KiB, max 16 KiB)" },
                 "related_limit": { "type": "integer", "description": "Maximum caller/callee summaries per item (default 0, max 50)" }
             },
-            "required": ["node_ids"]
+            "required": ["project_root", "node_ids"]
         }"#,
     },
     ToolDef {
@@ -188,11 +206,12 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
+                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
                 "from": { "type": "string", "description": "Source node id" },
                 "to": { "type": "string", "description": "Target node id" },
                 "max_depth": { "type": "integer", "description": "Hard bound on BFS depth (default 12, max 64)" }
             },
-            "required": ["from", "to"]
+            "required": ["project_root", "from", "to"]
         }"#,
     },
 ];
@@ -382,6 +401,7 @@ pub enum Action {
         line: String,
         wrap_in_mcp: bool,
         tool: Option<ToolCall>,
+        project_root: Option<String>,
     },
     /// The message wasn't valid JSON-RPC at all. Retained for callers
     /// that choose to ignore a message explicitly; protocol parse failures
@@ -494,6 +514,22 @@ pub fn classify_request(raw_line: &str) -> Action {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let Some(project_root) = arguments
+                .get("project_root")
+                .and_then(|root| root.as_str())
+                .map(str::to_string)
+            else {
+                let id = parsed.id.unwrap_or(Value::Null);
+                return Action::LocalReply(build_error_line(
+                    id,
+                    -32602,
+                    "tools/call arguments require a string `project_root`",
+                ));
+            };
+            let mut forwarded_arguments = arguments.clone();
+            if let Some(obj) = forwarded_arguments.as_object_mut() {
+                obj.remove("project_root");
+            }
             let id = parsed.id.unwrap_or(Value::Null);
             // Forward to the daemon under the tool's native method name
             // (e.g. `tools/call` { name: "search", ... } becomes a raw
@@ -502,7 +538,7 @@ pub fn classify_request(raw_line: &str) -> Action {
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": name,
-                "params": arguments,
+                "params": forwarded_arguments,
             }))
             .expect("forward payload is always serializable");
             forwarded.push('\n');
@@ -513,6 +549,7 @@ pub fn classify_request(raw_line: &str) -> Action {
                     name: name.to_string(),
                     arguments,
                 }),
+                project_root: Some(project_root),
             }
         }
         // ------------------------------------------------------------
@@ -528,6 +565,7 @@ pub fn classify_request(raw_line: &str) -> Action {
                 line,
                 wrap_in_mcp: false,
                 tool: None,
+                project_root: None,
             }
         }
     }
@@ -635,39 +673,66 @@ mod tests {
     #[test]
     fn tools_call_translates_to_native_method() {
         let action = classify_request(
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"name":"User","mode":"prefix"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"project_root":"/tmp/project-a","name":"User","mode":"prefix"}}}"#,
         );
         let Action::Forward {
             line,
             wrap_in_mcp,
             tool,
+            project_root,
         } = action
         else {
             panic!("expected Forward");
         };
         assert!(wrap_in_mcp);
+        assert_eq!(project_root.as_deref(), Some("/tmp/project-a"));
         let tool = tool.expect("tools/call should carry tool context");
         assert_eq!(tool.name, "search");
+        assert_eq!(tool.arguments["project_root"], "/tmp/project-a");
         assert_eq!(tool.arguments["name"], "User");
         assert_eq!(tool.arguments["mode"], "prefix");
         let forwarded: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(forwarded["method"], "search");
         assert_eq!(forwarded["id"], 3);
+        assert!(forwarded["params"].get("project_root").is_none());
         assert_eq!(forwarded["params"]["name"], "User");
         assert_eq!(forwarded["params"]["mode"], "prefix");
+    }
+
+    #[test]
+    fn tools_call_requires_project_root() {
+        let action = classify_request(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"name":"User","mode":"prefix"}}}"#,
+        );
+        let Action::LocalReply(line) = action else {
+            panic!("expected LocalReply error");
+        };
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("project_root")
+        );
     }
 
     #[test]
     fn legacy_passthrough_carries_no_tool_context() {
         let action = classify_request(r#"{"jsonrpc":"2.0","id":1,"method":"search","params":{}}"#);
         let Action::Forward {
-            tool, wrap_in_mcp, ..
+            tool,
+            wrap_in_mcp,
+            project_root,
+            ..
         } = action
         else {
             panic!("expected Forward");
         };
         assert!(!wrap_in_mcp);
         assert!(tool.is_none());
+        assert!(project_root.is_none());
     }
 
     #[test]
@@ -724,7 +789,7 @@ mod tests {
     fn search_tool_call() -> ToolCall {
         ToolCall {
             name: "search".to_string(),
-            arguments: json!({"name": "User", "mode": "exact"}),
+            arguments: json!({"project_root": "/tmp/project-a", "name": "User", "mode": "exact"}),
         }
     }
 
@@ -737,6 +802,7 @@ mod tests {
         assert_eq!(v["id"], 5);
         assert_eq!(v["result"]["isError"], false);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("xgraph project: /tmp/project-a"));
         assert!(text.contains("## Search: User"));
         assert!(text.contains("App\\Models\\User"));
         assert!(text.contains("abc:1"));
