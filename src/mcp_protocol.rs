@@ -49,7 +49,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "name": { "type": "string", "description": "Exact symbol name to find" },
                 "kind": { "type": "string", "description": "Optional symbol kind filter (class, function, method, ...)" }
             },
@@ -62,7 +62,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "name": { "type": "string", "description": "Search needle" },
                 "mode": { "type": "string", "enum": ["exact", "prefix", "contains"], "description": "Match mode (default: exact)" },
                 "kind": { "type": "string", "description": "Optional symbol kind filter" },
@@ -78,7 +78,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "node_id": { "type": "string", "description": "Target node id" },
                 "limit": { "type": "integer", "description": "Maximum callers to return (default 200, max 1000)" },
                 "offset": { "type": "integer", "description": "Number of callers to skip" }
@@ -92,7 +92,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "node_id": { "type": "string", "description": "Source node id" },
                 "limit": { "type": "integer", "description": "Maximum callees to return (default 200, max 1000)" },
                 "offset": { "type": "integer", "description": "Number of callees to skip" }
@@ -106,7 +106,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "path": { "type": "string", "description": "Worktree-relative file path" }
             },
             "required": ["project_root", "path"]
@@ -118,7 +118,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "node_id": { "type": "string", "description": "Node id to fetch" },
                 "related_limit": { "type": "integer", "description": "Maximum caller/callee summaries to include (default 20, max 200)" },
                 "snippet_bytes": { "type": "integer", "description": "Source snippet byte cap (default 4096, max 16384)" }
@@ -132,7 +132,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "prefix": { "type": "string", "description": "Optional path prefix such as app/Services" },
                 "limit": { "type": "integer", "description": "Maximum paths to return" },
                 "offset": { "type": "integer", "description": "Number of matching paths to skip" }
@@ -146,7 +146,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" }
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" }
             },
             "required": ["project_root"],
             "additionalProperties": false
@@ -158,7 +158,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "node_id": { "type": "string", "description": "Target whose impact is being asked about" },
                 "max_depth": { "type": "integer", "description": "Optional bound on transitive depth (0 = unbounded)" },
                 "limit": { "type": "integer", "description": "Maximum affected nodes to return (default 500, max 5000)" },
@@ -173,7 +173,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "name": { "type": "string", "description": "Symbol name to look up" },
                 "mode": { "type": "string", "enum": ["exact", "prefix", "contains"], "description": "Match mode (default: exact)" },
                 "kind": { "type": "string", "description": "Optional kind filter" },
@@ -191,7 +191,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "node_ids": { "type": "array", "items": { "type": "string" }, "description": "Node ids to expand" },
                 "byte_budget": { "type": "integer", "description": "Total byte budget across all snippets (default 32 KiB, max 128 KiB)" },
                 "per_snippet_bytes": { "type": "integer", "description": "Per-snippet cap (default 4 KiB, max 16 KiB)" },
@@ -206,7 +206,7 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{
             "type": "object",
             "properties": {
-                "project_root": { "type": "string", "description": "Absolute or resolvable path inside the Git worktree to query" },
+                "project_root": { "type": "string", "description": "Path inside the target Git worktree; the MCP proxy uses it to route this call to that worktree daemon" },
                 "from": { "type": "string", "description": "Source node id" },
                 "to": { "type": "string", "description": "Target node id" },
                 "max_depth": { "type": "integer", "description": "Hard bound on BFS depth (default 12, max 64)" }

@@ -5,7 +5,7 @@ xgraph indexes your repo into an embedded [CozoDB](https://docs.cozodb.org/en/la
 graph, keeps it fresh through an on-demand daemon, and serves fast structural
 queries — symbols, callers, callees, impact, traces — over MCP.
 
-Linux only. PHP, Laravel/Blade, TypeScript, JavaScript, TSX, and Python.
+Linux only. PHP, Laravel/Blade, TypeScript, JavaScript, TSX, Python, Go, and Rust.
 
 > Inspired by [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph),
 > with a different runtime model: one daemon per worktree owns watching, parsing,
@@ -19,9 +19,22 @@ cd xgraph
 ./install.sh
 ```
 
-`install.sh` wraps `cargo install --git . --force` and sets the compiler flag
-needed by Cozo/RocksDB on GCC 13+. Re-run any time to upgrade to latest
-`master`.
+`install.sh` wraps
+`cargo install --git https://github.com/nullbio/xgraph --force` and sets the
+compiler flag needed by Cozo/RocksDB on GCC 13+. Re-run any time to upgrade to
+latest `master`.
+
+To also install or update the global xgraph agent skill:
+
+```bash
+./install.sh --skills
+```
+
+Before running `--skills`, diff the installed skill against this repository's
+`skills/xgraph` copy. The flag overwrites `~/.agents/skills/xgraph` and
+refreshes `~/.claude/skills/xgraph`, so do not use it when the installed skill
+has local changes you may want to keep. Review those differences with the user
+first.
 
 Direct install with Cargo:
 
@@ -44,12 +57,16 @@ query.
 
 ## Features
 
-- Cross-file linking across PHP, Blade, TypeScript, JavaScript, TSX, and Python.
+- Cross-file linking across PHP, Blade, TypeScript, JavaScript, TSX, Python, Go, and Rust.
 - **Laravel resolution**: routes, Eloquent relationships, facades, container
   bindings, events, jobs, controller-to-model edges, and Blade references.
 - **React resolution**: function and class components, custom hooks, builtin
   hooks, `memo`, and `forwardRef`.
 - **Python resolution**: package-relative imports for cross-file calls.
+- **Go resolution**: module-aware imported selector calls and common router
+  handler references.
+- **Rust resolution**: module-scoped `crate::` calls, `use` bindings, impl/trait
+  methods, and common route handler references.
 - **Live freshness**: filesystem watching reconciles the graph after edits,
   deletes, renames, ignore-file changes, and branch checkouts.
 - **Hot in-memory indexes** for exact lookup, prefix/contains search,
@@ -245,4 +262,6 @@ skipping, hot-index loading, and per-phase index timing.
   [TypeScript/TSX](https://docs.rs/tree-sitter-typescript/latest/tree_sitter_typescript/),
   [PHP](https://docs.rs/tree-sitter-php/latest/tree_sitter_php/),
   [Python](https://docs.rs/tree-sitter-python/latest/tree_sitter_python/),
+  [Go](https://docs.rs/tree-sitter-go/latest/tree_sitter_go/),
+  [Rust](https://docs.rs/tree-sitter-rust/latest/tree_sitter_rust/),
   [Blade](https://github.com/EmranMR/tree-sitter-blade)

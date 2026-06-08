@@ -61,6 +61,38 @@ fn gen_ts_source(classes: usize, methods_per: usize) -> Vec<u8> {
     out.into_bytes()
 }
 
+fn gen_go_source(types: usize, methods_per: usize) -> Vec<u8> {
+    let mut out = String::from("package bench\n\n");
+    for i in 0..types {
+        out.push_str(&format!("type Type{i} struct {{}}\n"));
+        out.push_str(&format!(
+            "func NewType{i}() *Type{i} {{ return &Type{i}{{}} }}\n"
+        ));
+        for m in 0..methods_per {
+            out.push_str(&format!(
+                "func (t *Type{i}) Method{m}() {{ NewType{i}() }}\n"
+            ));
+        }
+    }
+    out.into_bytes()
+}
+
+fn gen_rust_source(types: usize, methods_per: usize) -> Vec<u8> {
+    let mut out = String::new();
+    for i in 0..types {
+        out.push_str(&format!("pub struct Type{i};\n"));
+        out.push_str(&format!("pub fn new_type_{i}() -> Type{i} {{ Type{i} }}\n"));
+        out.push_str(&format!("impl Type{i} {{\n"));
+        for m in 0..methods_per {
+            out.push_str(&format!(
+                "    pub fn method_{m}(&self) {{ new_type_{i}(); }}\n"
+            ));
+        }
+        out.push_str("}\n");
+    }
+    out.into_bytes()
+}
+
 fn bench_extract<F>(c: &mut Criterion, label: &str, id: LanguageId, path: &str, mut make_src: F)
 where
     F: FnMut(usize, usize) -> Vec<u8>,
@@ -110,10 +142,26 @@ fn bench_extract_typescript(c: &mut Criterion) {
     );
 }
 
+fn bench_extract_go(c: &mut Criterion) {
+    bench_extract(c, "extract_go", LanguageId::Go, "bench.go", gen_go_source);
+}
+
+fn bench_extract_rust(c: &mut Criterion) {
+    bench_extract(
+        c,
+        "extract_rust",
+        LanguageId::Rust,
+        "bench.rs",
+        gen_rust_source,
+    );
+}
+
 criterion_group!(
     benches,
     bench_extract_python,
     bench_extract_php,
     bench_extract_typescript,
+    bench_extract_go,
+    bench_extract_rust,
 );
 criterion_main!(benches);

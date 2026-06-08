@@ -20,6 +20,8 @@ pub enum DetectedLanguage {
     TypeScript,
     Tsx,
     Python,
+    Go,
+    Rust,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,8 @@ pub fn detect_language(path: &Path) -> Option<DetectedLanguage> {
         "ts" => Some(DetectedLanguage::TypeScript),
         "tsx" => Some(DetectedLanguage::Tsx),
         "py" => Some(DetectedLanguage::Python),
+        "go" => Some(DetectedLanguage::Go),
+        "rs" => Some(DetectedLanguage::Rust),
         _ => None,
     }
 }
@@ -228,6 +232,14 @@ mod tests {
         assert_eq!(
             detect_language(Path::new("/x/script.py")),
             Some(DetectedLanguage::Python)
+        );
+        assert_eq!(
+            detect_language(Path::new("/x/main.go")),
+            Some(DetectedLanguage::Go)
+        );
+        assert_eq!(
+            detect_language(Path::new("/x/lib.rs")),
+            Some(DetectedLanguage::Rust)
         );
         assert_eq!(detect_language(Path::new("/x/README.md")), None);
         assert_eq!(detect_language(Path::new("/x/no_extension")), None);

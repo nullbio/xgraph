@@ -50,9 +50,11 @@ Do not violate these without updating `README.md` and `IMPLEMENTATION_GUIDE.md` 
 - Core grammars must be native and statically linked.
 - Initial crate versions are:
   - `tree-sitter = "0.26"`
+  - `tree-sitter-go = "0.25"`
   - `tree-sitter-javascript = "0.25"`
   - `tree-sitter-typescript = "0.23"`
   - `tree-sitter-php = "0.24"`
+  - `tree-sitter-rust = "0.24"`
 - Use a vendored native `tree-sitter-blade` grammar for `.blade.php` files.
 - Python parser support must also use a selected/pinned native grammar crate.
 - Compile Tree-sitter queries once and share them as `Arc<Query>`.
@@ -82,14 +84,17 @@ Performance is a primary design constraint for xgraph. Prefer simple, measured h
 
 ## Language priorities
 
-Initial language support is limited to:
+Language support is limited to:
 
 1. PHP.
 2. Laravel framework conventions, including Blade.
 3. TypeScript / JavaScript.
 4. Python.
+5. Go.
+6. Rust.
 
-Do not broaden language scope before the first version handles these well.
+Do not broaden language scope further before these languages handle definitions,
+imports, calls, and path-aware cross-file resolution well.
 
 ## Extraction rules
 
@@ -136,7 +141,7 @@ Expected test coverage:
 - Integration tests using temporary Git repositories for `init`, `mcp` lazy startup, daemon locks, branch checkout reconciliation, deletion handling, and crash recovery.
 - Concurrency tests for many MCP proxies sharing one daemon.
 - Lifecycle tests for idle timeout, in-flight command protection, deleted worktrees, stale sockets, and reconnect after daemon restart.
-- Parser fixtures for PHP, Blade/Laravel, TypeScript/JavaScript, and Python.
+- Parser fixtures for PHP, Blade/Laravel, TypeScript/JavaScript, Python, Go, and Rust.
 - Incremental parsing tests that compare full parse extraction with incremental extraction for the same edit.
 
 Docs-only changes do not require Rust commands, but generated documentation should still be reviewed for consistency with the architecture invariants above.

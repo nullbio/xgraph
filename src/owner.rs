@@ -148,6 +148,7 @@ impl WorktreeOwner {
         // Project-scoped import resolvers, built once per pass.
         let ts_resolver = TsAliasResolver::from_worktree(&self.worktree_root);
         let py_resolver = PythonImportResolver::from_worktree(&self.worktree_root);
+        let go_resolver = GoModuleResolver::from_worktree(&self.worktree_root);
 
         progress.phase(Phase::Parsing, Some(scanned.len() as u64));
         let t_parse_start = Instant::now();
@@ -179,6 +180,7 @@ impl WorktreeOwner {
                     lang,
                     &ts_resolver,
                     &py_resolver,
+                    &go_resolver,
                     &self.worktree_root,
                 );
                 Ok(Some(prep))
@@ -560,6 +562,8 @@ enum LanguageFamily {
     PhpBlade,
     JsTs,
     Python,
+    Go,
+    Rust,
 }
 
 fn language_family(lang: DetectedLanguage) -> LanguageFamily {
@@ -569,6 +573,8 @@ fn language_family(lang: DetectedLanguage) -> LanguageFamily {
             LanguageFamily::JsTs
         }
         DetectedLanguage::Python => LanguageFamily::Python,
+        DetectedLanguage::Go => LanguageFamily::Go,
+        DetectedLanguage::Rust => LanguageFamily::Rust,
     }
 }
 
@@ -619,6 +625,16 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
         } else {
             None
         };
+        let go_package_prefix = if matches!(prep.language, DetectedLanguage::Go) {
+            Some(go_package_path(&prep.relative))
+        } else {
+            None
+        };
+        let rust_module_prefix = if matches!(prep.language, DetectedLanguage::Rust) {
+            rust_module_path(&prep.relative)
+        } else {
+            None
+        };
 
         for node in &prep.extracted.nodes {
             let node_id = active_node_id(&cozo_hash, node.id);
@@ -656,7 +672,17 @@ fn build_symbol_table(prepared: &[PreparedFile]) -> SymbolTable {
                 }
             }
             if let Some(module) = python_module_prefix.as_deref() {
-                table.register(family, &format!("{module}.{}", node.name), node_id);
+                table.register(family, &format!("{module}.{}", node.name), node_id.clone());
+            }
+            if let Some(prefix) = go_package_prefix.as_deref()
+                && !prefix.is_empty()
+            {
+                table.register(family, &format!("{prefix}#{}", node.name), node_id.clone());
+            }
+            if let Some(prefix) = rust_module_prefix.as_deref()
+                && !prefix.is_empty()
+            {
+                table.register(family, &format!("{prefix}::{}", node.name), node_id.clone());
             }
         }
     }
@@ -704,6 +730,107 @@ fn python_module_path(relative: &Path) -> Option<String> {
     Some(parts.join("."))
 }
 
+fn go_package_path(relative: &Path) -> String {
+    relative
+        .parent()
+        .map(normalize_path_components)
+        .unwrap_or_default()
+}
+
+fn rust_module_path(relative: &Path) -> Option<String> {
+    let mut rel = relative;
+    if let Ok(stripped) = relative.strip_prefix("src") {
+        rel = stripped;
+    }
+    let stem = rel.file_stem()?.to_str()?;
+    let parent = rel.parent();
+    let mut parts: Vec<String> = parent
+        .into_iter()
+        .flat_map(|p| p.components())
+        .filter_map(|c| c.as_os_str().to_str())
+        .map(str::to_owned)
+        .collect();
+    if stem != "lib" && stem != "main" && stem != "mod" {
+        parts.push(stem.to_owned());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("::"))
+    }
+}
+
+fn normalize_path_components(path: &Path) -> String {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[derive(Debug, Default)]
+struct GoModuleResolver {
+    module_path: Option<String>,
+}
+
+impl GoModuleResolver {
+    fn from_worktree(root: &Path) -> Self {
+        let Ok(text) = fs::read_to_string(root.join("go.mod")) else {
+            return Self::default();
+        };
+        let module_path = text.lines().find_map(|line| {
+            let line = line.split("//").next().unwrap_or("").trim();
+            let rest = line.strip_prefix("module ")?;
+            let module = rest.trim().trim_matches(['"', '\'']);
+            if module.is_empty() {
+                None
+            } else {
+                Some(module.to_owned())
+            }
+        });
+        Self { module_path }
+    }
+
+    fn resolve(&self, import_path: &str) -> Option<String> {
+        let module = self.module_path.as_deref()?;
+        if import_path == module {
+            return Some(String::new());
+        }
+        import_path
+            .strip_prefix(module)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_owned)
+    }
+}
+
+fn normalize_rust_qname(raw: &str, current_module: &str) -> String {
+    let path = raw
+        .trim()
+        .trim_end_matches(';')
+        .replace([' ', '\n', '\t'], "");
+    if let Some(rest) = path.strip_prefix("crate::") {
+        return rest.to_owned();
+    }
+    if let Some(rest) = path.strip_prefix("self::") {
+        return if current_module.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{current_module}::{rest}")
+        };
+    }
+    if let Some(rest) = path.strip_prefix("super::") {
+        let parent = current_module
+            .rsplit_once("::")
+            .map(|(p, _)| p)
+            .unwrap_or("");
+        return if parent.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{parent}::{rest}")
+        };
+    }
+    path
+}
+
 fn resolve_edges(
     hash: &ContentHash,
     extracted: &ExtractedFile,
@@ -713,7 +840,7 @@ fn resolve_edges(
     let cozo_hash = CozoContentHash::from_bytes(*hash.as_bytes());
     let mut edges = Vec::new();
     for r in &extracted.refs {
-        let lookup_key = if family == LanguageFamily::JsTs && is_jsts_precise_ref(&r.kind) {
+        let lookup_key = if is_hash_precise_ref(family, &r.kind) {
             let Some(qname) = r.qname.as_deref() else {
                 continue;
             };
@@ -721,6 +848,11 @@ fn resolve_edges(
                 continue;
             }
             qname
+        } else if family == LanguageFamily::Rust
+            && is_rust_precise_ref(&r.kind)
+            && r.qname.as_deref().is_some_and(|q| q.contains("::"))
+        {
+            r.qname.as_deref().unwrap()
         } else {
             r.qname.as_deref().unwrap_or(r.name.as_str())
         };
@@ -787,6 +919,19 @@ fn is_jsts_precise_ref(kind: &str) -> bool {
     )
 }
 
+fn is_hash_precise_ref(family: LanguageFamily, kind: &str) -> bool {
+    (family == LanguageFamily::JsTs && is_jsts_precise_ref(kind))
+        || (family == LanguageFamily::Go && is_go_precise_ref(kind))
+}
+
+fn is_go_precise_ref(kind: &str) -> bool {
+    matches!(kind, "go_selector_call")
+}
+
+fn is_rust_precise_ref(kind: &str) -> bool {
+    matches!(kind, "rust_call")
+}
+
 /// File-level synthesized node ID. The `file:` prefix avoids any collision
 /// with `active_node_id` (always starts with a 64-hex content hash) and the
 /// laravel-heuristic `lh:` prefix. Consumers reading edges with this source
@@ -802,13 +947,14 @@ fn is_file_level_edge_kind(edge_kind: &str) -> bool {
 fn edge_kind_for_ref(kind: &str) -> &str {
     match kind {
         "call" | "member_call" | "method_call" | "static_call" | "nullsafe_method_call" => "calls",
+        "go_selector_call" | "rust_call" => "calls",
         "extends" | "inheritance" => "inherits",
         "implements" => "implements",
         "trait_use" => "uses",
-        "import" | "import_esm" | "import_cjs" => "imports",
+        "import" | "import_esm" | "import_cjs" | "import_go" | "import_rust" => "imports",
         "import_named" | "import_default" | "import_namespace" => "imports",
         "export" | "export_esm" | "export_cjs" => "exports",
-        "type_reference" => "references",
+        "type_reference" | "instantiates" | "route_handler" => "references",
         "jsx_component" => "renders",
         "blade_view" | "blade_component" | "blade_x_component" => "renders",
         "decorator" => "references",
@@ -829,6 +975,7 @@ fn rewrite_imports(
     language: DetectedLanguage,
     ts: &TsAliasResolver,
     py: &PythonImportResolver,
+    go: &GoModuleResolver,
     worktree_root: &Path,
 ) {
     match language {
@@ -897,6 +1044,63 @@ fn rewrite_imports(
                     }
                 } else if let Some(resolved) = py.resolve(relative_path, &r.name) {
                     r.qname = Some(resolved);
+                }
+            }
+        }
+        DetectedLanguage::Go => {
+            let mut imports: HashMap<String, String> = HashMap::new();
+            for r in &mut extracted.refs {
+                if r.kind != "import_go" {
+                    continue;
+                }
+                let Some(resolved) = go.resolve(&r.name) else {
+                    continue;
+                };
+                r.qname = Some(resolved.clone());
+                if let Some(alias) = r.alias.clone() {
+                    imports.insert(alias, resolved);
+                }
+            }
+
+            for r in &mut extracted.refs {
+                if !matches!(r.kind.as_str(), "go_selector_call" | "instantiates") {
+                    continue;
+                }
+                let Some(qname) = r.qname.clone() else {
+                    continue;
+                };
+                let Some((base, symbol)) = qname.split_once('#') else {
+                    continue;
+                };
+                if let Some(package_path) = imports.get(base) {
+                    r.qname = Some(format!("{package_path}#{symbol}"));
+                }
+            }
+        }
+        DetectedLanguage::Rust => {
+            let current_module = rust_module_path(relative_path).unwrap_or_default();
+            let mut imports: HashMap<String, String> = HashMap::new();
+            for r in &mut extracted.refs {
+                if r.kind != "import_rust" {
+                    continue;
+                }
+                let Some(qname) = r.qname.clone() else {
+                    continue;
+                };
+                let normalized = normalize_rust_qname(&qname, &current_module);
+                let local_name = r.alias.clone().unwrap_or_else(|| r.name.clone());
+                imports.insert(local_name, normalized.clone());
+                r.qname = Some(normalized);
+            }
+
+            for r in &mut extracted.refs {
+                if r.kind != "rust_call" {
+                    continue;
+                }
+                if let Some(qname) = r.qname.clone() {
+                    r.qname = Some(normalize_rust_qname(&qname, &current_module));
+                } else if let Some(imported) = imports.get(&r.name) {
+                    r.qname = Some(imported.clone());
                 }
             }
         }
@@ -1025,6 +1229,8 @@ fn language_label(id: DetectedLanguage) -> &'static str {
         DetectedLanguage::TypeScript => "typescript",
         DetectedLanguage::Tsx => "tsx",
         DetectedLanguage::Python => "python",
+        DetectedLanguage::Go => "go",
+        DetectedLanguage::Rust => "rust",
     }
 }
 
@@ -1032,6 +1238,135 @@ fn language_label(id: DetectedLanguage) -> &'static str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn prepared_file(
+        root: &Path,
+        relative: &str,
+        language: DetectedLanguage,
+        source: &[u8],
+    ) -> PreparedFile {
+        let registry = LanguageRegistry::with_all();
+        let mut extracted = registry
+            .extract_file(Path::new(relative), source)
+            .expect("extract");
+        let ts = TsAliasResolver::from_worktree(root);
+        let py = PythonImportResolver::from_worktree(root);
+        let go = GoModuleResolver::from_worktree(root);
+        rewrite_imports(
+            &mut extracted,
+            Path::new(relative),
+            language,
+            &ts,
+            &py,
+            &go,
+            root,
+        );
+        PreparedFile {
+            relative: PathBuf::from(relative),
+            content_hash: crate::hash::hash_bytes(source),
+            language,
+            mtime: UNIX_EPOCH,
+            size: source.len() as u64,
+            extracted,
+            source_bytes: None,
+        }
+    }
+
+    #[test]
+    fn go_imported_selector_calls_resolve_to_module_path_symbols() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("go.mod"), "module example.com/project\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("internal/server")).unwrap();
+
+        let server = prepared_file(
+            tmp.path(),
+            "internal/server/server.go",
+            DetectedLanguage::Go,
+            b"package server\n\nfunc Start() {}\n",
+        );
+        let caller = prepared_file(
+            tmp.path(),
+            "cmd/app/main.go",
+            DetectedLanguage::Go,
+            br#"package main
+
+import srv "example.com/project/internal/server"
+
+func main() {
+    srv.Start()
+}
+"#,
+        );
+        let prepared = vec![server, caller];
+        let server = &prepared[0];
+        let caller = &prepared[1];
+        let symbols = build_symbol_table(&prepared);
+        let edges = resolve_edges(
+            &caller.content_hash,
+            &caller.extracted,
+            &symbols,
+            language_family(caller.language),
+        );
+        let start = server
+            .extracted
+            .nodes
+            .iter()
+            .find(|n| n.name == "Start")
+            .expect("Start node");
+        let target = active_node_id(
+            &CozoContentHash::from_bytes(*server.content_hash.as_bytes()),
+            start.id,
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == "calls" && e.target_node_id == target),
+            "expected srv.Start() to resolve to internal/server#Start, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn rust_scoped_calls_resolve_to_module_path_symbols() {
+        let tmp = TempDir::new().expect("tempdir");
+        let server = prepared_file(
+            tmp.path(),
+            "src/server.rs",
+            DetectedLanguage::Rust,
+            b"pub fn stop() {}\n",
+        );
+        let caller = prepared_file(
+            tmp.path(),
+            "src/main.rs",
+            DetectedLanguage::Rust,
+            b"mod server;\n\nfn main() {\n    crate::server::stop();\n}\n",
+        );
+        let prepared = vec![server, caller];
+        let server = &prepared[0];
+        let caller = &prepared[1];
+        let symbols = build_symbol_table(&prepared);
+        let edges = resolve_edges(
+            &caller.content_hash,
+            &caller.extracted,
+            &symbols,
+            language_family(caller.language),
+        );
+        let stop = server
+            .extracted
+            .nodes
+            .iter()
+            .find(|n| n.name == "stop")
+            .expect("stop node");
+        let target = active_node_id(
+            &CozoContentHash::from_bytes(*server.content_hash.as_bytes()),
+            stop.id,
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == "calls" && e.target_node_id == target),
+            "expected crate::server::stop() to resolve to server::stop, got {edges:?}"
+        );
+    }
 
     #[test]
     fn index_all_submits_one_update_per_supported_file() {

@@ -19,6 +19,8 @@ pub enum LanguageId {
     TypeScript,
     Tsx,
     Python,
+    Go,
+    Rust,
 }
 
 impl LanguageId {
@@ -30,6 +32,8 @@ impl LanguageId {
             LanguageId::TypeScript => "typescript",
             LanguageId::Tsx => "tsx",
             LanguageId::Python => "python",
+            LanguageId::Go => "go",
+            LanguageId::Rust => "rust",
         }
     }
 }
@@ -77,6 +81,8 @@ impl LanguageRegistry {
         registry.register(crate::languages::typescript::TypeScriptPlugin::typescript());
         registry.register(crate::languages::typescript::TypeScriptPlugin::tsx());
         registry.register(crate::languages::python::PythonPlugin);
+        registry.register(crate::languages::go::GoPlugin);
+        registry.register(crate::languages::rust::RustPlugin);
         registry
     }
 
@@ -158,6 +164,8 @@ fn detect_language_by_path(path: &Path) -> Option<LanguageId> {
         "ts" | "mts" | "cts" => Some(LanguageId::TypeScript),
         "tsx" => Some(LanguageId::Tsx),
         "py" | "pyi" => Some(LanguageId::Python),
+        "go" => Some(LanguageId::Go),
+        "rs" => Some(LanguageId::Rust),
         _ => None,
     }
 }
@@ -301,6 +309,24 @@ mod tests {
     }
 
     #[test]
+    fn detect_by_path_returns_go_for_go_files() {
+        let registry = LanguageRegistry::new();
+        assert_eq!(
+            registry.detect_by_path(&PathBuf::from("cmd/xgraph/main.go")),
+            Some(LanguageId::Go)
+        );
+    }
+
+    #[test]
+    fn detect_by_path_returns_rust_for_rs_files() {
+        let registry = LanguageRegistry::new();
+        assert_eq!(
+            registry.detect_by_path(&PathBuf::from("src/main.rs")),
+            Some(LanguageId::Rust)
+        );
+    }
+
+    #[test]
     fn blade_php_takes_precedence_over_php() {
         let registry = LanguageRegistry::new();
         let path = PathBuf::from("resources/views/layout.blade.php");
@@ -426,6 +452,8 @@ mod tests {
         assert_eq!(LanguageId::TypeScript.to_string(), "typescript");
         assert_eq!(LanguageId::Tsx.to_string(), "tsx");
         assert_eq!(LanguageId::Python.to_string(), "python");
+        assert_eq!(LanguageId::Go.to_string(), "go");
+        assert_eq!(LanguageId::Rust.to_string(), "rust");
     }
 
     #[test]
@@ -438,6 +466,8 @@ mod tests {
             LanguageId::TypeScript,
             LanguageId::Tsx,
             LanguageId::Python,
+            LanguageId::Go,
+            LanguageId::Rust,
         ] {
             assert!(registry.get(id).is_some(), "missing plugin for {id}");
         }
