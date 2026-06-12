@@ -249,18 +249,12 @@ impl DaemonHandle {
 /// listener, write a diagnostic PID file, then spawn the accept loop.
 pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     let DaemonConfig {
-        runtime_dir,
-        socket_name,
-        handler,
-        lifecycle,
+        ref runtime_dir, ..
     } = config;
 
-    std::fs::create_dir_all(&runtime_dir)?;
+    std::fs::create_dir_all(runtime_dir)?;
 
     let lock_path = runtime_dir.join(DAEMON_LOCK_FILE);
-    let socket_path = runtime_dir.join(socket_name);
-    let pid_path = runtime_dir.join(DAEMON_PID_FILE);
-
     let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -275,6 +269,30 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         }
         Err(err) => return Err(DaemonError::Io(err)),
     }
+
+    start_with_lock(config, lock_file).await
+}
+
+/// Start the daemon with an already-held `daemon.lock`.
+///
+/// `xgraph daemon start` uses this path so it can acquire the runtime daemon
+/// lock before opening Cozo. That keeps duplicate lazy starts from racing into
+/// RocksDB startup/indexing before the socket exists.
+pub async fn start_with_lock(
+    config: DaemonConfig,
+    lock_file: File,
+) -> Result<DaemonHandle, DaemonError> {
+    let DaemonConfig {
+        runtime_dir,
+        socket_name,
+        handler,
+        lifecycle,
+    } = config;
+
+    std::fs::create_dir_all(&runtime_dir)?;
+
+    let socket_path = runtime_dir.join(socket_name);
+    let pid_path = runtime_dir.join(DAEMON_PID_FILE);
 
     match std::fs::remove_file(&socket_path) {
         Ok(()) => {}

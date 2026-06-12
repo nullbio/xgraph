@@ -50,7 +50,8 @@ const SOCKET_POLL_INITIAL: Duration = Duration::from_millis(10);
 const SOCKET_POLL_MAX: Duration = Duration::from_millis(100);
 
 /// Convenience alias for the boxed future returned by [`DaemonLauncher`].
-pub type SpawnFuture<'a> = Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + 'a>>;
+pub type SpawnFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SpawnedDaemon, McpError>> + Send + 'a>>;
 
 /// Errors produced by the MCP proxy.
 #[derive(Debug)]
@@ -110,10 +111,50 @@ impl From<io::Error> for McpError {
 pub trait DaemonLauncher: Send + Sync {
     /// Spawn the daemon for the proxy's runtime directory.
     ///
-    /// Returning `Ok(())` means the spawn was initiated. The proxy still
+    /// Returning `Ok` means the spawn was initiated. The proxy still
     /// polls the socket until it becomes connectable, so the launcher does
-    /// not need to block until the daemon is fully ready.
+    /// not need to block until the daemon is fully ready. Launchers that
+    /// spawn a subprocess should return its PID so the proxy can terminate
+    /// that exact child if startup never reaches the socket.
     fn spawn_daemon(&self) -> SpawnFuture<'_>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnedDaemon {
+    pid: Option<u32>,
+}
+
+impl SpawnedDaemon {
+    pub fn unknown() -> Self {
+        Self { pid: None }
+    }
+
+    pub fn subprocess(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    fn terminate_if_known(self) {
+        let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) else {
+            return;
+        };
+        if pid <= 0 {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .arg("-15")
+            .arg(pid.to_string())
+            .status();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_alive(pid) {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -252,6 +293,15 @@ impl McpProxy {
     }
 
     async fn connect_endpoint(&self, endpoint: &DaemonEndpoint) -> Result<UnixStream, McpError> {
+        self.connect_endpoint_with_timeout(endpoint, DAEMON_STARTUP_TIMEOUT)
+            .await
+    }
+
+    async fn connect_endpoint_with_timeout(
+        &self,
+        endpoint: &DaemonEndpoint,
+        startup_timeout: Duration,
+    ) -> Result<UnixStream, McpError> {
         ensure_runtime_dir(&endpoint.runtime_dir)?;
         let socket_path = socket_path(endpoint);
         if let Some(stream) = try_ping(&socket_path).await {
@@ -268,10 +318,19 @@ impl McpProxy {
                 remove_if_exists(&socket_path)?;
                 remove_if_exists(&pid_path(endpoint))?;
 
-                endpoint.daemon_launcher.spawn_daemon().await?;
-                wait_for_socket(&socket_path, DAEMON_STARTUP_TIMEOUT).await
+                let spawned = endpoint.daemon_launcher.spawn_daemon().await?;
+                match wait_for_socket(&socket_path, startup_timeout).await {
+                    Ok(stream) => Ok(stream),
+                    Err(McpError::StartupTimeout) => {
+                        spawned.terminate_if_known();
+                        remove_if_exists(&socket_path)?;
+                        remove_if_exists(&pid_path(endpoint))?;
+                        Err(McpError::StartupTimeout)
+                    }
+                    Err(err) => Err(err),
+                }
             }
-            None => wait_for_socket(&socket_path, DAEMON_STARTUP_TIMEOUT).await,
+            None => wait_for_socket(&socket_path, startup_timeout).await,
         }
     }
 
@@ -361,7 +420,7 @@ impl McpProxy {
             },
         };
         let key = endpoint.project_root.clone();
-        for attempt in 0..=1 {
+        for attempt in 0..=2 {
             if !daemons.contains_key(&key) {
                 match self.connect_endpoint(&endpoint).await {
                     Ok(stream) => {
@@ -386,7 +445,7 @@ impl McpProxy {
                 Err(err) => {
                     eprintln!("xgraph mcp: daemon socket error: {err}");
                     daemons.remove(&key);
-                    if attempt == 0 {
+                    if attempt < 2 {
                         continue;
                     }
                     return crate::mcp_protocol::shape_forward_error(
@@ -441,6 +500,10 @@ fn remove_if_exists(path: &Path) -> Result<(), McpError> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(McpError::Io(err)),
     }
+}
+
+fn process_alive(pid: i32) -> bool {
+    pid > 0 && Path::new(&format!("/proc/{pid}")).exists()
 }
 
 async fn try_ping(socket_path: &Path) -> Option<UnixStream> {
@@ -631,6 +694,7 @@ async fn forward_once(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -823,7 +887,42 @@ mod tests {
                 sleep(delay).await;
                 let daemon = EchoDaemon::bind(&socket_path).await;
                 *self.daemon.lock().await = Some(daemon);
-                Ok(())
+                Ok(SpawnedDaemon::unknown())
+            })
+        }
+    }
+
+    struct SleepingSubprocessLauncher {
+        pid: Mutex<Option<u32>>,
+    }
+
+    impl SleepingSubprocessLauncher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                pid: Mutex::new(None),
+            })
+        }
+
+        fn pid(&self) -> Option<u32> {
+            *self.pid.lock().expect("pid lock poisoned")
+        }
+    }
+
+    impl DaemonLauncher for SleepingSubprocessLauncher {
+        fn spawn_daemon(&self) -> SpawnFuture<'_> {
+            Box::pin(async move {
+                let mut child = std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .map_err(McpError::Io)?;
+                let pid = child.id();
+                *self.pid.lock().expect("pid lock poisoned") = Some(pid);
+                let _ = std::thread::Builder::new()
+                    .name("xgraph-test-sleep-reaper".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+                Ok(SpawnedDaemon::subprocess(pid))
             })
         }
     }
@@ -981,6 +1080,34 @@ mod tests {
             .expect("shutdown")
             .expect("join")
             .expect("ok");
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_terminates_spawned_subprocess() {
+        let dir = TempDir::new("timeout-cleanup");
+        let launcher = SleepingSubprocessLauncher::new();
+        let config = McpConfig::new(dir.path.clone(), launcher.clone());
+        let proxy = McpProxy::new(config.clone());
+        let endpoint = config.default_endpoint().expect("default endpoint");
+
+        let err = proxy
+            .connect_endpoint_with_timeout(&endpoint, Duration::from_millis(30))
+            .await
+            .expect_err("socket should time out");
+
+        assert!(matches!(err, McpError::StartupTimeout));
+        let pid = launcher.pid().expect("launcher should record child pid");
+        let pid = i32::try_from(pid).expect("pid fits i32");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_alive(pid),
+            "startup timeout should terminate the spawned daemon child"
+        );
+        assert!(!socket_path(&endpoint).exists());
+        assert!(!pid_path(&endpoint).exists());
     }
 
     #[tokio::test]
@@ -1160,7 +1287,7 @@ mod tests {
                 let _ = std::fs::remove_file(&socket_path);
                 let daemon = EchoDaemon::bind(&socket_path).await;
                 *self.daemon.lock().await = Some(daemon);
-                Ok(())
+                Ok(SpawnedDaemon::unknown())
             })
         }
     }
@@ -1177,7 +1304,7 @@ mod tests {
                 let _ = std::fs::remove_file(&socket_path);
                 let daemon = FilesDaemon::bind(&socket_path, "fresh.php").await;
                 *self.daemon.lock().await = Some(daemon);
-                Ok(())
+                Ok(SpawnedDaemon::unknown())
             })
         }
     }

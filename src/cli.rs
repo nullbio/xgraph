@@ -17,8 +17,8 @@ use crate::ignore::{IgnoreError, IgnoreMatcher};
 use crate::language::LanguageRegistry;
 use crate::owner::WorktreeOwner;
 use crate::runtime::{
-    RuntimeDir, RuntimeError, StartupLockGuard, acquire_startup_lock, ensure_runtime_dir,
-    runtime_dir,
+    RuntimeDir, RuntimeError, StartupLockGuard, acquire_daemon_lock, acquire_startup_lock,
+    ensure_runtime_dir, runtime_dir,
 };
 use crate::scanner::ScanError;
 use crate::storage::{PersistentPaths, PersistentPathsError};
@@ -565,12 +565,13 @@ impl crate::mcp::DaemonLauncher for SubprocessLauncher {
             }
 
             let mut child = command.spawn().map_err(crate::mcp::McpError::Io)?;
+            let pid = child.id();
             let _ = std::thread::Builder::new()
                 .name("xgraph-daemon-reaper".into())
                 .spawn(move || {
                     let _ = child.wait();
                 });
-            Ok(())
+            Ok(crate::mcp::SpawnedDaemon::subprocess(pid))
         })
     }
 }
@@ -580,6 +581,8 @@ fn cmd_daemon_start(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
     let persistent = PersistentPaths::for_worktree(&worktree)?;
     persistent.ensure_created()?;
     let runtime = ensure_runtime_dir(worktree.as_path())?;
+    let daemon_lock = acquire_daemon_lock(&runtime)?;
+    let daemon_lock_file = daemon_lock.into_file();
 
     let store = open_store_with_lock_retry(
         &persistent.cozo_db_path(),
@@ -713,7 +716,7 @@ fn cmd_daemon_start(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
         let mut config = DaemonConfig::new(runtime.as_path().to_path_buf(), handler);
         config.lifecycle.worktree_root = Some(worktree_root_for_lifecycle);
         config.lifecycle.persistent_root = Some(persistent.root_dir().to_path_buf());
-        let handle = crate::daemon::start(config).await?;
+        let handle = crate::daemon::start_with_lock(config, daemon_lock_file).await?;
         let socket_path = handle.socket_path().to_path_buf();
         eprintln!("daemon listening on {}", socket_path.display());
 
@@ -879,7 +882,6 @@ fn cmd_daemon_stop(project_root: Option<&Path>, force: bool) -> Result<ExitCode,
 fn cmd_status(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
     let worktree = requested_worktree(project_root)?;
     let persistent = PersistentPaths::for_worktree(&worktree)?;
-    ensure_daemon_running(&worktree)?;
     let runtime = runtime_dir(worktree.as_path())?;
     let cozo_present = persistent.cozo_db_path().exists();
     let socket_path = runtime.socket_path();
@@ -1146,7 +1148,7 @@ fn ensure_daemon_running(worktree: &WorktreeRoot) -> Result<(), CliError> {
     }
     let _ = fs::remove_file(runtime.socket_path());
     let _ = fs::remove_file(runtime.pid_file_path());
-    spawn_daemon_process(worktree)?;
+    let child_pid = spawn_daemon_process(worktree)?;
 
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
@@ -1155,6 +1157,7 @@ fn ensure_daemon_running(worktree: &WorktreeRoot) -> Result<(), CliError> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    terminate_spawned_daemon(child_pid, &runtime);
     Err(CliError::Mcp(crate::mcp::McpError::StartupTimeout))
 }
 
@@ -1162,7 +1165,7 @@ fn socket_connects(socket_path: &Path) -> bool {
     socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok()
 }
 
-fn spawn_daemon_process(worktree: &WorktreeRoot) -> Result<(), CliError> {
+fn spawn_daemon_process(worktree: &WorktreeRoot) -> Result<u32, CliError> {
     let exe_path = env::current_exe().map_err(|source| CliError::Io {
         path: PathBuf::from("<current executable>"),
         source,
@@ -1188,12 +1191,36 @@ fn spawn_daemon_process(worktree: &WorktreeRoot) -> Result<(), CliError> {
         path: worktree.as_path().to_path_buf(),
         source,
     })?;
+    let pid = child.id();
     let _ = std::thread::Builder::new()
         .name("xgraph-cli-daemon-reaper".into())
         .spawn(move || {
             let _ = child.wait();
         });
-    Ok(())
+    Ok(pid)
+}
+
+fn terminate_spawned_daemon(pid: u32, runtime: &RuntimeDir) {
+    let pid = match i32::try_from(pid) {
+        Ok(pid) if pid > 0 => pid,
+        _ => return,
+    };
+    let _ = std::process::Command::new("kill")
+        .arg("-15")
+        .arg(pid.to_string())
+        .status();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if process_alive(pid) {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+    let _ = fs::remove_file(runtime.socket_path());
+    let _ = fs::remove_file(runtime.pid_file_path());
 }
 
 fn send_daemon_request_if_reachable(
@@ -1458,6 +1485,36 @@ mod tests {
     fn parses_status_command() {
         let cli = parse(["xgraph", "status"]).expect("status should parse");
         assert_eq!(cli.command, Command::Status);
+    }
+
+    #[test]
+    fn status_command_does_not_start_daemon() {
+        use std::process::Command as ProcessCommand;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .arg(tmp.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        let worktree = WorktreeRoot::discover(tmp.path()).expect("discover worktree");
+        let runtime = ensure_runtime_dir(worktree.as_path()).expect("runtime dir");
+        let _ = std::fs::remove_file(runtime.socket_path());
+        let _ = std::fs::remove_file(runtime.pid_file_path());
+
+        let exit = cmd_status(Some(tmp.path())).expect("status succeeds");
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert!(
+            !runtime.socket_path().exists(),
+            "status must not create a daemon socket"
+        );
+        assert!(
+            !runtime.pid_file_path().exists(),
+            "status must not start a daemon"
+        );
     }
 
     #[test]

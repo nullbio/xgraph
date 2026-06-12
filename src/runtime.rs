@@ -169,6 +169,12 @@ impl DaemonLockGuard {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn into_file(mut self) -> File {
+        self.file
+            .take()
+            .expect("daemon lock guard must own a lock file")
+    }
 }
 
 impl Drop for DaemonLockGuard {
