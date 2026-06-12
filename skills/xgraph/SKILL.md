@@ -1,6 +1,6 @@
 ---
 name: xgraph
-description: "Use when working with xgraph code intelligence or the xgraph Rust repo: querying symbols, files, callers, callees, impact, traces, or focused context; diagnosing xgraph daemon/MCP behavior; deciding when to use xgraph versus grep or LSP; handling project_root/worktree routing; or updating xgraph docs, tool definitions, install scripts, or skills."
+description: "xgraph code intelligence and xgraph Rust repo workflow. Use for querying symbols, files, callers, callees, impact, traces, focused context, daemon/MCP diagnosis, xgraph-vs-grep/LSP choices, project_root/worktree routing, or updating docs, tool definitions, install scripts, or skills."
 ---
 
 # xgraph
@@ -43,8 +43,23 @@ Prefer LSP tools for hover/type information, diagnostics, definitions, implement
 
 - Treat exact symbol, file, node, and trace results as stronger than broad caller/callee/impact/context results.
 - Common names can over-broaden graph relationships. Cross-check high-impact decisions with source or LSP.
+- If `context` misses a qualified name, use `status`, `nodes_in_file`, `search`,
+  or `find_symbol` to get exact node IDs, then query by node ID.
 - xgraph reflects current files on disk in the selected worktree. A same-directory `git checkout` is filesystem churn in the same database; a linked `git worktree` gets a separate database and daemon.
 - Do not initialize xgraph for a project unless the user asks or project instructions allow it. If a project is not initialized, ask before running `xgraph init`.
+
+## Local Caveats
+
+- `status` is the fastest health split. A healthy daemon with zero nodes usually
+  means language coverage, ignore rules, or indexing scope is wrong.
+- `.xgraphignore` is the project-local way to exclude generated/noisy trees from
+  indexing.
+- If standalone CLI commands need a runtime dir on this machine, use
+  `XDG_RUNTIME_DIR=/tmp`.
+- If `xgraph sync` reports a store lock while the daemon is running, do not kill
+  the daemon by default; let the watcher reconcile or restart intentionally.
+- MCP tools may be hidden until explicitly discovered, so absence from an
+  initial tool list is not proof xgraph is uninstalled.
 
 ## Repo Work
 
