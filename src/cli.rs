@@ -607,15 +607,6 @@ fn cmd_daemon_start(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
     let (maintenance_tx, maintenance_rx) = crate::owner::maintenance_channel();
     let maintenance_gate = Arc::new(parking_lot::RwLock::new(()));
 
-    let summary = owner.index_all()?;
-    print_index_summary_parts(
-        summary.files_scanned as u64,
-        summary.files_indexed as u64,
-        summary.nodes_created,
-        summary.edges_created,
-        Some(GraphCounts::from_indexes(&indexes)),
-        persistent.root_dir(),
-    );
     println!(
         "opening daemon socket at {}",
         runtime.socket_path().display()
@@ -653,9 +644,25 @@ fn cmd_daemon_start(project_root: Option<&Path>) -> Result<ExitCode, CliError> {
     };
 
     let maintenance_gate_for_thread = Arc::clone(&maintenance_gate);
+    let indexes_for_thread = Arc::clone(&indexes);
+    let persistent_root_for_thread = persistent.root_dir().to_path_buf();
     let watcher_thread = std::thread::Builder::new()
         .name("xgraph-watcher-handler".into())
         .spawn(move || {
+            let progress = crate::progress::Progress::start();
+            match owner.index_all_with_progress(&progress) {
+                Ok(summary) => print_index_summary_parts(
+                    summary.files_scanned as u64,
+                    summary.files_indexed as u64,
+                    summary.nodes_created,
+                    summary.edges_created,
+                    Some(GraphCounts::from_indexes(&indexes_for_thread)),
+                    &persistent_root_for_thread,
+                ),
+                Err(err) => eprintln!("xgraph: initial reconcile failed: {err}"),
+            }
+            progress.stop();
+
             // Two channel-pair shapes depending on whether the watcher
             // started. With a watcher we poll both batches and
             // maintenance commands; without one we only poll

@@ -170,7 +170,8 @@ impl WorktreeOwner {
                 let Some(lang) = file.language else {
                     return Ok(None);
                 };
-                let Some(mut prep) = self.prepare_file(file.path, file.mtime, file.size, lang)?
+                let Some(mut prep) =
+                    self.prepare_file(file.path, file.content_hash, file.mtime, file.size, lang)?
                 else {
                     return Ok(None);
                 };
@@ -284,7 +285,15 @@ impl WorktreeOwner {
         let Some(lang) = crate::scanner::detect_language(&path) else {
             return Ok(false);
         };
-        let Some(prep) = self.prepare_file(path, mtime, size, lang)? else {
+        let bytes = fs::read(&path).map_err(|source| OwnerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let content_hash = crate::hash::hash_bytes(&bytes);
+
+        let Some(prep) =
+            self.prepare_file_from_bytes(path, bytes, content_hash, mtime, size, lang)?
+        else {
             return Ok(false);
         };
         let empty = SymbolTable::default();
@@ -295,6 +304,7 @@ impl WorktreeOwner {
     fn prepare_file(
         &self,
         path: PathBuf,
+        content_hash: ContentHash,
         mtime: SystemTime,
         size: u64,
         language: DetectedLanguage,
@@ -303,7 +313,19 @@ impl WorktreeOwner {
             path: path.clone(),
             source,
         })?;
-        let content_hash = crate::hash::hash_bytes(&bytes);
+
+        self.prepare_file_from_bytes(path, bytes, content_hash, mtime, size, language)
+    }
+
+    fn prepare_file_from_bytes(
+        &self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        content_hash: ContentHash,
+        mtime: SystemTime,
+        size: u64,
+        language: DetectedLanguage,
+    ) -> Result<Option<PreparedFile>, OwnerError> {
         let relative = path
             .strip_prefix(&self.worktree_root)
             .unwrap_or(&path)
@@ -1429,7 +1451,11 @@ func main() {
         let errs = owner.shutdown();
         assert!(errs.is_empty());
 
-        // Second pass: file unchanged → 0 submissions.
+        // Same content with fresh metadata still hashes to the existing active
+        // row, so the startup pass should not parse or submit it again.
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+
+        // Second pass: file content unchanged -> 0 submissions.
         let mut owner2 = WorktreeOwner::new(
             tmp.path().to_path_buf(),
             matcher2,
